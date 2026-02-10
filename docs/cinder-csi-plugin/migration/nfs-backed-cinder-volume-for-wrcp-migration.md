@@ -257,7 +257,7 @@ The table below summarizes how each CSI RPC maps to OpenStack operations in the 
 | **`CreateVolume`** | Cinder `POST /v3/volumes` | Cinder `POST /v3/volumes` + Shadow VM create (triggers NFS attachment record) |
 | **`DeleteVolume`** | Cinder `DELETE /v3/volumes/{id}` | Shadow VM delete + Cinder `DELETE /v3/volumes/{id}` |
 | **`ControllerPublishVolume`** | Nova `POST /v2/servers/{id}/os-volume_attachments` (block attach) | Query Cinder attachment → extract NFS export/path from `connection_info` properties |
-| **`ControllerUnpublishVolume`** | Nova `DELETE /v2/servers/{id}/os-volume_attachments/{vid}` | **Configurable**: No-op (default), OR detach volume from Shadow VM + delete Shadow VM (`detachOnUnpublish`), OR detach + delete Shadow VM + **delete Cinder volume** (`deleteVolumeOnUnpublish`). |
+| **`ControllerUnpublishVolume`** | Nova `DELETE /v2/servers/{id}/os-volume_attachments/{vid}` | **Configurable**: No-op (default) OR detach + delete Shadow VM + **delete Cinder volume** (`deleteVolumeOnUnpublish: "true"`). |
 | **`NodeStageVolume`** | Discover `/dev/vdb` by serial → `FormatAndMount` to staging path | `mount -t nfs` NFS export → staging path on WRCP host |
 | **`NodeUnstageVolume`** | `umount` staging path | `umount` NFS mount from staging path |
 | **`NodePublishVolume`** | Bind mount staging path (or raw block device) → target path | Bind mount NFS volume file → target path as block device (`/dev/cdi-block-volume`) |
@@ -317,6 +317,7 @@ The `CreateVolume` RPC encapsulates both Cinder volume creation and the Shadow V
 | `req.CapacityRange.RequiredBytes` | Source VM disk size |
 | `req.Parameters["type"]` | `netapp-nfs` (StorageClass parameter) |
 | `req.Parameters["availability"]` | Target AZ |
+| `req.Parameters["deleteVolumeOnUnpublish"]` | `"true"` or `"false"` (StorageClass parameter, default `"false"`) — persisted as Cinder volume metadata `csi.deleteVolumeOnUnpublish` for use by `ControllerUnpublishVolume` |
 | `resp.Volume.VolumeId` | Cinder volume UUID |
 | `resp.Volume.VolumeContext["nfs_export"]` | `192.168.57.105:/trident_pvc_xxx` |
 | `resp.Volume.VolumeContext["nfs_volume_file"]` | `volume-ba833668-xxx` |
@@ -347,6 +348,15 @@ The `CreateVolume` RPC encapsulates both Cinder volume creation and the Shadow V
        ├────────────────────────────────────────► │
        │                                          │  Cinder provisions volume
        │  ◄── VOLUME_ID                           │  on NFS backend
+       │                                          │
+       │  2b. Persist StorageClass config as      │
+       │      Cinder volume metadata:             │
+       │      cloud.SetVolumeMetadata(VOLUME_ID, {│
+       │        "csi.deleteVolumeOnUnpublish":     │
+       │           req.Parameters["deleteVolOnUn"],│
+       │      })                                  │
+       │      → Cinder PUT /v3/volumes/{id}/metadata
+       ├────────────────────────────────────────► │
        │                                          │
        │  3. Create Shadow VM (attachment trigger):│
        │     cloud.CreateServer(                  │
@@ -459,13 +469,12 @@ In the existing Cinder CSI driver, this RPC calls `Nova os-volume_attachments` t
 
 **CSI Spec Reference:** *"This RPC is a reverse operation of ControllerPublishVolume. It MUST be called after all NodeUnstageVolume and NodeUnpublishVolume on the volume are called and succeed."*
 
-In the existing Cinder CSI driver, this calls `Nova DELETE /v2/servers/{id}/os-volume_attachments/{vid}`. In the NFS-Cinder driver, the behavior is **configurable** to support three distinct migration workflows:
+In the existing Cinder CSI driver, this calls `Nova DELETE /v2/servers/{id}/os-volume_attachments/{vid}`. In the NFS-Cinder driver, the behavior is **configurable** via a single StorageClass parameter to support two migration workflows:
 
 | Mode | StorageClass Parameter | Behavior | Use Case |
 |------|------------------------|----------|----------|
-| **No-op** (default) | Both `detachOnUnpublish` and `deleteVolumeOnUnpublish` omitted or `"false"` | Shadow VM attachment stays intact. Post-CSI orchestrator handles Shadow VM cleanup + target VM creation. | Direct boot-from-volume workflow — the same Cinder volume becomes the target VM's root disk. |
-| **Detach + Cleanup** | `detachOnUnpublish: "true"` | Detach volume from Shadow VM, delete Shadow VM. Volume is left in `available` state in Cinder. | Clone-then-keep workflow — orchestrator clones the volume to a new volume with OpenStack tenant naming conventions, then creates the target VM from the clone. Orchestrator is responsible for deleting the original migration volume separately. |
-| **Detach + Delete Volume** | `deleteVolumeOnUnpublish: "true"` | Detach volume from Shadow VM, delete Shadow VM, **then delete the Cinder volume itself**. The volume is fully cleaned up by the CSI driver. | Clone-then-cleanup workflow — orchestrator has **already cloned** the migration volume before deleting the PVC/PV. When the PVC is deleted, `ControllerUnpublishVolume` performs full cleanup of the original Cinder volume, eliminating the need for the orchestrator to make separate OpenStack API calls. |
+| **No-op** (default) | `deleteVolumeOnUnpublish` omitted or `"false"` | Shadow VM attachment stays intact. Post-CSI orchestrator handles Shadow VM cleanup + target VM creation. | Direct boot-from-volume workflow — the same Cinder volume becomes the target VM's root disk. The orchestrator has full OpenStack API access to manage the Shadow VM lifecycle and volume finalization post-CSI. |
+| **Full Cleanup** | `deleteVolumeOnUnpublish: "true"` | Detach volume from Shadow VM, delete Shadow VM, **then delete the Cinder volume itself**. The volume is fully cleaned up by the CSI driver. | Clone-then-cleanup workflow — orchestrator has **already cloned** the migration volume before deleting the PVC/PV. When the PVC is deleted, `ControllerUnpublishVolume` performs full cleanup of the original Cinder volume, Shadow VM, and all associated resources. |
 
 **How Configuration Flows Through CSI RPCs:**
 
@@ -478,14 +487,13 @@ The CSI spec's `ControllerUnpublishVolumeRequest` contains only `volume_id`, `no
   ┌──────────────────────────┐
   │ parameters:              │
   │   type: netapp-nfs       │
-  │   detachOnUnpublish:     │  ── CreateVolumeRequest.parameters ──►  CreateVolume:
+  │   deleteVolumeOnUnpublish│  ── CreateVolumeRequest.parameters ──►  CreateVolume:
   │     "true"               │                                          1. Create Cinder volume
-  │   deleteVolumeOnUnpublish│                                          2. Store config as Cinder
-  │     "false"              │                                             volume metadata:
-  └──────────────────────────┘                                             openstack volume set
+  └──────────────────────────┘                                          2. Store config as Cinder
+                                                                           volume metadata:
+                                                                           openstack volume set
                                                                              --property
-                                                                             csi.detachOnUnpublish=true
-                                                                             csi.deleteVolumeOnUnpublish=false
+                                                                             csi.deleteVolumeOnUnpublish=true
                                                                              ${VOLUME_ID}
                                                                         3. Create Shadow VM
 
@@ -493,25 +501,20 @@ The CSI spec's `ControllerUnpublishVolumeRequest` contains only `volume_id`, `no
                                           1. Read Cinder volume metadata:
   ┌──────────────────────────┐               GET /v3/volumes/{id}
   │ Cinder Volume            │ ◄─────────    → properties["csi.deleteVolumeOnUnpublish"]
-  │ metadata:                │               → properties["csi.detachOnUnpublish"]
-  │  csi.detachOnUnpublish   │            2. If deleteVolumeOnUnpublish == "true":
-  │   = "true"               │               → Detach volume from Shadow VM
-  │  csi.deleteVolumeOnUnpub │               → Delete Shadow VM
-  │   = "false"              │               → Delete Cinder volume
-  └──────────────────────────┘            3. If detachOnUnpublish == "true":
-                                             → Detach volume from Shadow VM
-                                             → Delete Shadow VM
-                                          4. If both "false" or missing:
+  │ metadata:                │            2. If "true":
+  │  csi.deleteVolumeOnUnpub │               → Detach volume from Shadow VM
+  │   = "true"               │               → Delete Shadow VM
+  └──────────────────────────┘               → Delete Cinder volume
+                                          3. If "false" or missing:
                                              → No-op
 ```
-
-> **Precedence Rule:** If both `deleteVolumeOnUnpublish` and `detachOnUnpublish` are `"true"`, `deleteVolumeOnUnpublish` takes precedence (since deleting the volume implies detaching first).
 
 > **Note:** This pattern of persisting driver configuration in backend storage metadata is common in CSI drivers. The existing Cinder CSI driver similarly stores topology and volume-type information in Cinder volume properties. See the [CSI Secrets and Credentials](https://kubernetes-csi.github.io/docs/secrets-and-credentials-storage-class.html) documentation for how StorageClass parameters flow to CSI RPCs.
 
 **StorageClass Definition:**
 
 ```yaml
+# StorageClass — Direct boot-from-volume (default)
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -520,21 +523,13 @@ provisioner: cinder-nfs.csi.openstack.org
 parameters:
   type: netapp-nfs
   availability: nova
-  # Controls ControllerUnpublishVolume behavior.
-  # Only one of detachOnUnpublish / deleteVolumeOnUnpublish should be "true".
-  # If both are "true", deleteVolumeOnUnpublish takes precedence.
-  #
-  # detachOnUnpublish:
-  #   "false" (default) — No-op; Shadow VM persists for direct boot-from-volume.
-  #   "true"  — Detach volume from Shadow VM + delete Shadow VM;
-  #              volume left in 'available' state for clone workflow.
-  detachOnUnpublish: "false"
-  #
-  # deleteVolumeOnUnpublish:
-  #   "false" (default) — Do not delete the Cinder volume on unpublish.
-  #   "true"  — Detach + delete Shadow VM + DELETE the Cinder volume.
-  #              Use when orchestrator has already cloned the volume
-  #              and PVC deletion should trigger full cleanup.
+  # Controls ControllerUnpublishVolume behavior:
+  #   "false" (default) — No-op; Shadow VM and volume persist.
+  #     Orchestrator manages Shadow VM cleanup + target VM creation
+  #     via OpenStack APIs post-CSI.
+  #   "true" — Full cleanup: detach + delete Shadow VM + DELETE
+  #     the Cinder volume. Use when orchestrator has already
+  #     cloned the volume and PVC deletion should trigger cleanup.
   deleteVolumeOnUnpublish: "false"
 ```
 
@@ -554,46 +549,11 @@ parameters:
   deleteVolumeOnUnpublish: "true"
 ```
 
-**Implementation Flow — Detach Mode (`detachOnUnpublish: "true"`):**
+**Implementation Flow — Full Cleanup Mode (`deleteVolumeOnUnpublish: "true"`):**
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│   ControllerUnpublishVolume RPC — Detach Mode                             │
-└────────────────────────────────────────────────────────────────────────────┘
-
-  CSI Controller Plugin                     Target OpenStack
-       │                                         │
-       │  1. Read volume metadata:                │
-       │     cloud.GetVolume(req.VolumeId)         │
-       │     → Check properties["csi.detachOnUnpublish"]
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  2. Get Shadow VM ID from metadata:      │
-       │     shadow_vm_id = properties["csi.shadow_vm_id"]
-       │                                          │
-       │  3. Detach volume from Shadow VM:         │
-       │     cloud.DetachVolume(shadow_vm_id,      │
-       │                       req.VolumeId)      │
-       │     → Nova DELETE .../os-volume_attachments
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  4. Delete Shadow VM:                    │
-       │     cloud.DeleteServer(shadow_vm_id)      │
-       │     → Nova DELETE /v2/servers/{id}        │
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  Volume is now in 'available' state.     │
-       │  Orchestrator can clone it to a new vol  │
-       │  with OpenStack tenant naming.           │
-       │                                          │
-       │  5. Return ControllerUnpublishVolumeResponse{}
-```
-
-**Implementation Flow — Delete Volume Mode (`deleteVolumeOnUnpublish: "true"`):**
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│   ControllerUnpublishVolume RPC — Delete Volume Mode                       │
+│   ControllerUnpublishVolume RPC — Full Cleanup Mode                        │
 └────────────────────────────────────────────────────────────────────────────┘
 
   CSI Controller Plugin                     Target OpenStack
@@ -639,7 +599,6 @@ parameters:
        │  ControllerUnpublishVolume(req):
        │    1. Read volume metadata:
        │       → deleteVolumeOnUnpublish = false
-       │       → detachOnUnpublish = false
        │    2. No-op: Shadow VM attachment stays intact
        │    3. Return ControllerUnpublishVolumeResponse{}
        │
@@ -648,15 +607,14 @@ parameters:
        │  (Section 4.5) or DeleteVolume on failure.
 ```
 
-**Why Three Modes?**
+**Why Two Modes?**
 
-The three modes map to distinct orchestration workflows after the data transfer completes:
+The two modes map to distinct orchestration workflows after the data transfer completes. Since the orchestrator has full OpenStack API access, the middle ground of "detach only" is unnecessary — the orchestrator can always manage volume lifecycle directly.
 
 | Workflow | ControllerUnpublish Mode | Post-CSI Steps |
 |----------|--------------------------|----------------|
-| **Direct boot-from-volume** | No-op (default) | Orchestrator: virt-v2v → detach from Shadow VM → delete Shadow VM → set bootable → `openstack server create --volume` |
-| **Clone to tenant volume (manual cleanup)** | Detach + Cleanup | Orchestrator: `openstack volume create --source ${VOLUME_ID}` → virt-v2v on clone → set bootable → `openstack server create --volume` → orchestrator deletes original migration volume via OpenStack API |
-| **Clone to tenant volume (auto cleanup)** | Detach + Delete Volume | Orchestrator: `openstack volume create --source ${VOLUME_ID}` → virt-v2v on clone → set bootable → `openstack server create --volume` → orchestrator deletes PVC/PV → **CSI driver automatically deletes the original Cinder volume** |
+| **Direct boot-from-volume** | No-op (default) | Orchestrator (via OpenStack API): virt-v2v → detach from Shadow VM → delete Shadow VM → set bootable → `openstack server create --volume` |
+| **Clone to tenant volume** | Full Cleanup (`deleteVolumeOnUnpublish`) | Orchestrator: `openstack volume create --source ${VOLUME_ID}` → virt-v2v on clone → set bootable → `openstack server create --volume` → delete PVC/PV → **CSI driver automatically deletes the original Cinder volume + Shadow VM** |
 
 #### 4.2.4 `DeleteVolume` — Cinder Volume Deletion (Failure Cleanup)
 
@@ -928,28 +886,16 @@ The following diagram shows the complete CSI RPC call sequence as orchestrated b
   │     │                              │     VM + delete Shadow  │
   │     │                              │     VM + DELETE Cinder  │
   │     │                              │     volume (full clean) │
-  │     │                              │── ELIF detachOnUnpub:   │
-  │     │                              │     Detach from Shadow  │
-  │     │                              │     VM + delete Shadow  │
-  │     │                              │     VM → vol 'available'│
   │     │                              │── ELSE: no-op           │
   │     │◄─────────────────────────────┤                         │
   │     │                              │                         │
   │  (Migration success — direct boot):│                         │
   │   Post-CSI orchestrator handles    │                         │
   │   Shadow VM cleanup (if no-op) +   │                         │
-  │   target VM creation from volume.  │                         │
+  │   target VM creation from volume   │                         │
+  │   via OpenStack APIs.              │                         │
   │     │                              │                         │
-  │  (Migration success — clone,       │                         │
-  │   manual cleanup):                 │                         │
-  │   Shadow VM already cleaned up     │                         │
-  │   (detachOnUnpublish). Orchestrator│                         │
-  │   clones vol with tenant naming    │                         │
-  │   → creates target VM from clone   │                         │
-  │   → orchestrator deletes orig vol. │                         │
-  │     │                              │                         │
-  │  (Migration success — clone,       │                         │
-  │   auto cleanup):                   │                         │
+  │  (Migration success — clone):      │                         │
   │   Orchestrator already cloned vol. │                         │
   │   PVC/PV deletion triggers CSI     │                         │
   │   deleteVolumeOnUnpublish → orig   │                         │
@@ -967,9 +913,9 @@ The following diagram shows the complete CSI RPC call sequence as orchestrated b
 
 ### 4.5 Volume Finalization and VM Creation (Post-CSI)
 
-After all CSI RPCs complete (volume is unpublished, unstaged, and controller-unpublished), the WRC blueprint orchestrator performs the final migration steps **outside of CSI**. The steps differ depending on the `detachOnUnpublish` mode:
+After all CSI RPCs complete (volume is unpublished, unstaged, and controller-unpublished), the WRC blueprint orchestrator performs the final migration steps **outside of CSI**. The steps differ depending on the `deleteVolumeOnUnpublish` mode:
 
-**Path A: Direct Boot-from-Volume (`detachOnUnpublish: "false"` — default)**
+**Path A: Direct Boot-from-Volume (`deleteVolumeOnUnpublish: "false"` — default)**
 
 Shadow VM still exists. Orchestrator detaches, cleans up, and creates the target VM from the same volume:
 
@@ -1012,57 +958,13 @@ Shadow VM still exists. Orchestrator detaches, cleans up, and creates the target
        │                                          │  ✓ Migration complete
 ```
 
-**Path B: Clone to Tenant Volume — Manual Cleanup (`detachOnUnpublish: "true"`)**
-
-Shadow VM already deleted by `ControllerUnpublishVolume`. Volume is in `available` state. Orchestrator clones it to a new volume with OpenStack tenant naming, then creates the target VM, and deletes the original migration volume:
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│       Post-CSI Path B: Clone to Tenant Volume (Manual Cleanup)             │
-│       (Orchestrated by WRC Blueprint, not CSI RPCs)                        │
-└────────────────────────────────────────────────────────────────────────────┘
-
-  WRC Orchestrator                          Target OpenStack
-       │                                         │
-       │  1. Clone migration volume to tenant vol │
-       │     openstack volume create              │
-       │       --source ${VOLUME_ID}              │
-       │       --name ${TENANT_VM_NAME}-root      │
-       │       --type ${TENANT_VOLUME_TYPE}       │
-       ├────────────────────────────────────────► │
-       │                                          │  Cinder clones volume
-       │  ◄── CLONE_VOLUME_ID                     │
-       │                                          │
-       │  2. virt-v2v-in-place on cloned volume   │
-       │     (inject virtio drivers)               │
-       │                                          │
-       │  3. Set cloned volume bootable            │
-       │     openstack volume set --bootable      │
-       │     ${CLONE_VOLUME_ID}                   │
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  4. Create target VM from cloned volume  │
-       │     openstack server create              │
-       │     --volume ${CLONE_VOLUME_ID}          │
-       │     --flavor ${FLAVOR}                   │
-       │     --network ${NETWORK}                 │
-       │     ${TENANT_VM_NAME}                    │
-       ├────────────────────────────────────────► │
-       │                                          │  VM boots from cloned volume
-       │                                          │
-       │  5. Delete original migration volume     │
-       │     openstack volume delete ${VOLUME_ID} │
-       ├────────────────────────────────────────► │
-       │                                          │  ✓ Migration complete
-```
-
-**Path C: Clone to Tenant Volume — Auto Cleanup (`deleteVolumeOnUnpublish: "true"`)**
+**Path B: Clone to Tenant Volume (`deleteVolumeOnUnpublish: "true"`)**
 
 Orchestrator clones the migration volume **before** deleting the PVC/PV. When the orchestrator deletes the PVC, `ControllerUnpublishVolume` automatically cleans up the Shadow VM and deletes the original Cinder volume, removing the need for the orchestrator to make separate OpenStack API calls for volume cleanup:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│       Post-CSI Path C: Clone to Tenant Volume (Auto Cleanup)               │
+│       Post-CSI Path B: Clone to Tenant Volume (Auto Cleanup)               │
 │       Orchestrator clones BEFORE PVC deletion; CSI handles cleanup         │
 └────────────────────────────────────────────────────────────────────────────┘
 
@@ -1107,7 +1009,7 @@ Orchestrator clones the migration volume **before** deleting the PVC/PV. When th
        │                                          │    (no orphaned volumes)
 ```
 
-> **Important Ordering Constraint (Path C):** The orchestrator **MUST** complete the volume clone (`openstack volume create --source`) and verify the clone is in `available` state **before** deleting the PVC/PV. Deleting the PVC first would trigger `ControllerUnpublishVolume` which deletes the source volume, causing the clone to fail.
+> **Important Ordering Constraint (Path B):** The orchestrator **MUST** complete the volume clone (`openstack volume create --source`) and verify the clone is in `available` state **before** deleting the PVC/PV. Deleting the PVC first would trigger `ControllerUnpublishVolume` which deletes the source volume, causing the clone to fail.
 
 ---
 
@@ -1164,17 +1066,11 @@ Orchestrator clones the migration volume **before** deleting the PVC/PV. When th
  │                                                             │
  │  Path A (default — Shadow VM still exists):                 │
  │    1. virt-v2v-in-place (inject virtio drivers)             │
- │    2. Detach volume from Shadow VM                          │
- │    3. Delete Shadow VM                                      │
+ │    2. Detach volume from Shadow VM (orchestrator)           │
+ │    3. Delete Shadow VM (orchestrator)                       │
  │    4. Mark volume bootable                                  │
  │                                                             │
- │  Path B (detachOnUnpublish — manual cleanup):               │
- │    1. Clone volume with tenant naming                       │
- │    2. virt-v2v-in-place on cloned volume                    │
- │    3. Mark cloned volume bootable                           │
- │    4. Delete original migration volume (orchestrator)       │
- │                                                             │
- │  Path C (deleteVolumeOnUnpublish — auto cleanup):           │
+ │  Path B (deleteVolumeOnUnpublish — auto cleanup):           │
  │    1. Clone volume with tenant naming                       │
  │    2. virt-v2v-in-place on cloned volume                    │
  │    3. Mark cloned volume bootable                           │
@@ -1468,7 +1364,7 @@ Created ──► Running ──► Stopped ──► (Migration runs) ──►
      attachment   populated
 ```
 
-**Cleanup Script — Path A (default, `detachOnUnpublish: "false"`):**
+**Cleanup Script — Path A (default, `deleteVolumeOnUnpublish: "false"`):**
 
 ```bash
 # After migration is complete and target VM is created:
@@ -1491,35 +1387,7 @@ openstack server delete shadow-${VM_NAME}
 openstack server create --volume ${VOLUME_ID} ...
 ```
 
-**Cleanup Script — Path B (`detachOnUnpublish: "true"`, manual cleanup):**
-
-```bash
-# After migration is complete — Shadow VM already deleted by CSI:
-
-# 1. Unmount NFS from WRCP host (handled by NodeUnstageVolume)
-umount /var/lib/cinder-nfs/migration-${VM_NAME}-vda
-rmdir /var/lib/cinder-nfs/migration-${VM_NAME}-vda
-
-# 2. Delete K8S PV/PVC resources
-kubectl delete pvc migration-${VM_NAME}-vda-pvc
-kubectl delete pv migration-${VM_NAME}-vda-pv
-
-# 3. Clone volume with OpenStack tenant naming convention
-openstack volume create \
-  --source ${VOLUME_ID} \
-  --name ${TENANT_VM_NAME}-root \
-  --type ${TENANT_VOLUME_TYPE}
-
-CLONE_VOLUME_ID=$(openstack volume show ${TENANT_VM_NAME}-root -f value -c id)
-
-# 4. Create target VM from cloned volume
-openstack server create --volume ${CLONE_VOLUME_ID} ...
-
-# 5. Delete original migration volume (orchestrator responsibility)
-openstack volume delete ${VOLUME_ID}
-```
-
-**Cleanup Script — Path C (`deleteVolumeOnUnpublish: "true"`, auto cleanup):**
+**Cleanup Script — Path B (`deleteVolumeOnUnpublish: "true"`, auto cleanup):**
 
 ```bash
 # After migration data transfer is complete:
