@@ -694,7 +694,7 @@ This RPC reverses `CreateVolume` — it cleans up the Shadow VM (if it still exi
        │  4. Return DeleteVolumeResponse{}        │
 ```
 
-**Note:** In the migration use case, `DeleteVolume` is typically **not** called after a successful migration — the volume is either used directly to boot the target VM, or cloned to a new volume. `DeleteVolume` is called only for cleanup on migration failure/cancellation. The Shadow VM may or may not exist at this point depending on whether `ControllerUnpublishVolume` ran with `detachOnUnpublish: "true"`.
+**Note:** In the migration use case, `DeleteVolume` is typically **not** called after a successful migration — the volume is either used directly to boot the target VM, or cloned to a new volume. `DeleteVolume` is called only for cleanup on migration failure/cancellation. When using `deleteVolumeOnUnpublish: "true"`, the Cinder volume is already deleted by `ControllerUnpublishVolume`, so `DeleteVolume` becomes a no-op (the volume no longer exists in Cinder). The driver handles this gracefully — if the volume is not found, `DeleteVolume` returns success (idempotency). The Shadow VM may or may not exist at this point depending on which `ControllerUnpublishVolume` mode was used.
 
 ### 4.3 CSI Node Service
 
