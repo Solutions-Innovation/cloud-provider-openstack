@@ -9,37 +9,48 @@
 
 ## Table of Contents
 
-- [1. Problem Statement](#1-problem-statement)
-  - [1.1 Current Architecture Limitations](#11-current-architecture-limitations)
-  - [1.2 Network Isolation Problem](#12-network-isolation-problem)
-- [2. Proposed Solution](#2-proposed-solution)
-  - [2.1 Key Insight: NFS-Backed Cinder Volumes](#21-key-insight-nfs-backed-cinder-volumes)
-  - [2.2 Design Goals](#22-design-goals)
-- [3. Architecture Overview](#3-architecture-overview)
-  - [3.1 Current Architecture (CSI-Based, Addon K8S Cluster)](#31-current-architecture-csi-based-addon-k8s-cluster)
-  - [3.2 Proposed Architecture (NFS Direct Mount on WRCP/WRC Host)](#32-proposed-architecture-nfs-direct-mount-on-wrcpwrc-host)
-  - [3.3 Architecture Comparison](#33-architecture-comparison)
-- [4. Detailed Design](#4-detailed-design)
-  - [4.1 Phase 1 — Cinder Volume Provisioning via Shadow VM](#41-phase-1--cinder-volume-provisioning-via-shadow-vm)
-  - [4.2 Phase 2 — NFS Connection Discovery](#42-phase-2--nfs-connection-discovery)
-  - [4.3 Phase 3 — NFS Mount on WRCP/WRC Worker Host](#43-phase-3--nfs-mount-on-wrcpwrc-worker-host)
-  - [4.4 Phase 4 — Bind Mount into CDI Importer Pod](#44-phase-4--bind-mount-into-cdi-importer-pod)
-  - [4.5 Phase 5 — Volume Finalization and VM Creation](#45-phase-5--volume-finalization-and-vm-creation)
-- [5. Component Flow](#5-component-flow)
-  - [5.1 End-to-End Workflow](#51-end-to-end-workflow)
-  - [5.2 Data Path Visualization](#52-data-path-visualization)
-- [6. Implementation Details](#6-implementation-details)
-  - [6.1 NFS Volume Discovery Script](#61-nfs-volume-discovery-script)
-  - [6.2 PV/PVC Definition for NFS Volume](#62-pvpvc-definition-for-nfs-volume)
-  - [6.3 CDI Importer Pod Specification](#63-cdi-importer-pod-specification)
-  - [6.4 Shadow VM Lifecycle Management](#64-shadow-vm-lifecycle-management)
-- [7. Network Architecture](#7-network-architecture)
-  - [7.1 Network Topology](#71-network-topology)
-  - [7.2 Network Requirements](#72-network-requirements)
-- [8. Prerequisites](#8-prerequisites)
-- [9. Risks and Mitigations](#9-risks-and-mitigations)
-- [10. Future Work](#10-future-work)
-- [11. References](#11-references)
+- [Design Proposal: NFS-Backed Cinder Volume Direct Mount for WRCP/WRC Migration](#design-proposal-nfs-backed-cinder-volume-direct-mount-for-wrcpwrc-migration)
+  - [Table of Contents](#table-of-contents)
+  - [1. Problem Statement](#1-problem-statement)
+    - [1.1 Current Architecture Limitations](#11-current-architecture-limitations)
+    - [1.2 Network Isolation Problem](#12-network-isolation-problem)
+  - [2. Proposed Solution](#2-proposed-solution)
+    - [2.1 Key Insight: NFS-Backed Cinder Volumes](#21-key-insight-nfs-backed-cinder-volumes)
+    - [2.2 Design Goals](#22-design-goals)
+  - [3. Architecture Overview](#3-architecture-overview)
+    - [3.1 Current Architecture (CSI-Based, Addon K8S Cluster)](#31-current-architecture-csi-based-addon-k8s-cluster)
+    - [3.2 Proposed Architecture (NFS Direct Mount on WRCP/WRC Host)](#32-proposed-architecture-nfs-direct-mount-on-wrcpwrc-host)
+    - [3.3 Architecture Comparison](#33-architecture-comparison)
+  - [4. Detailed Design — CSI RPC Mapping](#4-detailed-design--csi-rpc-mapping)
+    - [4.0 CSI Volume Lifecycle Reference](#40-csi-volume-lifecycle-reference)
+    - [4.1 CSI Identity Service](#41-csi-identity-service)
+    - [4.2 CSI Controller Service](#42-csi-controller-service)
+      - [4.2.1 `CreateVolume` — Cinder Volume Provisioning + Shadow VM](#421-createvolume--cinder-volume-provisioning--shadow-vm)
+      - [4.2.2 `ControllerPublishVolume` — NFS Connection Discovery](#422-controllerpublishvolume--nfs-connection-discovery)
+      - [4.2.3 `ControllerUnpublishVolume` — NFS Connection Release](#423-controllerunpublishvolume--nfs-connection-release)
+      - [4.2.4 `DeleteVolume` — Shadow VM Cleanup + Cinder Volume Deletion](#424-deletevolume--shadow-vm-cleanup--cinder-volume-deletion)
+    - [4.3 CSI Node Service](#43-csi-node-service)
+      - [4.3.1 `NodeStageVolume` — NFS Mount on WRCP/WRC Worker Host](#431-nodestagevolume--nfs-mount-on-wrcpwrc-worker-host)
+      - [4.3.2 `NodePublishVolume` — Bind Mount Volume File into Pod](#432-nodepublishvolume--bind-mount-volume-file-into-pod)
+      - [4.3.3 `NodeUnpublishVolume` — Remove Pod Bind Mount](#433-nodeunpublishvolume--remove-pod-bind-mount)
+      - [4.3.4 `NodeUnstageVolume` — Unmount NFS Export](#434-nodeunstagevolume--unmount-nfs-export)
+    - [4.4 End-to-End CSI RPC Call Sequence](#44-end-to-end-csi-rpc-call-sequence)
+    - [4.5 Volume Finalization and VM Creation (Post-CSI)](#45-volume-finalization-and-vm-creation-post-csi)
+  - [5. Component Flow](#5-component-flow)
+    - [5.1 End-to-End Workflow](#51-end-to-end-workflow)
+    - [5.2 Data Path Visualization](#52-data-path-visualization)
+  - [6. Implementation Details](#6-implementation-details)
+    - [6.1 NFS Volume Discovery Script](#61-nfs-volume-discovery-script)
+    - [6.2 PV/PVC Definition for NFS Volume](#62-pvpvc-definition-for-nfs-volume)
+    - [6.3 CDI Importer Pod Specification](#63-cdi-importer-pod-specification)
+    - [6.4 Shadow VM Lifecycle Management](#64-shadow-vm-lifecycle-management)
+  - [7. Network Architecture](#7-network-architecture)
+    - [7.1 Network Topology](#71-network-topology)
+    - [7.2 Network Requirements](#72-network-requirements)
+  - [8. Prerequisites](#8-prerequisites)
+  - [9. Risks and Mitigations](#9-risks-and-mitigations)
+  - [10. Future Work](#10-future-work)
+  - [11. References](#11-references)
 
 ---
 
@@ -207,67 +218,222 @@ Problem: CDI Importer cannot reach vCenter on management network  ✗
 
 ---
 
-## 4. Detailed Design
+## 4. Detailed Design — CSI RPC Mapping
 
-### 4.1 Phase 1 — Cinder Volume Provisioning via Shadow VM
+This section maps each migration phase to the corresponding **CSI Specification RPCs** (as defined in the [Container Storage Interface Spec](https://github.com/container-storage-interface/spec/blob/master/spec.md)). The new NFS-Cinder CSI driver (`cinder-nfs.csi.openstack.org`) implements the standard CSI gRPC services but replaces the Nova-attach block path with an NFS direct-mount path.
 
-A **Shadow VM** is created on the target OpenStack to trigger Cinder to provision the NFS-backed volume and establish a proper volume attachment record with NFS connection properties.
+### 4.0 CSI Volume Lifecycle Reference
+
+The CSI spec defines the following volume lifecycle for a dynamically provisioned volume with `STAGE_UNSTAGE_VOLUME` capability:
+
+```
+   CreateVolume +------------+ DeleteVolume
+ +------------->|  CREATED   +--------------+
+ |              +---+----^---+              |
+ |       Controller |    | Controller       v
++++         Publish |    | Unpublish       +++
+|X|          Volume |    | Volume          | |
++-+             +---v----+---+             +-+
+                | NODE_READY |
+                +---+----^---+
+               Node |    | Node
+              Stage |    | Unstage
+             Volume |    | Volume
+                +---v----+---+
+                |  VOL_READY |
+                +---+----^---+
+               Node |    | Node
+            Publish |    | Unpublish
+             Volume |    | Volume
+                +---v----+---+
+                | PUBLISHED  |
+                +------------+
+```
+
+The table below summarizes how each CSI RPC maps to OpenStack operations in the **existing Cinder CSI driver** vs. the **proposed NFS-Cinder CSI driver**:
+
+| CSI RPC | Existing `cinder.csi.openstack.org` | Proposed `cinder-nfs.csi.openstack.org` |
+|---------|--------------------------------------|------------------------------------------|
+| **`CreateVolume`** | Cinder `POST /v3/volumes` | Cinder `POST /v3/volumes` + Shadow VM create (triggers NFS attachment record) |
+| **`DeleteVolume`** | Cinder `DELETE /v3/volumes/{id}` | Shadow VM delete + Cinder `DELETE /v3/volumes/{id}` |
+| **`ControllerPublishVolume`** | Nova `POST /v2/servers/{id}/os-volume_attachments` (block attach) | Query Cinder attachment → extract NFS export/path from `connection_info` properties |
+| **`ControllerUnpublishVolume`** | Nova `DELETE /v2/servers/{id}/os-volume_attachments/{vid}` | No-op (NFS connection info is stateless; Shadow VM attachment persists) |
+| **`NodeStageVolume`** | Discover `/dev/vdb` by serial → `FormatAndMount` to staging path | `mount -t nfs` NFS export → staging path on WRCP host |
+| **`NodeUnstageVolume`** | `umount` staging path | `umount` NFS mount from staging path |
+| **`NodePublishVolume`** | Bind mount staging path (or raw block device) → target path | Bind mount NFS volume file → target path as block device (`/dev/cdi-block-volume`) |
+| **`NodeUnpublishVolume`** | `umount` target path | `umount` bind mount at target path |
+| **`NodeGetInfo`** | Returns Nova instance ID + AZ topology | Returns WRCP host ID + topology label |
+| **`ValidateVolumeCapabilities`** | Validates `SINGLE_NODE_WRITER` | Validates `SINGLE_NODE_WRITER`, `Block` access type, `nfs` driver_volume_type |
+
+### 4.1 CSI Identity Service
+
+The NFS-Cinder CSI driver registers itself with a distinct driver name and advertises the required capabilities.
+
+**`GetPluginInfo`** returns:
+
+| Field | Value |
+|-------|-------|
+| `name` | `cinder-nfs.csi.openstack.org` |
+| `vendor_version` | `1.0.0` |
+
+**`GetPluginCapabilities`** advertises:
+
+| Capability | Type | Rationale |
+|------------|------|-----------|
+| `CONTROLLER_SERVICE` | PluginCapability.Service | Driver implements Controller RPCs for volume provisioning and NFS connection discovery |
+| `VOLUME_ACCESSIBILITY_CONSTRAINTS` | PluginCapability.Service | Volumes are only accessible from nodes with NFS storage network access |
+
+**`Probe`** verifies:
+- OpenStack credentials are valid (Keystone token obtainable)
+- NFS client utilities (`nfs-utils`) are installed on the node (for Node plugin)
+- Target Cinder NFS backend is reachable
+
+### 4.2 CSI Controller Service
+
+The Controller plugin runs on the WRC K8S cluster (does **not** need to run on the target OpenStack). It communicates with the target OpenStack APIs (Keystone, Cinder, Nova) over HTTPS.
+
+**Controller Service Capabilities** (`ControllerGetCapabilities`):
+
+| Capability | Supported | Notes |
+|------------|-----------|-------|
+| `CREATE_DELETE_VOLUME` | Yes | Provisions Cinder NFS volumes via Shadow VM pattern |
+| `PUBLISH_UNPUBLISH_VOLUME` | Yes | Discovers NFS connection info from Cinder attachment properties |
+| `LIST_VOLUMES` | Yes | Lists Cinder volumes filtered by NFS type |
+| `EXPAND_VOLUME` | Yes | Delegates to Cinder `os-extend` API |
+| `CREATE_DELETE_SNAPSHOT` | No | Not required for migration use case |
+| `CLONE_VOLUME` | No | Not required for migration use case |
+
+#### 4.2.1 `CreateVolume` — Cinder Volume Provisioning + Shadow VM
+
+**CSI Spec Reference:** *"A Controller Plugin MUST implement this RPC call if it has `CREATE_DELETE_VOLUME` controller capability. This RPC will be called by the CO to provision a new volume on behalf of a user."*
+
+The `CreateVolume` RPC encapsulates both Cinder volume creation and the Shadow VM lifecycle needed to populate NFS attachment properties.
+
+**Request → Response Mapping:**
+
+| CSI Field | Source / Value |
+|-----------|----------------|
+| `req.Name` | `migration-${VM_NAME}-${DISK_LABEL}` (idempotency key) |
+| `req.CapacityRange.RequiredBytes` | Source VM disk size |
+| `req.Parameters["type"]` | `netapp-nfs` (StorageClass parameter) |
+| `req.Parameters["availability"]` | Target AZ |
+| `resp.Volume.VolumeId` | Cinder volume UUID |
+| `resp.Volume.VolumeContext["nfs_export"]` | `192.168.57.105:/trident_pvc_xxx` |
+| `resp.Volume.VolumeContext["nfs_volume_file"]` | `volume-ba833668-xxx` |
+| `resp.Volume.VolumeContext["shadow_vm_id"]` | Shadow VM Nova instance UUID |
+
+**Implementation Flow:**
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                    PHASE 1: Shadow VM Provisioning                         │
+│          CreateVolume RPC — Controller Plugin                              │
 └────────────────────────────────────────────────────────────────────────────┘
 
-  WRC Orchestrator                          Target OpenStack
+  CSI Controller Plugin                     Target OpenStack
        │                                         │
-       │  1. openstack volume create              │
-       │     --size ${DISK_SIZE}                  │
-       │     --type netapp-nfs                    │
-       │     --bootable                           │
+       │  1. Idempotency check:                   │
+       │     cloud.GetVolumesByName(req.Name)     │
+       │     → Cinder GET /v3/volumes?name=...    │
        ├────────────────────────────────────────► │
-       │                                          │  Cinder provisions NFS volume
-       │                                          │  on NetApp backend
-       │  2. openstack server create              │
-       │     --volume ${VOLUME_ID}                │
-       │     shadow-${VM_NAME}                    │
+       │                                          │
+       │  2. Create Cinder volume:                │
+       │     cloud.CreateVolume(                  │
+       │       Name: req.Name,                    │
+       │       Size: req.CapacityRange,           │
+       │       VolumeType: req.Parameters["type"],│
+       │       AZ: req.Parameters["availability"] │
+       │     )                                    │
+       │     → Cinder POST /v3/volumes            │
+       ├────────────────────────────────────────► │
+       │                                          │  Cinder provisions volume
+       │  ◄── VOLUME_ID                           │  on NFS backend
+       │                                          │
+       │  3. Create Shadow VM (attachment trigger):│
+       │     cloud.CreateServer(                  │
+       │       Name: "shadow-"+req.Name,          │
+       │       Flavor: m1.small,                  │
+       │       Volume: VOLUME_ID,                 │
+       │       Network: migration-network         │
+       │     )                                    │
+       │     → Nova POST /v2/servers              │
        ├────────────────────────────────────────► │
        │                                          │  Nova creates VM, attaches vol
        │                                          │  → Attachment record created
-       │  3. openstack server stop                │     with NFS Properties
-       │     shadow-${VM_NAME}                    │
+       │  4. Stop Shadow VM:                      │     with NFS connection_info
+       │     cloud.StopServer(shadow_id)          │
+       │     → Nova POST /v2/servers/{id}/action  │
        ├────────────────────────────────────────► │
-       │                                          │  Shadow VM stopped
-       │                                          │  Volume + Attachment persist
+       │                                          │
+       │  5. Return CreateVolumeResponse:         │
+       │     Volume.VolumeId = VOLUME_ID          │
+       │     Volume.VolumeContext = {             │
+       │       "shadow_vm_id": shadow_id,         │
+       │       "nfs_export": (queried later       │
+       │                      in ControllerPublish)│
+       │     }                                    │
 ```
 
-**Why a Shadow VM?**
+**Why a Shadow VM in CreateVolume?**
 
-- Cinder's NFS driver populates the `volume attachment` properties (export path, volume filename, mount options) **only when a volume is attached to an instance**.
+- Cinder's NFS driver populates the `volume attachment` properties (export path, volume filename, mount options) **only when a volume is attached to an instance via Nova**.
 - The Shadow VM is a lightweight instance (`m1.small`) whose sole purpose is to trigger this attachment record creation.
-- Once stopped, the Shadow VM consumes negligible resources but keeps the attachment record intact for querying.
+- Once stopped, the Shadow VM consumes negligible resources but keeps the attachment record intact.
+- This maps cleanly to the CSI `CreateVolume` semantic: *"provision a new volume"* — in this case, provisioning includes ensuring the NFS connection metadata is available.
 
-### 4.2 Phase 2 — NFS Connection Discovery
+#### 4.2.2 `ControllerPublishVolume` — NFS Connection Discovery
 
-Query the Cinder volume attachment to extract the NFS export connection info:
+**CSI Spec Reference:** *"This RPC will be called by the CO when it wants to place a workload that uses the volume onto a node. The Plugin SHOULD perform the work that is necessary for making the volume available on the given node."*
+
+In the existing Cinder CSI driver, this RPC calls `Nova os-volume_attachments` to attach a block device to the worker VM. In the NFS-Cinder driver, this RPC **discovers the NFS connection info** from the Cinder volume attachment record and returns it as `publish_context` — which the CO will forward to `NodeStageVolume`.
+
+**Request → Response Mapping:**
+
+| CSI Field | Source / Value |
+|-----------|----------------|
+| `req.VolumeId` | Cinder volume UUID |
+| `req.NodeId` | WRCP worker hostname (from `NodeGetInfo`) |
+| `req.VolumeContext["shadow_vm_id"]` | Shadow VM ID (from `CreateVolume`) |
+| `resp.PublishContext["nfs_export"]` | `192.168.57.105:/trident_pvc_xxx` |
+| `resp.PublishContext["nfs_volume_file"]` | `volume-ba833668-xxx` |
+| `resp.PublishContext["nfs_mount_options"]` | `rw,hard,intr` |
+| `resp.PublishContext["volume_format"]` | `raw` |
+| `resp.PublishContext["driver_volume_type"]` | `nfs` |
+
+**Implementation Flow:**
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                    PHASE 2: NFS Connection Discovery                       │
+│      ControllerPublishVolume RPC — Controller Plugin                       │
 └────────────────────────────────────────────────────────────────────────────┘
 
-  WRC Orchestrator                          Target OpenStack (Cinder API)
+  CSI Controller Plugin                     Target OpenStack (Cinder API)
        │                                         │
-       │  1. openstack volume attachment list     │
-       │     --volume-id ${VOLUME_ID}             │
+       │  1. Validate volume exists:              │
+       │     cloud.GetVolume(req.VolumeId)        │
+       │     → Cinder GET /v3/volumes/{id}        │
+       ├────────────────────────────────────────► │
+       │                                          │
+       │  2. Validate driver_volume_type:         │
+       │     if volume.VolumeType != nfs-backed   │
+       │       → return INVALID_ARGUMENT          │
+       │                                          │
+       │  3. Get attachment ID:                   │
+       │     cloud.ListVolumeAttachments(          │
+       │       VolumeId: req.VolumeId             │
+       │     )                                    │
+       │     → Cinder GET /v3/attachments?vol=... │
        ├────────────────────────────────────────► │
        │                                          │
        │  ◄── ATTACHMENT_ID                       │
        │                                          │
-       │  2. openstack volume attachment show     │
-       │     ${ATTACHMENT_ID}                     │
+       │  4. Get attachment connection_info:      │
+       │     cloud.GetVolumeAttachment(            │
+       │       ATTACHMENT_ID                      │
+       │     )                                    │
+       │     → Cinder GET /v3/attachments/{id}    │
        ├────────────────────────────────────────► │
        │                                          │
-       │  ◄── Properties JSON:                    │
+       │  ◄── connection_info JSON:               │
        │      {                                   │
        │        "export": "192.168.57.105:/trident_pvc_xxx",
        │        "name": "volume-ba833668-xxx",    │
@@ -276,159 +442,351 @@ Query the Cinder volume attachment to extract the NFS export connection info:
        │        "driver_volume_type": "nfs",      │
        │        "mount_point_base": "/opt/stack/data/cinder/mnt"
        │      }                                   │
+       │                                          │
+       │  5. Return ControllerPublishVolumeResponse:
+       │     PublishContext = {                    │
+       │       "nfs_export": connection_info.export,
+       │       "nfs_volume_file": connection_info.name,
+       │       "nfs_mount_options": "rw,hard,intr",
+       │       "volume_format": "raw",            │
+       │       "driver_volume_type": "nfs"        │
+       │     }                                    │
 ```
 
-**Extracted Information:**
+**Key Design Decision:** The `publish_context` map returned here is passed by the CO (kubelet) to `NodeStageVolume` and `NodePublishVolume`. This is exactly how the CSI spec intends controller-to-node communication to work — the opaque `publish_context` carries the NFS connection details that the Node plugin needs to mount the volume.
 
-| Field | Example Value | Usage |
-|-------|---------------|-------|
-| `export` | `192.168.57.105:/trident_pvc_xxx` | NFS server and export path for mount |
-| `name` | `volume-ba833668-xxx` | Volume filename within the NFS export |
-| `format` | `raw` | Confirms volume format (must be `raw` for block mode) |
-| `driver_volume_type` | `nfs` | Validates this is an NFS-backed volume |
-| `options` | `null` (defaults to `rw,hard,intr`) | NFS mount options |
+#### 4.2.3 `ControllerUnpublishVolume` — NFS Connection Release
 
-### 4.3 Phase 3 — NFS Mount on WRCP/WRC Worker Host
+**CSI Spec Reference:** *"This RPC is a reverse operation of ControllerPublishVolume. It MUST be called after all NodeUnstageVolume and NodeUnpublishVolume on the volume are called and succeed."*
 
-Mount the NFS export on the WRCP/WRC worker host where the CDI importer pod will be scheduled:
+In the existing Cinder CSI driver, this calls `Nova DELETE /v2/servers/{id}/os-volume_attachments/{vid}`. In the NFS-Cinder driver, this is effectively a **no-op** because:
+
+- The NFS connection info is stateless (it's just metadata from the attachment record).
+- The Shadow VM attachment must persist until `DeleteVolume` is called.
+- The actual NFS unmount happens in `NodeUnstageVolume` on the node side.
+
+```
+  CSI Controller Plugin
+       │
+       │  ControllerUnpublishVolume(req):
+       │    - Validate volume exists
+       │    - No-op: Shadow VM attachment stays intact
+       │    - Return ControllerUnpublishVolumeResponse{}
+       │
+       │  The NFS mount cleanup is handled by NodeUnstageVolume.
+       │  The Shadow VM cleanup is handled by DeleteVolume.
+```
+
+#### 4.2.4 `DeleteVolume` — Shadow VM Cleanup + Cinder Volume Deletion
+
+**CSI Spec Reference:** *"A Controller Plugin MUST implement this RPC call if it has CREATE_DELETE_VOLUME controller capability. This RPC will be called by the CO to deprovision a volume."*
+
+This RPC reverses `CreateVolume` — it cleans up the Shadow VM and deletes the Cinder volume.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│              PHASE 3: NFS Mount on WRCP/WRC Worker Host                    │
+│          DeleteVolume RPC — Controller Plugin                              │
+└────────────────────────────────────────────────────────────────────────────┘
+
+  CSI Controller Plugin                     Target OpenStack
+       │                                         │
+       │  1. Detach volume from Shadow VM:        │
+       │     cloud.DetachVolume(shadow_vm_id,      │
+       │                       req.VolumeId)      │
+       │     → Nova DELETE .../os-volume_attachments
+       ├────────────────────────────────────────► │
+       │                                          │
+       │  2. Delete Shadow VM:                    │
+       │     cloud.DeleteServer(shadow_vm_id)     │
+       │     → Nova DELETE /v2/servers/{id}       │
+       ├────────────────────────────────────────► │
+       │                                          │
+       │  3. Delete Cinder volume:                │
+       │     cloud.DeleteVolume(req.VolumeId)     │
+       │     → Cinder DELETE /v3/volumes/{id}     │
+       ├────────────────────────────────────────► │
+       │                                          │
+       │  4. Return DeleteVolumeResponse{}        │
+```
+
+**Note:** In the migration use case, `DeleteVolume` is typically **not** called after a successful migration — the volume is detached from the Shadow VM and then used to boot the target VM. `DeleteVolume` is called only for cleanup on migration failure/cancellation.
+
+### 4.3 CSI Node Service
+
+The Node plugin runs on each **WRCP/WRC worker host** where CDI importer pods may be scheduled. It handles the actual NFS mount/unmount and bind-mount operations on the host.
+
+**Node Service Capabilities** (`NodeGetCapabilities`):
+
+| Capability | Supported | Notes |
+|------------|-----------|-------|
+| `STAGE_UNSTAGE_VOLUME` | Yes | NFS mount/unmount at staging path (per-volume, per-node) |
+| `GET_VOLUME_STATS` | Yes | Report NFS-based volume stats |
+| `EXPAND_VOLUME` | No | NFS volume expansion is handled controller-side via Cinder |
+
+#### 4.3.1 `NodeStageVolume` — NFS Mount on WRCP/WRC Worker Host
+
+**CSI Spec Reference:** *"This RPC is called by the CO prior to the volume being consumed by any workloads on the node by NodePublishVolume. The Plugin SHALL assume that this RPC will be executed on the node where the volume will be used."*
+
+In the existing Cinder CSI driver, `NodeStageVolume` discovers the local block device (`/dev/vdb`) by serial number and calls `FormatAndMount`. In the NFS-Cinder driver, it **mounts the NFS export** to the staging path.
+
+**Request → Action Mapping:**
+
+| CSI Field | Source / Value |
+|-----------|----------------|
+| `req.VolumeId` | Cinder volume UUID |
+| `req.PublishContext["nfs_export"]` | `192.168.57.105:/trident_pvc_xxx` (from `ControllerPublishVolume`) |
+| `req.PublishContext["nfs_volume_file"]` | `volume-ba833668-xxx` |
+| `req.PublishContext["nfs_mount_options"]` | `rw,hard,intr` |
+| `req.StagingTargetPath` | `/var/lib/kubelet/plugins/kubernetes.io/csi/pv/.../globalmount` |
+| `req.VolumeCapability` | `Block` access type, `SINGLE_NODE_WRITER` |
+
+**Implementation Flow:**
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│          NodeStageVolume RPC — Node Plugin (WRCP Worker Host)              │
 └────────────────────────────────────────────────────────────────────────────┘
 
   WRCP/WRC Worker Host
   ┌──────────────────────────────────────────────────────────────────────┐
   │                                                                      │
-  │  1. Create mount point directory                                     │
-  │     mkdir -p /var/lib/cinder-nfs/migration-${VM_NAME}-vda            │
+  │  1. Parse publish_context:                                           │
+  │     nfs_export  = req.PublishContext["nfs_export"]                    │
+  │     volume_file = req.PublishContext["nfs_volume_file"]               │
+  │     mount_opts  = req.PublishContext["nfs_mount_options"]             │
   │                                                                      │
-  │  2. Mount NFS export                                                 │
-  │     mount -t nfs -o rw,hard,intr \                                   │
-  │       192.168.57.105:/trident_pvc_xxx \                              │
-  │       /var/lib/cinder-nfs/migration-${VM_NAME}-vda                   │
+  │  2. Idempotency check:                                               │
+  │     if staging_target_path already mounted → return OK               │
   │                                                                      │
-  │  3. Verify volume file exists                                        │
-  │     ls -la /var/lib/cinder-nfs/migration-${VM_NAME}-vda/             │
-  │       └── volume-ba833668-xxx   (raw volume file, ${DISK_SIZE}G)     │
+  │  3. Create staging directory:                                        │
+  │     mkdir -p ${req.StagingTargetPath}                                │
   │                                                                      │
-  │  VOLUME_PATH=/var/lib/cinder-nfs/migration-${VM_NAME}-vda/          │
-  │              volume-ba833668-xxx                                      │
+  │  4. Mount NFS export to staging path:                                │
+  │     mount -t nfs -o ${mount_opts} \                                  │
+  │       ${nfs_export} \                                                │
+  │       ${req.StagingTargetPath}                                       │
+  │                                                                      │
+  │  5. Verify volume file exists at staging path:                       │
+  │     stat ${req.StagingTargetPath}/${volume_file}                     │
+  │     → Confirm file size matches req.VolumeCapability size            │
+  │                                                                      │
+  │  6. Return NodeStageVolumeResponse{}                                 │
   │                                                                      │
   └──────────────────────────────────────────────────────────────────────┘
 
-  Storage Network:
+  Result:
   ┌────────────────────┐         NFS          ┌─────────────────────────┐
   │ WRCP Worker Host   │◄───────────────────►│ NFS Server              │
-  │ (NFS Client)       │   192.168.57.x net  │ (NetApp / Cinder NFS)   │
+  │ staging_target_path│   192.168.57.x net  │ (NetApp / Cinder NFS)   │
+  │  └── volume-xxx    │                      │  └── volume-xxx (raw)   │
   └────────────────────┘                      └─────────────────────────┘
 ```
 
-**Mount Point Convention:** `/var/lib/cinder-nfs/migration-${VM_NAME}-${DISK_LABEL}/`
+**Comparison with existing Cinder CSI `NodeStageVolume`:**
 
-This path avoids potential SELinux issues and follows the convention used by Cinder NFS driver mounts.
+| Step | Existing (`cinder.csi.openstack.org`) | NFS-Cinder (`cinder-nfs.csi.openstack.org`) |
+|------|----------------------------------------|----------------------------------------------|
+| Device discovery | `GetDevicePath()` → scan `/dev/disk/by-id/` for virtio serial | Parse `publish_context["nfs_export"]` |
+| Mount type | `FormatAndMount(devicePath, stagingPath, fsType)` | `mount -t nfs -o opts nfs_export stagingPath` |
+| Format required | Yes (ext4/xfs on raw block device) | No (NFS volume file is pre-allocated raw) |
+| Dev path source | Nova block device attachment (`/dev/vdb`) | NFS network mount |
 
-### 4.4 Phase 4 — Bind Mount into CDI Importer Pod
+#### 4.3.2 `NodePublishVolume` — Bind Mount Volume File into Pod
 
-The CDI importer pod is configured to mount the NFS volume file as a block device using Kubernetes' `hostPath` volume with bind mount:
+**CSI Spec Reference:** *"This RPC is called by the CO when a workload that wants to use the specified volume is placed (scheduled) on a node. For volumes with an access type of block, the SP SHALL place the block device at target_path."*
+
+In the existing Cinder CSI driver, `NodePublishVolume` bind-mounts the staged block device or mount point to the pod's target path. In the NFS-Cinder driver, it **bind-mounts the specific volume file** from the NFS staging path to the pod's `target_path` as a raw block device.
+
+**Request → Action Mapping:**
+
+| CSI Field | Source / Value |
+|-----------|----------------|
+| `req.VolumeId` | Cinder volume UUID |
+| `req.StagingTargetPath` | NFS mount point (from `NodeStageVolume`) |
+| `req.TargetPath` | `/var/lib/kubelet/pods/{uid}/volumeDevices/...` |
+| `req.VolumeCapability` | `Block` access type |
+| `req.PublishContext["nfs_volume_file"]` | `volume-ba833668-xxx` |
+
+**Implementation Flow:**
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│              PHASE 4: Bind Mount into CDI Importer Pod                     │
+│        NodePublishVolume RPC — Node Plugin (WRCP Worker Host)              │
 └────────────────────────────────────────────────────────────────────────────┘
 
-  WRC K8S Cluster
+  WRCP/WRC Worker Host
   ┌──────────────────────────────────────────────────────────────────────┐
   │                                                                      │
-  │  Option A: Static PV/PVC with hostPath (Recommended for MVP)         │
-  │  ──────────────────────────────────────────────────────               │
+  │  1. Determine volume file path:                                      │
+  │     source = ${req.StagingTargetPath}/${publish_context.volume_file}  │
+  │     target = ${req.TargetPath}   (e.g. /dev/cdi-block-volume in pod) │
   │                                                                      │
-  │  PersistentVolume:                                                   │
-  │    spec:                                                             │
-  │      hostPath:                                                       │
-  │        path: /var/lib/cinder-nfs/migration-vm1-vda/volume-xxx        │
-  │        type: FileOrCreate                                            │
-  │      volumeMode: Block                                               │
-  │      nodeAffinity: (pin to worker with NFS mount)                    │
+  │  2. Idempotency check:                                               │
+  │     if target already bind-mounted → return OK                       │
   │                                                                      │
-  │  PersistentVolumeClaim:                                              │
-  │    spec:                                                             │
-  │      volumeMode: Block                                               │
-  │      accessModes: [ReadWriteOnce]                                    │
-  │      storageClassName: "" (static binding)                           │
+  │  3. For Block access type:                                           │
+  │     a. Create target file if not exists:                             │
+  │        touch ${req.TargetPath}                                       │
+  │     b. Bind mount volume file to target:                             │
+  │        mount --bind ${source} ${req.TargetPath}                      │
   │                                                                      │
-  │  CDI Importer Pod:                                                   │
-  │    volumeDevices:                                                    │
-  │      - name: cdi-data-vol                                            │
-  │        devicePath: /dev/cdi-block-volume                             │
-  │    volumes:                                                          │
-  │      - name: cdi-data-vol                                            │
-  │        persistentVolumeClaim:                                        │
-  │          claimName: migration-vm1-vda-pvc                            │
+  │  4. Return NodePublishVolumeResponse{}                               │
   │                                                                      │
-  │  Option B: Direct hostPath volume in Pod spec                        │
-  │  ────────────────────────────────────────────                        │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  Data Path (inside CDI Importer Pod):
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  CDI Importer Pod                                                    │
   │                                                                      │
-  │  CDI Importer Pod:                                                   │
-  │    volumes:                                                          │
-  │      - name: cdi-data-vol                                            │
-  │        hostPath:                                                     │
-  │          path: /var/lib/cinder-nfs/migration-vm1-vda/volume-xxx      │
-  │          type: FileOrCreate                                          │
-  │                                                                      │
+  │  /dev/cdi-block-volume                                               │
+  │    │  (bind mount from staging_target/volume-ba833668-xxx)           │
+  │    │                                                                 │
+  │    └─► VDDK Client writes VMDK data here                            │
+  │        → write goes through bind mount                               │
+  │        → lands on NFS-mounted volume file                            │
+  │        → NFS write-through to Cinder NFS backend                    │
+  │        → Cinder volume updated in-place                              │
   └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Data Flow in Container:**
+#### 4.3.3 `NodeUnpublishVolume` — Remove Pod Bind Mount
+
+**CSI Spec Reference:** *"This RPC is a reverse operation of NodePublishVolume. This RPC MUST undo the work by the corresponding NodePublishVolume."*
 
 ```
-NFS Server                 WRCP Worker Host                CDI Importer Pod
-─────────                  ────────────────                ────────────────
-NFS Export                 NFS Mount                       Bind Mount
- └─ volume-xxx    ◄─────►  /var/lib/cinder-nfs/...  ────►  /dev/cdi-block-volume
-    (raw file)                └─ volume-xxx                 (block device)
-                               (raw file)
-                                                            VDDK Client writes
-                                                            directly to this
-                                                            → NFS write-through
-                                                            → Cinder volume updated
+  Node Plugin:
+    1. umount ${req.TargetPath}     // remove bind mount
+    2. Remove target file/dir
+    3. Return NodeUnpublishVolumeResponse{}
 ```
 
-### 4.5 Phase 5 — Volume Finalization and VM Creation
+#### 4.3.4 `NodeUnstageVolume` — Unmount NFS Export
 
-After all CDI data transfers (full copy + precopy deltas + final cutover delta) are complete:
+**CSI Spec Reference:** *"This RPC is a reverse operation of NodeStageVolume. This RPC MUST undo the work by the corresponding NodeStageVolume."*
+
+```
+  Node Plugin:
+    1. umount ${req.StagingTargetPath}   // unmount NFS export
+    2. rmdir ${req.StagingTargetPath}
+    3. Return NodeUnstageVolumeResponse{}
+```
+
+**Important:** Per the CSI spec, the CO guarantees that `NodeUnstageVolume` is called **only after** all `NodeUnpublishVolume` calls for the volume have returned success. This ensures the NFS mount is removed only after all pod bind mounts are cleaned up.
+
+### 4.4 End-to-End CSI RPC Call Sequence
+
+The following diagram shows the complete CSI RPC call sequence as orchestrated by the CO (kubelet + external-provisioner + external-attacher sidecars) during the migration lifecycle:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              CSI RPC Call Sequence — Migration Lifecycle                         │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+ CO (kubelet + sidecars)        Controller Plugin           Node Plugin
+ ══════════════════════         ═════════════════           ═══════════
+        │                              │                         │
+  PVC Created                          │                         │
+        │                              │                         │
+  ┌─────┤  1. CreateVolume             │                         │
+  │     ├─────────────────────────────►│                         │
+  │     │                              │── Cinder create vol     │
+  │     │                              │── Nova create shadow VM │
+  │     │                              │── Nova stop shadow VM   │
+  │     │◄─────────────────────────────┤                         │
+  │     │  VolumeId + VolumeContext    │                         │
+  │     │                              │                         │
+  │  Pod Scheduled to WRCP Worker      │                         │
+  │     │                              │                         │
+  │     │  2. ControllerPublishVolume  │                         │
+  │     ├─────────────────────────────►│                         │
+  │     │                              │── Query attachment      │
+  │     │                              │── Extract NFS conn info │
+  │     │◄─────────────────────────────┤                         │
+  │     │  PublishContext (NFS info)   │                         │
+  │     │                              │                         │
+  │     │  3. NodeStageVolume          │                         │
+  │     ├──────────────────────────────┼────────────────────────►│
+  │     │                              │                         │── mount -t nfs
+  │     │                              │                         │   nfs_export →
+  │     │                              │                         │   staging_path
+  │     │◄─────────────────────────────┼─────────────────────────┤
+  │     │                              │                         │
+  │     │  4. NodePublishVolume        │                         │
+  │     ├──────────────────────────────┼────────────────────────►│
+  │     │                              │                         │── mount --bind
+  │     │                              │                         │   vol_file →
+  │     │                              │                         │   target_path
+  │     │◄─────────────────────────────┼─────────────────────────┤
+  │     │                              │                         │
+  │ CDI Importer Pod runs:             │                         │
+  │ ┌───────────────────────────┐      │                         │
+  │ │ VDDK → /dev/cdi-block-vol │      │                         │
+  │ │ (full copy + precopies)   │      │                         │
+  │ └───────────────────────────┘      │                         │
+  │     │                              │                         │
+  │ Migration complete / cutover       │                         │
+  │     │                              │                         │
+  │     │  5. NodeUnpublishVolume      │                         │
+  │     ├──────────────────────────────┼────────────────────────►│
+  │     │                              │                         │── umount target
+  │     │◄─────────────────────────────┼─────────────────────────┤
+  │     │                              │                         │
+  │     │  6. NodeUnstageVolume        │                         │
+  │     ├──────────────────────────────┼────────────────────────►│
+  │     │                              │                         │── umount NFS
+  │     │◄─────────────────────────────┼─────────────────────────┤
+  │     │                              │                         │
+  │     │  7. ControllerUnpublishVol   │                         │
+  │     ├─────────────────────────────►│                         │
+  │     │                              │── no-op                 │
+  │     │◄─────────────────────────────┤                         │
+  │     │                              │                         │
+  │  (Migration success path:          │                         │
+  │   Volume NOT deleted — used for    │                         │
+  │   target VM boot)                  │                         │
+  │     │                              │                         │
+  │  OR (Migration failure path):      │                         │
+  │     │  8. DeleteVolume             │                         │
+  │     ├─────────────────────────────►│                         │
+  │     │                              │── Delete shadow VM      │
+  │     │                              │── Delete Cinder volume  │
+  │     │◄─────────────────────────────┤                         │
+  └─────┤                              │                         │
+```
+
+### 4.5 Volume Finalization and VM Creation (Post-CSI)
+
+After all CSI RPCs complete (volume is unpublished, unstaged, and controller-unpublished), the WRC blueprint orchestrator performs the final migration steps **outside of CSI**:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│              PHASE 5: Volume Finalization & VM Creation                    │
+│       Post-CSI: Volume Finalization & VM Creation                          │
+│       (Orchestrated by WRC Blueprint, not CSI RPCs)                        │
 └────────────────────────────────────────────────────────────────────────────┘
 
   WRC Orchestrator                          Target OpenStack
        │                                         │
-       │  1. Unmount NFS on WRCP host             │
-       │     umount /var/lib/cinder-nfs/...       │
-       │                                          │
-       │  2. Run virt-v2v-in-place                │
+       │  1. virt-v2v-in-place                    │
        │     (inject virtio drivers into          │
        │      the volume via NFS re-mount         │
        │      or via Shadow VM)                   │
        │                                          │
-       │  3. Detach volume from Shadow VM         │
+       │  2. Detach volume from Shadow VM         │
        │     openstack server remove volume       │
        │     shadow-${VM_NAME} ${VOLUME_ID}       │
        ├────────────────────────────────────────► │
        │                                          │
-       │  4. Delete Shadow VM                     │
+       │  3. Delete Shadow VM                     │
        │     openstack server delete              │
        │     shadow-${VM_NAME}                    │
        ├────────────────────────────────────────► │
        │                                          │
-       │  5. Set volume bootable                  │
+       │  4. Set volume bootable                  │
        │     openstack volume set --bootable      │
        │     ${VOLUME_ID}                         │
        ├────────────────────────────────────────► │
        │                                          │
-       │  6. Create target VM from volume         │
+       │  5. Create target VM from volume         │
        │     openstack server create              │
        │     --volume ${VOLUME_ID}                │
        │     --flavor ${FLAVOR}                   │
