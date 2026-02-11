@@ -1,7 +1,7 @@
 # Design Proposal: NFS-Backed Cinder Volume Direct Mount for WRCP/WRC Migration
 
 > **Status**: Draft  
-> **Version**: 0.1  
+> **Version**: 0.2  
 > **Date**: February 2026  
 > **Authors**: WindRiver Migration Framework Team
 
@@ -16,7 +16,8 @@
     - [1.2 Network Isolation Problem](#12-network-isolation-problem)
   - [2. Proposed Solution](#2-proposed-solution)
     - [2.1 Key Insight: NFS-Backed Cinder Volumes](#21-key-insight-nfs-backed-cinder-volumes)
-    - [2.2 Design Goals](#22-design-goals)
+    - [2.2 Supported Migration Use Cases](#22-supported-migration-use-cases)
+    - [2.3 Design Goals](#23-design-goals)
   - [3. Architecture Overview](#3-architecture-overview)
     - [3.1 Current Architecture (CSI-Based, Addon K8S Cluster)](#31-current-architecture-csi-based-addon-k8s-cluster)
     - [3.2 Proposed Architecture (NFS Direct Mount on WRCP/WRC Host)](#32-proposed-architecture-nfs-direct-mount-on-wrcpwrc-host)
@@ -27,21 +28,24 @@
     - [4.2 CSI Controller Service](#42-csi-controller-service)
       - [4.2.1 `CreateVolume` — Cinder Volume Provisioning + Shadow VM](#421-createvolume--cinder-volume-provisioning--shadow-vm)
       - [4.2.2 `ControllerPublishVolume` — NFS Connection Discovery](#422-controllerpublishvolume--nfs-connection-discovery)
-      - [4.2.3 `ControllerUnpublishVolume` — Shadow VM Detach (Configurable)](#423-controllerunpublishvolume--shadow-vm-detach-configurable)
-      - [4.2.4 `DeleteVolume` — Cinder Volume Deletion (Failure Cleanup)](#424-deletevolume--cinder-volume-deletion-failure-cleanup)
+      - [4.2.3 `ControllerUnpublishVolume` — No-Op (Shadow VM Persists)](#423-controllerunpublishvolume--no-op-shadow-vm-persists)
+      - [4.2.4 `DeleteVolume` — Shadow VM Cleanup + Volume Release](#424-deletevolume--shadow-vm-cleanup--volume-release)
     - [4.3 CSI Node Service](#43-csi-node-service)
       - [4.3.1 `NodeStageVolume` — NFS Mount on WRCP/WRC Worker Host](#431-nodestagevolume--nfs-mount-on-wrcpwrc-worker-host)
       - [4.3.2 `NodePublishVolume` — Bind Mount Volume File into Pod](#432-nodepublishvolume--bind-mount-volume-file-into-pod)
       - [4.3.3 `NodeUnpublishVolume` — Remove Pod Bind Mount](#433-nodeunpublishvolume--remove-pod-bind-mount)
       - [4.3.4 `NodeUnstageVolume` — Unmount NFS Export](#434-nodeunstagevolume--unmount-nfs-export)
-    - [4.4 End-to-End CSI RPC Call Sequence](#44-end-to-end-csi-rpc-call-sequence)
-    - [4.5 Volume Finalization and VM Creation (Post-CSI)](#45-volume-finalization-and-vm-creation-post-csi)
+    - [4.4 Cinder Volume Status Lifecycle](#44-cinder-volume-status-lifecycle)
+    - [4.5 End-to-End CSI RPC Call Sequence (CDI Multi-Phase Precopy)](#45-end-to-end-csi-rpc-call-sequence-cdi-multi-phase-precopy)
+    - [4.6 Volume Finalization and VM Creation (Post-CSI)](#46-volume-finalization-and-vm-creation-post-csi)
   - [5. Component Flow](#5-component-flow)
     - [5.1 End-to-End Workflow](#51-end-to-end-workflow)
+      - [5.1.1 VMware → OpenStack (V2O) — CDI Multi-Phase Warm Migration](#511-vmware--openstack-v2o--cdi-multi-phase-warm-migration)
+      - [5.1.2 OpenStack → OpenStack (O2O) — virsh blockcopy](#512-openstack--openstack-o2o--virsh-blockcopy)
     - [5.2 Data Path Visualization](#52-data-path-visualization)
   - [6. Implementation Details](#6-implementation-details)
-    - [6.1 NFS Volume Discovery Script](#61-nfs-volume-discovery-script)
-    - [6.2 PV/PVC Definition for NFS Volume](#62-pvpvc-definition-for-nfs-volume)
+    - [6.1 NFS Volume Discovery Script (Reference)](#61-nfs-volume-discovery-script-reference)
+    - [6.2 StorageClass and PVC Definition](#62-storageclass-and-pvc-definition)
     - [6.3 CDI Importer Pod Specification](#63-cdi-importer-pod-specification)
     - [6.4 Shadow VM Lifecycle Management](#64-shadow-vm-lifecycle-management)
   - [7. Network Architecture](#7-network-architecture)
@@ -119,15 +123,32 @@ The solution is to:
 
 This eliminates the need for the addon K8S cluster entirely for the data path, while the CDI importer pod on WRCP/WRC has full access to both vCenter (management network) and the Cinder volume (NFS storage network).
 
-### 2.2 Design Goals
+### 2.2 Supported Migration Use Cases
+
+This design consolidates **two migration use cases** under a single CSI driver that owns the Shadow VM lifecycle:
+
+| Use Case | Data Transfer Tool | Data Writer | NFS Mount Location | Description |
+|----------|-------------------|-------------|-------------------|-------------|
+| **VMware → OpenStack (V2O)** | CDI importer pod (VDDK multi-phase warm migration) | CDI pod on WRC K8S | WRCP/WRC worker host (via CSI Node RPCs) | CDI runs full copy + N precopy delta stages. Each stage may create/destroy importer pods. CSI must survive pod cycling without losing NFS metadata. |
+| **OpenStack → OpenStack (O2O)** | `virsh blockcopy` (libvirt block mirror) | libvirt/QEMU on source compute host | Source OpenStack compute host (Blueprint mounts directly) | Blueprint reads NFS connection info from CSI `ControllerPublishVolume`, mounts NFS on the compute host, and runs `virsh blockcopy` to mirror the source VM's vda to the NFS volume file. |
+
+**Consolidation Principle:** The CSI driver's Controller plugin manages the Shadow VM lifecycle (create, stop, persist attachment, cleanup on `DeleteVolume`) identically for both use cases. The difference is only in who performs the NFS mount and writes data:
+
+- **V2O**: CSI Node plugin mounts NFS on the WRCP worker, bind-mounts the volume file into the CDI pod
+- **O2O**: Blueprint reads NFS info from the PV's `volumeAttributes` (populated by `ControllerPublishVolume`) and mounts NFS directly on the compute host
+
+### 2.3 Design Goals
 
 | Goal | Description |
 |------|-------------|
 | **Eliminate addon K8S cluster dependency** | Remove the requirement for a dedicated K8S cluster on target OpenStack for the migration data path |
 | **Resolve network isolation** | CDI importer pods on WRCP/WRC have native access to the vCenter management network |
+| **Consolidate Shadow VM ownership** | CSI driver owns the full Shadow VM lifecycle for both V2O and O2O use cases — no duplication in Blueprint |
+| **Support CDI multi-phase precopy** | Shadow VM and NFS attachment must persist across CDI pod restarts between full copy and precopy stages |
 | **Direct-to-Cinder writes** | Maintain the zero-copy-at-cutover benefit — data written during migration lands directly in the Cinder volume |
 | **Minimal cutover downtime** | Final delta sync + driver injection is all that remains in the cutover window |
 | **Leverage existing NFS infrastructure** | Use the NFS backend that Cinder already provisions on (no additional storage required) |
+| **Clean volume handoff** | After PVC deletion, the Cinder volume is `available` with no attachments — ready for Blueprint to create target VM |
 | **Compatible with warm migration workflow** | Integrate with existing CDI multi-stage VDDK import and WRC blueprint orchestration |
 
 ---
@@ -255,9 +276,9 @@ The table below summarizes how each CSI RPC maps to OpenStack operations in the 
 | CSI RPC | Existing `cinder.csi.openstack.org` | Proposed `cinder-nfs.csi.openstack.org` |
 |---------|--------------------------------------|------------------------------------------|
 | **`CreateVolume`** | Cinder `POST /v3/volumes` | Cinder `POST /v3/volumes` + Shadow VM create (triggers NFS attachment record) |
-| **`DeleteVolume`** | Cinder `DELETE /v3/volumes/{id}` | Shadow VM delete + Cinder `DELETE /v3/volumes/{id}` |
-| **`ControllerPublishVolume`** | Nova `POST /v2/servers/{id}/os-volume_attachments` (block attach) | Query Cinder attachment → extract NFS export/path from `connection_info` properties |
-| **`ControllerUnpublishVolume`** | Nova `DELETE /v2/servers/{id}/os-volume_attachments/{vid}` | **Configurable**: No-op (default) OR detach + delete Shadow VM + **delete Cinder volume** (`deleteVolumeOnUnpublish: "true"`). |
+| **`DeleteVolume`** | Cinder `DELETE /v3/volumes/{id}` | Detach volume from Shadow VM + delete Shadow VM. Volume becomes `available` (not deleted). Cinder `DELETE` only on failure/cancellation. |
+| **`ControllerPublishVolume`** | Nova `POST /v2/servers/{id}/os-volume_attachments` (block attach) | Query Cinder attachment → extract NFS export/path from `connection_info` properties. Idempotent — same attachment queried each CDI precopy stage. |
+| **`ControllerUnpublishVolume`** | Nova `DELETE /v2/servers/{id}/os-volume_attachments/{vid}` | **No-op.** Shadow VM attachment persists across CDI precopy pod cycles. NFS unmount handled by `NodeUnstageVolume`. |
 | **`NodeStageVolume`** | Discover `/dev/vdb` by serial → `FormatAndMount` to staging path | `mount -t nfs` NFS export → staging path on WRCP host |
 | **`NodeUnstageVolume`** | `umount` staging path | `umount` NFS mount from staging path |
 | **`NodePublishVolume`** | Bind mount staging path (or raw block device) → target path | Bind mount NFS volume file → target path as block device (`/dev/cdi-block-volume`) |
@@ -317,7 +338,6 @@ The `CreateVolume` RPC encapsulates both Cinder volume creation and the Shadow V
 | `req.CapacityRange.RequiredBytes` | Source VM disk size |
 | `req.Parameters["type"]` | `netapp-nfs` (StorageClass parameter) |
 | `req.Parameters["availability"]` | Target AZ |
-| `req.Parameters["deleteVolumeOnUnpublish"]` | `"true"` or `"false"` (StorageClass parameter, default `"false"`) — persisted as Cinder volume metadata `csi.deleteVolumeOnUnpublish` for use by `ControllerUnpublishVolume` |
 | `resp.Volume.VolumeId` | Cinder volume UUID |
 | `resp.Volume.VolumeContext["nfs_export"]` | `192.168.57.105:/trident_pvc_xxx` |
 | `resp.Volume.VolumeContext["nfs_volume_file"]` | `volume-ba833668-xxx` |
@@ -349,11 +369,10 @@ The `CreateVolume` RPC encapsulates both Cinder volume creation and the Shadow V
        │                                          │  Cinder provisions volume
        │  ◄── VOLUME_ID                           │  on NFS backend
        │                                          │
-       │  2b. Persist StorageClass config as      │
+       │  2b. Persist Shadow VM ID as             │
        │      Cinder volume metadata:             │
        │      cloud.SetVolumeMetadata(VOLUME_ID, {│
-       │        "csi.deleteVolumeOnUnpublish":     │
-       │           req.Parameters["deleteVolOnUn"],│
+       │        "csi.shadow_vm_id": shadow_id,     │
        │      })                                  │
        │      → Cinder PUT /v3/volumes/{id}/metadata
        ├────────────────────────────────────────► │
@@ -465,56 +484,49 @@ In the existing Cinder CSI driver, this RPC calls `Nova os-volume_attachments` t
 
 **Key Design Decision:** The `publish_context` map returned here is passed by the CO (kubelet) to `NodeStageVolume` and `NodePublishVolume`. This is exactly how the CSI spec intends controller-to-node communication to work — the opaque `publish_context` carries the NFS connection details that the Node plugin needs to mount the volume.
 
-#### 4.2.3 `ControllerUnpublishVolume` — Shadow VM Detach (Configurable)
+#### 4.2.3 `ControllerUnpublishVolume` — No-Op (Shadow VM Persists)
 
 **CSI Spec Reference:** *"This RPC is a reverse operation of ControllerPublishVolume. It MUST be called after all NodeUnstageVolume and NodeUnpublishVolume on the volume are called and succeed."*
 
-In the existing Cinder CSI driver, this calls `Nova DELETE /v2/servers/{id}/os-volume_attachments/{vid}`. In the NFS-Cinder driver, the behavior is **configurable** via a single StorageClass parameter to support two migration workflows:
+In the existing Cinder CSI driver, this calls `Nova DELETE /v2/servers/{id}/os-volume_attachments/{vid}`. In the NFS-Cinder driver, this RPC is a **no-op** — the Shadow VM and its volume attachment record must persist.
 
-| Mode | StorageClass Parameter | Behavior | Use Case |
-|------|------------------------|----------|----------|
-| **No-op** (default) | `deleteVolumeOnUnpublish` omitted or `"false"` | Shadow VM attachment stays intact. Post-CSI orchestrator handles Shadow VM cleanup + target VM creation. | Direct boot-from-volume workflow — the same Cinder volume becomes the target VM's root disk. The orchestrator has full OpenStack API access to manage the Shadow VM lifecycle and volume finalization post-CSI. |
-| **Full Cleanup** | `deleteVolumeOnUnpublish: "true"` | Detach volume from Shadow VM, delete Shadow VM, **then delete the Cinder volume itself**. The volume is fully cleaned up by the CSI driver. | Clone-then-cleanup workflow — orchestrator has **already cloned** the migration volume before deleting the PVC/PV. When the PVC is deleted, `ControllerUnpublishVolume` performs full cleanup of the original Cinder volume, Shadow VM, and all associated resources. |
+**Why No-Op?**
 
-**How Configuration Flows Through CSI RPCs:**
-
-The CSI spec's `ControllerUnpublishVolumeRequest` contains only `volume_id`, `node_id`, and `secrets` — it does **not** receive `volume_context` or StorageClass parameters directly. To bridge this gap, the driver uses **Cinder volume metadata** as a configuration sideband:
+CDI warm migration uses **multi-phase precopy** (full copy → precopy 1 → precopy 2 → ... → cutover). Between each stage, the CDI importer pod exits and a new pod is created for the next stage. When a pod is deleted and no other pod references the PV on that node, the CO fires the full unmount + unpublish chain:
 
 ```
-  Configuration Flow:
+  CDI Stage N pod completes:
+    → NodeUnpublishVolume    (umount bind mount)
+    → NodeUnstageVolume      (umount NFS)
+    → ControllerUnpublishVolume  ← FIRES HERE (between CDI stages)
 
-  StorageClass                          CSI Controller Plugin
-  ┌──────────────────────────┐
-  │ parameters:              │
-  │   type: netapp-nfs       │
-  │   deleteVolumeOnUnpublish│  ── CreateVolumeRequest.parameters ──►  CreateVolume:
-  │     "true"               │                                          1. Create Cinder volume
-  └──────────────────────────┘                                          2. Store config as Cinder
-                                                                           volume metadata:
-                                                                           openstack volume set
-                                                                             --property
-                                                                             csi.deleteVolumeOnUnpublish=true
-                                                                             ${VOLUME_ID}
-                                                                        3. Create Shadow VM
-
-                                        ControllerUnpublishVolume:
-                                          1. Read Cinder volume metadata:
-  ┌──────────────────────────┐               GET /v3/volumes/{id}
-  │ Cinder Volume            │ ◄─────────    → properties["csi.deleteVolumeOnUnpublish"]
-  │ metadata:                │            2. If "true":
-  │  csi.deleteVolumeOnUnpub │               → Detach volume from Shadow VM
-  │   = "true"               │               → Delete Shadow VM
-  └──────────────────────────┘               → Delete Cinder volume
-                                          3. If "false" or missing:
-                                             → No-op
+  CDI Stage N+1 pod scheduled:
+    → ControllerPublishVolume    ← FIRES AGAIN (needs NFS info)
+    → NodeStageVolume            (mount NFS again)
+    → NodePublishVolume          (bind mount again)
 ```
 
-> **Note:** This pattern of persisting driver configuration in backend storage metadata is common in CSI drivers. The existing Cinder CSI driver similarly stores topology and volume-type information in Cinder volume properties. See the [CSI Secrets and Credentials](https://kubernetes-csi.github.io/docs/secrets-and-credentials-storage-class.html) documentation for how StorageClass parameters flow to CSI RPCs.
+If `ControllerUnpublishVolume` were to detach the volume from the Shadow VM or delete the Shadow VM, then `ControllerPublishVolume` in the next stage would fail — there would be no attachment record to query for NFS connection info. Therefore, `ControllerUnpublishVolume` must be a no-op.
+
+**Implementation:**
+
+```
+  CSI Controller Plugin
+       │
+       │  ControllerUnpublishVolume(req):
+       │    1. Log: "No-op — Shadow VM attachment persists for
+       │            potential CDI precopy re-publish"
+       │    2. Return ControllerUnpublishVolumeResponse{}
+       │
+       │  NFS mount cleanup is handled by NodeUnstageVolume.
+       │  Shadow VM cleanup is deferred to DeleteVolume (PVC deletion).
+```
+
+**Cinder Volume Status:** The Cinder volume remains `in-use` throughout the entire migration lifecycle (see [Section 4.4](#44-cinder-volume-status-lifecycle)). The Shadow VM holds the attachment, which acts as a lock preventing accidental deletion or double-attachment.
 
 **StorageClass Definition:**
 
 ```yaml
-# StorageClass — Direct boot-from-volume (default)
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -523,108 +535,28 @@ provisioner: cinder-nfs.csi.openstack.org
 parameters:
   type: netapp-nfs
   availability: nova
-  # Controls ControllerUnpublishVolume behavior:
-  #   "false" (default) — No-op; Shadow VM and volume persist.
-  #     Orchestrator manages Shadow VM cleanup + target VM creation
-  #     via OpenStack APIs post-CSI.
-  #   "true" — Full cleanup: detach + delete Shadow VM + DELETE
-  #     the Cinder volume. Use when orchestrator has already
-  #     cloned the volume and PVC deletion should trigger cleanup.
-  deleteVolumeOnUnpublish: "false"
+reclaimPolicy: Delete    # PVC deletion triggers DeleteVolume
+volumeBindingMode: Immediate
 ```
 
-**Example StorageClass — Clone-then-cleanup workflow:**
-
-```yaml
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: cinder-nfs-migration-clone-cleanup
-provisioner: cinder-nfs.csi.openstack.org
-parameters:
-  type: netapp-nfs
-  availability: nova
-  # Orchestrator clones the volume before deleting PVC.
-  # CSI driver fully cleans up the original migration volume.
-  deleteVolumeOnUnpublish: "true"
-```
-
-**Implementation Flow — Full Cleanup Mode (`deleteVolumeOnUnpublish: "true"`):**
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│   ControllerUnpublishVolume RPC — Full Cleanup Mode                        │
-└────────────────────────────────────────────────────────────────────────────┘
-
-  CSI Controller Plugin                     Target OpenStack
-       │                                         │
-       │  1. Read volume metadata:                │
-       │     cloud.GetVolume(req.VolumeId)         │
-       │     → Check properties["csi.deleteVolumeOnUnpublish"]
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  2. Get Shadow VM ID from metadata:      │
-       │     shadow_vm_id = properties["csi.shadow_vm_id"]
-       │                                          │
-       │  3. Detach volume from Shadow VM:         │
-       │     cloud.DetachVolume(shadow_vm_id,      │
-       │                       req.VolumeId)      │
-       │     → Nova DELETE .../os-volume_attachments
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  4. Delete Shadow VM:                    │
-       │     cloud.DeleteServer(shadow_vm_id)      │
-       │     → Nova DELETE /v2/servers/{id}        │
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  5. Delete the Cinder volume:            │
-       │     cloud.DeleteVolume(req.VolumeId)     │
-       │     → Cinder DELETE /v3/volumes/{id}     │
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  Volume and Shadow VM are fully cleaned  │
-       │  up. Orchestrator does NOT need to call  │
-       │  any additional OpenStack volume APIs.   │
-       │                                          │
-       │  6. Return ControllerUnpublishVolumeResponse{}
-```
-
-> **Safety Note:** The driver should verify the volume is not in `in-use` state before deletion. If `DetachVolume` has not yet propagated, the driver should poll until the volume reaches `available` state (with a configurable timeout) before calling `DeleteVolume`. This prevents race conditions where Cinder rejects the delete due to the volume still being attached.
-
-**Implementation Flow — No-op Mode (default):**
-
-```
-  CSI Controller Plugin
-       │
-       │  ControllerUnpublishVolume(req):
-       │    1. Read volume metadata:
-       │       → deleteVolumeOnUnpublish = false
-       │    2. No-op: Shadow VM attachment stays intact
-       │    3. Return ControllerUnpublishVolumeResponse{}
-       │
-       │  The NFS mount cleanup is handled by NodeUnstageVolume.
-       │  The Shadow VM cleanup is handled by post-CSI orchestrator
-       │  (Section 4.5) or DeleteVolume on failure.
-```
-
-**Why Two Modes?**
-
-The two modes map to distinct orchestration workflows after the data transfer completes. Since the orchestrator has full OpenStack API access, the middle ground of "detach only" is unnecessary — the orchestrator can always manage volume lifecycle directly.
-
-| Workflow | ControllerUnpublish Mode | Post-CSI Steps |
-|----------|--------------------------|----------------|
-| **Direct boot-from-volume** | No-op (default) | Orchestrator (via OpenStack API): virt-v2v → detach from Shadow VM → delete Shadow VM → set bootable → `openstack server create --volume` |
-| **Clone to tenant volume** | Full Cleanup (`deleteVolumeOnUnpublish`) | Orchestrator: `openstack volume create --source ${VOLUME_ID}` → virt-v2v on clone → set bootable → `openstack server create --volume` → delete PVC/PV → **CSI driver automatically deletes the original Cinder volume + Shadow VM** |
-
-#### 4.2.4 `DeleteVolume` — Cinder Volume Deletion (Failure Cleanup)
+#### 4.2.4 `DeleteVolume` — Shadow VM Cleanup + Volume Release
 
 **CSI Spec Reference:** *"A Controller Plugin MUST implement this RPC call if it has CREATE_DELETE_VOLUME controller capability. This RPC will be called by the CO to deprovision a volume."*
 
-This RPC reverses `CreateVolume` — it cleans up the Shadow VM (if it still exists) and deletes the Cinder volume. It is designed to be **idempotent** regardless of whether `ControllerUnpublishVolume` already cleaned up the Shadow VM.
+This RPC is the **single cleanup point** for the entire migration lifecycle. It is called when the PVC is deleted (either after successful migration or on failure/cancellation). It performs Shadow VM cleanup and — depending on whether the migration succeeded or failed — either releases the volume as `available` or deletes it entirely.
+
+**Behavior is controlled by Cinder volume metadata** (`csi.cleanupVolume`):
+
+| Scenario | `csi.cleanupVolume` metadata | `DeleteVolume` behavior |
+|----------|------------------------------|------------------------|
+| **Migration success** (default) | Not set or `"false"` | Detach volume from Shadow VM → delete Shadow VM → volume becomes `available`. **Volume is NOT deleted.** Blueprint creates target VM from this volume. |
+| **Migration failure / cancellation** | Blueprint sets `"true"` before deleting PVC | Detach from Shadow VM → delete Shadow VM → **delete Cinder volume**. Full cleanup. |
+
+**Implementation Flow — Success Path (default):**
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│          DeleteVolume RPC — Controller Plugin                              │
+│    DeleteVolume RPC — Success Path (volume released as "available")         │
 └────────────────────────────────────────────────────────────────────────────┘
 
   CSI Controller Plugin                     Target OpenStack
@@ -632,27 +564,77 @@ This RPC reverses `CreateVolume` — it cleans up the Shadow VM (if it still exi
        │  1. Read volume metadata:                │
        │     cloud.GetVolume(req.VolumeId)         │
        │     → Get properties["csi.shadow_vm_id"] │
+       │     → Get properties["csi.cleanupVolume"]│
        ├────────────────────────────────────────► │
        │                                          │
-       │  2. If Shadow VM still exists:           │
+       │  2. If volume not found:                 │
+       │     → Return success (idempotent)        │
+       │                                          │
+       │  3. If Shadow VM exists:                 │
        │     a. Detach volume from Shadow VM:     │
        │        cloud.DetachVolume(shadow_vm_id,   │
        │                          req.VolumeId)   │
        │        → Nova DELETE .../os-volume_attachments
-       │     b. Delete Shadow VM:                 │
+       ├────────────────────────────────────────► │
+       │                                          │
+       │     b. Wait for volume status:           │
+       │        Poll until status == "available"  │
+       │        (timeout: 120s)                   │
+       │                                          │
+       │     c. Delete Shadow VM:                 │
        │        cloud.DeleteServer(shadow_vm_id)   │
        │        → Nova DELETE /v2/servers/{id}     │
        ├────────────────────────────────────────► │
        │                                          │
-       │  3. Delete Cinder volume:                │
-       │     cloud.DeleteVolume(req.VolumeId)     │
-       │     → Cinder DELETE /v3/volumes/{id}     │
-       ├────────────────────────────────────────► │
+       │  4. Check cleanup mode:                  │
+       │     cleanupVolume = properties["csi.cleanupVolume"]
        │                                          │
-       │  4. Return DeleteVolumeResponse{}        │
+       │     IF cleanupVolume == "true":          │
+       │       → Delete Cinder volume             │
+       │       cloud.DeleteVolume(req.VolumeId)   │
+       │       → Cinder DELETE /v3/volumes/{id}   │
+       │                                          │
+       │     ELSE (default):                      │
+       │       → Leave volume as "available"      │
+       │       → Remove CSI metadata from volume  │
+       │       cloud.DeleteVolumeMetadata(         │
+       │         req.VolumeId,                    │
+       │         ["csi.shadow_vm_id",             │
+       │          "csi.cleanupVolume"])            │
+       │                                          │
+       │  5. Return DeleteVolumeResponse{}        │
 ```
 
-**Note:** In the migration use case, `DeleteVolume` is typically **not** called after a successful migration — the volume is either used directly to boot the target VM, or cloned to a new volume. `DeleteVolume` is called only for cleanup on migration failure/cancellation. When using `deleteVolumeOnUnpublish: "true"`, the Cinder volume is already deleted by `ControllerUnpublishVolume`, so `DeleteVolume` becomes a no-op (the volume no longer exists in Cinder). The driver handles this gracefully — if the volume is not found, `DeleteVolume` returns success (idempotency). The Shadow VM may or may not exist at this point depending on which `ControllerUnpublishVolume` mode was used.
+**Volume Handoff to Blueprint:**
+
+After `DeleteVolume` completes (success path), the Cinder volume is in `available` state with no attachments. The Blueprint can then:
+
+```
+  Blueprint (after PVC deletion):
+    1. virt-v2v-in-place ${VOLUME_ID}    ← inject virtio drivers
+    2. openstack volume set --bootable ${VOLUME_ID}
+    3. openstack server create --volume ${VOLUME_ID} ...
+    ✓ Target VM boots from the migration volume
+```
+
+**Failure/Cancellation Cleanup:**
+
+When migration fails, the Blueprint sets the cleanup flag before deleting the PVC:
+
+```bash
+# Blueprint detects migration failure:
+openstack volume set --property csi.cleanupVolume=true ${VOLUME_ID}
+
+# Then deletes PVC — triggers DeleteVolume which fully cleans up
+kubectl delete pvc migration-${VM_NAME}-vda-pvc
+# → DeleteVolume: detach + delete Shadow VM + DELETE Cinder volume
+```
+
+**Idempotency:** `DeleteVolume` handles all partial-state scenarios gracefully:
+- Volume already deleted → return success
+- Shadow VM already deleted → skip Shadow VM cleanup, proceed with volume
+- Volume already detached → skip detach, proceed with Shadow VM deletion
+- Volume in `available` state (no attachment) → skip detach, delete Shadow VM if exists
 
 ### 4.3 CSI Node Service
 
@@ -816,13 +798,85 @@ In the existing Cinder CSI driver, `NodePublishVolume` bind-mounts the staged bl
 
 **Important:** Per the CSI spec, the CO guarantees that `NodeUnstageVolume` is called **only after** all `NodeUnpublishVolume` calls for the volume have returned success. This ensures the NFS mount is removed only after all pod bind mounts are cleaned up.
 
-### 4.4 End-to-End CSI RPC Call Sequence
+### 4.4 Cinder Volume Status Lifecycle
 
-The following diagram shows the complete CSI RPC call sequence as orchestrated by the CO (kubelet + external-provisioner + external-attacher sidecars) during the migration lifecycle:
+The Cinder volume remains `in-use` for the **entire migration lifecycle** because the Shadow VM holds the attachment. This is by design — the `in-use` status acts as a lock.
+
+```
+  Cinder Volume Status Timeline:
+
+  CSI RPC / Action                    Volume Status    Reason
+  ─────────────────────────────────── ────────────── ──────────────────────────
+  Cinder POST /v3/volumes             creating →      Normal Cinder lifecycle
+                                      available
+
+  Nova create Shadow VM               available →     Nova attaches the volume
+    (boot from volume)                 in-use          to the Shadow VM instance
+
+  Nova stop Shadow VM                  in-use          Stopping ≠ detaching.
+                                                       Volume stays attached.
+
+  ControllerPublishVolume              in-use          Just queries attachment
+    (query attachment → NFS info)                      record. No status change.
+
+  NodeStageVolume                      in-use          NFS mount on WRCP host is
+    (mount -t nfs on WRCP host)                        invisible to Cinder.
+
+  CDI full copy / precopy              in-use          Writes go NFS → storage.
+    (pod writes to NFS vol file)                       Cinder doesn't know.
+
+  NodeUnstageVolume                    in-use          NFS unmount. Cinder
+    (umount NFS)                                       doesn't know.
+
+  ControllerUnpublishVolume            in-use          No-op. Shadow VM still
+    (no-op)                                            attached.
+
+    ── CDI precopy cycles ──           in-use          Same throughout all stages.
+
+  DeleteVolume (PVC deleted)           in-use →        Detach from Shadow VM.
+    (detach from Shadow VM)            detaching →     Cinder releases volume.
+    (delete Shadow VM)                 available
+
+  Blueprint: server create             available →     Now attached to the
+    --volume ${VOLUME_ID}              in-use          real target VM.
+```
+
+**Why `in-use` is correct and safe:**
+
+| Protection | How it works |
+|---|---|
+| **Prevents accidental deletion** | `openstack volume delete` on `in-use` volume → rejected by Cinder |
+| **Prevents double-attachment** | Another Nova instance can't attach an `in-use` volume (unless multi-attach) |
+| **Prevents concurrent migration** | No other workflow can claim this volume while migration runs |
+| **NFS mount is invisible to Cinder** | WRCP host mounts NFS directly as a client — Cinder only sees the Shadow VM attachment |
+
+The two data planes are decoupled:
+
+```
+  Cinder Control Plane:                NFS Data Plane:
+  ───────────────────                  ──────────────
+  Shadow VM ──attach──► Volume         WRCP Host ──NFS mount──► Same files
+  (stopped, idle)       (in-use)       (active, writing)        on NFS server
+
+  Cinder sees: volume attached         Reality: WRCP host is
+  to Shadow VM. Status: in-use.        the actual writer.
+                                       Shadow VM is stopped,
+                                       not doing any I/O.
+```
+
+This is safe because:
+1. **Shadow VM is stopped** — it performs zero I/O on the volume
+2. **NFS is a shared filesystem** — multiple clients can mount the same export
+3. **Single writer** — only the CDI pod writes to the specific volume file
+4. **No filesystem corruption** — the volume file is used as a raw block image, not mounted as a filesystem by the Shadow VM
+
+### 4.5 End-to-End CSI RPC Call Sequence (CDI Multi-Phase Precopy)
+
+The following diagram shows the complete CSI RPC call sequence during a CDI multi-phase warm migration. The key insight is that `ControllerUnpublishVolume` fires **between each CDI stage** (when the importer pod exits) and must be a no-op to preserve the Shadow VM attachment:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│              CSI RPC Call Sequence — Migration Lifecycle                         │
+│   CSI RPC Call Sequence — CDI Multi-Phase Precopy Lifecycle (V2O)               │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
  CO (kubelet + sidecars)        Controller Plugin           Node Plugin
@@ -833,121 +887,165 @@ The following diagram shows the complete CSI RPC call sequence as orchestrated b
   ┌─────┤  1. CreateVolume             │                         │
   │     ├─────────────────────────────►│                         │
   │     │                              │── Cinder create vol     │
+  │     │                              │── Set metadata:         │
+  │     │                              │   csi.shadow_vm_id      │
   │     │                              │── Nova create shadow VM │
   │     │                              │── Nova stop shadow VM   │
   │     │◄─────────────────────────────┤                         │
   │     │  VolumeId + VolumeContext    │                         │
   │     │                              │                         │
-  │  Pod Scheduled to WRCP Worker      │                         │
+  │ ╔═══╪══ CDI Stage 1: Full Copy ════╪═════════════════════════╪═══╗
+  │ ║   │                              │                         │   ║
+  │ ║ Pod 1 Scheduled to WRCP Worker   │                         │   ║
+  │ ║   │                              │                         │   ║
+  │ ║   │  2. ControllerPublishVolume  │                         │   ║
+  │ ║   ├─────────────────────────────►│                         │   ║
+  │ ║   │                              │── Query attachment      │   ║
+  │ ║   │                              │── Extract NFS conn info │   ║
+  │ ║   │◄─────────────────────────────┤                         │   ║
+  │ ║   │  PublishContext (NFS info)   │                         │   ║
+  │ ║   │                              │                         │   ║
+  │ ║   │  3. NodeStageVolume          │                         │   ║
+  │ ║   ├──────────────────────────────┼────────────────────────►│   ║
+  │ ║   │                              │                         │── mount -t nfs
+  │ ║   │                              │                         │   ║
+  │ ║   │  4. NodePublishVolume        │                         │   ║
+  │ ║   ├──────────────────────────────┼────────────────────────►│   ║
+  │ ║   │                              │                         │── mount --bind
+  │ ║   │                              │                         │   ║
+  │ ║   │ CDI Full Copy runs:          │                         │   ║
+  │ ║   │ ┌───────────────────────┐    │                         │   ║
+  │ ║   │ │ VDDK → /dev/cdi-block │    │                         │   ║
+  │ ║   │ └───────────────────────┘    │                         │   ║
+  │ ║   │                              │                         │   ║
+  │ ║ Pod 1 completes                  │                         │   ║
+  │ ║   │  5. NodeUnpublishVolume      │                         │   ║
+  │ ║   ├──────────────────────────────┼────────────────────────►│   ║
+  │ ║   │                              │                         │── umount bind
+  │ ║   │  6. NodeUnstageVolume        │                         │   ║
+  │ ║   ├──────────────────────────────┼────────────────────────►│   ║
+  │ ║   │                              │                         │── umount NFS
+  │ ║   │  7. ControllerUnpublishVol   │                         │   ║
+  │ ║   ├─────────────────────────────►│                         │   ║
+  │ ║   │                              │── NO-OP ✓               │   ║
+  │ ║   │                              │── Shadow VM persists    │   ║
+  │ ║   │◄─────────────────────────────┤                         │   ║
+  │ ╚═══╪══════════════════════════════╪═════════════════════════╪═══╝
   │     │                              │                         │
-  │     │  2. ControllerPublishVolume  │                         │
-  │     ├─────────────────────────────►│                         │
-  │     │                              │── Query attachment      │
-  │     │                              │── Extract NFS conn info │
-  │     │◄─────────────────────────────┤                         │
-  │     │  PublishContext (NFS info)   │                         │
+  │     │  ── gap: no pod, no VolumeAttachment on node ──        │
+  │     │  ── Shadow VM still attached: volume still in-use ──   │
   │     │                              │                         │
-  │     │  3. NodeStageVolume          │                         │
-  │     ├──────────────────────────────┼────────────────────────►│
-  │     │                              │                         │── mount -t nfs
-  │     │                              │                         │   nfs_export →
-  │     │                              │                         │   staging_path
-  │     │◄─────────────────────────────┼─────────────────────────┤
+  │ ╔═══╪══ CDI Stage 2: Precopy 1 ═══╪═════════════════════════╪═══╗
+  │ ║   │                              │                         │   ║
+  │ ║ Pod 2 Scheduled                  │                         │   ║
+  │ ║   │  2. ControllerPublishVolume  │                         │   ║
+  │ ║   ├─────────────────────────────►│                         │   ║
+  │ ║   │                              │── Query SAME attachment │   ║
+  │ ║   │                              │── SAME NFS info ✓       │   ║
+  │ ║   │◄─────────────────────────────┤                         │   ║
+  │ ║   │                              │                         │   ║
+  │ ║   │  3-4. NodeStage + Publish    │                         │   ║
+  │ ║   ├──────────────────────────────┼────────────────────────►│   ║
+  │ ║   │                              │                         │── mount NFS
+  │ ║   │                              │                         │── bind mount
+  │ ║   │ CDI Delta Copy runs:         │                         │   ║
+  │ ║   │ ┌───────────────────────┐    │                         │   ║
+  │ ║   │ │ VDDK delta → block vol│    │                         │   ║
+  │ ║   │ └───────────────────────┘    │                         │   ║
+  │ ║   │                              │                         │   ║
+  │ ║ Pod 2 completes                  │                         │   ║
+  │ ║   │  5-7. Unpublish+Unstage+     │                         │   ║
+  │ ║   │       CtrlUnpublish (NO-OP)  │                         │   ║
+  │ ╚═══╪══════════════════════════════╪═════════════════════════╪═══╝
   │     │                              │                         │
-  │     │  4. NodePublishVolume        │                         │
-  │     ├──────────────────────────────┼────────────────────────►│
-  │     │                              │                         │── mount --bind
-  │     │                              │                         │   vol_file →
-  │     │                              │                         │   target_path
-  │     │◄─────────────────────────────┼─────────────────────────┤
+  │     │  ... repeat for precopy N ...│                         │
   │     │                              │                         │
-  │ CDI Importer Pod runs:             │                         │
-  │ ┌───────────────────────────┐      │                         │
-  │ │ VDDK → /dev/cdi-block-vol │      │                         │
-  │ │ (full copy + precopies)   │      │                         │
-  │ └───────────────────────────┘      │                         │
+  │ ╔═══╪══ CDI Final Stage: Cutover ══╪═════════════════════════╪═══╗
+  │ ║   │  (same pattern as above —    │                         │   ║
+  │ ║   │   CtrlUnpublish still NO-OP) │                         │   ║
+  │ ╚═══╪══════════════════════════════╪═════════════════════════╪═══╝
   │     │                              │                         │
-  │ Migration complete / cutover       │                         │
+  │ Migration complete!                │                         │
   │     │                              │                         │
-  │     │  5. NodeUnpublishVolume      │                         │
-  │     ├──────────────────────────────┼────────────────────────►│
-  │     │                              │                         │── umount target
-  │     │◄─────────────────────────────┼─────────────────────────┤
+  │ PVC Deleted (reclaimPolicy: Delete)│                         │
   │     │                              │                         │
-  │     │  6. NodeUnstageVolume        │                         │
-  │     ├──────────────────────────────┼────────────────────────►│
-  │     │                              │                         │── umount NFS
-  │     │◄─────────────────────────────┼─────────────────────────┤
-  │     │                              │                         │
-  │     │  7. ControllerUnpublishVol   │                         │
-  │     ├─────────────────────────────►│                         │
-  │     │                              │── IF deleteVolOnUnpub:  │
-  │     │                              │     Detach from Shadow  │
-  │     │                              │     VM + delete Shadow  │
-  │     │                              │     VM + DELETE Cinder  │
-  │     │                              │     volume (full clean) │
-  │     │                              │── ELSE: no-op           │
-  │     │◄─────────────────────────────┤                         │
-  │     │                              │                         │
-  │  (Migration success — direct boot):│                         │
-  │   Post-CSI orchestrator handles    │                         │
-  │   Shadow VM cleanup (if no-op) +   │                         │
-  │   target VM creation from volume   │                         │
-  │   via OpenStack APIs.              │                         │
-  │     │                              │                         │
-  │  (Migration success — clone):      │                         │
-  │   Orchestrator already cloned vol. │                         │
-  │   PVC/PV deletion triggers CSI     │                         │
-  │   deleteVolumeOnUnpublish → orig   │                         │
-  │   Cinder vol deleted by driver.    │                         │
-  │     │                              │                         │
-  │  OR (Migration failure path):      │                         │
   │     │  8. DeleteVolume             │                         │
   │     ├─────────────────────────────►│                         │
-  │     │                              │── Delete shadow VM      │
-  │     │                              │   (if still exists)     │
-  │     │                              │── Delete Cinder volume  │
+  │     │                              │── Detach from Shadow VM │
+  │     │                              │── Wait: status→available│
+  │     │                              │── Delete Shadow VM      │
+  │     │                              │── Volume now "available"│
+  │     │                              │   (NOT deleted)         │
   │     │◄─────────────────────────────┤                         │
+  │     │                              │                         │
+  │ Blueprint takes over:              │                         │
+  │   virt-v2v → set bootable →        │                         │
+  │   server create --volume           │                         │
   └─────┤                              │                         │
 ```
 
-### 4.5 Volume Finalization and VM Creation (Post-CSI)
+**OpenStack → OpenStack (O2O) variant** — the sequence is simpler because there are no CDI pod cycles:
 
-After all CSI RPCs complete (volume is unpublished, unstaged, and controller-unpublished), the WRC blueprint orchestrator performs the final migration steps **outside of CSI**. The steps differ depending on the `deleteVolumeOnUnpublish` mode:
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│   CSI RPC Call Sequence — virsh blockcopy (O2O)                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
 
-**Path A: Direct Boot-from-Volume (`deleteVolumeOnUnpublish: "false"` — default)**
+ Blueprint                      Controller Plugin
+ ═════════                      ═════════════════
+     │                                 │
+     │─ Create PVC ───────────────────►│
+     │                                 │── CreateVolume:
+     │                                 │   Cinder vol + Shadow VM
+     │                                 │
+     │─ (Force ControllerPublish) ────►│
+     │                                 │── ControllerPublishVolume:
+     │                                 │   Query attachment → NFS info
+     │  ◄── NFS info in PV annotations│
+     │                                 │
+     │─ Mount NFS on compute host ─────┤  (Blueprint does this directly,
+     │  using nfs_export from PV       │   NOT via CSI Node RPCs)
+     │                                 │
+     │─ virsh blockcopy source-vda ────┤  (libvirt mirrors to NFS vol file)
+     │  → NFS vol file                 │
+     │                                 │
+     │─ blockcopy complete ────────────┤
+     │─ Unmount NFS on compute host ───┤
+     │                                 │
+     │─ Delete PVC ───────────────────►│
+     │                                 │── DeleteVolume:
+     │                                 │   Detach + delete Shadow VM
+     │                                 │   Volume → "available"
+     │                                 │
+     │─ set bootable + server create ──┤
+     ✓ Done                            │
+```
 
-Shadow VM still exists. Orchestrator detaches, cleans up, and creates the target VM from the same volume:
+### 4.6 Volume Finalization and VM Creation (Post-CSI)
+
+After `DeleteVolume` completes (triggered by PVC deletion), the Cinder volume is `available` with no attachments. The Blueprint performs the final steps:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│       Post-CSI Path A: Direct Boot-from-Volume (default)                   │
+│       Post-CSI: Volume Finalization (both V2O and O2O)                     │
 │       (Orchestrated by WRC Blueprint, not CSI RPCs)                        │
 └────────────────────────────────────────────────────────────────────────────┘
 
   WRC Orchestrator                          Target OpenStack
        │                                         │
+       │  Volume is now "available" (post-CSI)    │
+       │                                          │
        │  1. virt-v2v-in-place                    │
        │     (inject virtio drivers into          │
-       │      the volume via NFS re-mount         │
-       │      or via Shadow VM)                   │
+       │      the volume — can re-mount NFS       │
+       │      temporarily for this step)          │
        │                                          │
-       │  2. Detach volume from Shadow VM         │
-       │     openstack server remove volume       │
-       │     shadow-${VM_NAME} ${VOLUME_ID}       │
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  3. Delete Shadow VM                     │
-       │     openstack server delete              │
-       │     shadow-${VM_NAME}                    │
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  4. Set volume bootable                  │
+       │  2. Set volume bootable                  │
        │     openstack volume set --bootable      │
        │     ${VOLUME_ID}                         │
        ├────────────────────────────────────────► │
        │                                          │
-       │  5. Create target VM from volume         │
+       │  3. Create target VM from volume         │
        │     openstack server create              │
        │     --volume ${VOLUME_ID}                │
        │     --flavor ${FLAVOR}                   │
@@ -958,58 +1056,18 @@ Shadow VM still exists. Orchestrator detaches, cleans up, and creates the target
        │                                          │  ✓ Migration complete
 ```
 
-**Path B: Clone to Tenant Volume (`deleteVolumeOnUnpublish: "true"`)**
+**Failure/Cancellation Cleanup:**
 
-Orchestrator clones the migration volume **before** deleting the PVC/PV. When the orchestrator deletes the PVC, `ControllerUnpublishVolume` automatically cleans up the Shadow VM and deletes the original Cinder volume, removing the need for the orchestrator to make separate OpenStack API calls for volume cleanup:
+If migration fails, the Blueprint sets the cleanup flag and deletes the PVC:
 
+```bash
+# Mark volume for full cleanup
+openstack volume set --property csi.cleanupVolume=true ${VOLUME_ID}
+
+# Delete PVC → triggers DeleteVolume → full cleanup
+kubectl delete pvc migration-${VM_NAME}-vda-pvc
+# Result: Shadow VM deleted + Cinder volume DELETED. No orphans.
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│       Post-CSI Path B: Clone to Tenant Volume (Auto Cleanup)               │
-│       Orchestrator clones BEFORE PVC deletion; CSI handles cleanup         │
-└────────────────────────────────────────────────────────────────────────────┘
-
-  WRC Orchestrator                          Target OpenStack
-       │                                         │
-       │  1. Clone migration volume to tenant vol │
-       │     (while PVC/PV still exists)          │
-       │     openstack volume create              │
-       │       --source ${VOLUME_ID}              │
-       │       --name ${TENANT_VM_NAME}-root      │
-       │       --type ${TENANT_VOLUME_TYPE}       │
-       ├────────────────────────────────────────► │
-       │                                          │  Cinder clones volume
-       │  ◄── CLONE_VOLUME_ID                     │
-       │                                          │
-       │  2. virt-v2v-in-place on cloned volume   │
-       │     (inject virtio drivers)               │
-       │                                          │
-       │  3. Set cloned volume bootable            │
-       │     openstack volume set --bootable      │
-       │     ${CLONE_VOLUME_ID}                   │
-       ├────────────────────────────────────────► │
-       │                                          │
-       │  4. Create target VM from cloned volume  │
-       │     openstack server create              │
-       │     --volume ${CLONE_VOLUME_ID}          │
-       │     --flavor ${FLAVOR}                   │
-       │     --network ${NETWORK}                 │
-       │     ${TENANT_VM_NAME}                    │
-       ├────────────────────────────────────────► │
-       │                                          │  VM boots from cloned volume
-       │                                          │
-       │  5. Delete PVC/PV (triggers CSI cleanup) │
-       │     kubectl delete pvc migration-xxx     │
-       │                                          │
-       │     CSI ControllerUnpublishVolume fires:  │
-       │       → Detach vol from Shadow VM        │
-       │       → Delete Shadow VM                 │
-       │       → Delete original Cinder volume    │  ◄── Automatic!
-       │                                          │
-       │                                          │  ✓ Migration complete
-       │                                          │    (no orphaned volumes)
-```
-
-> **Important Ordering Constraint (Path B):** The orchestrator **MUST** complete the volume clone (`openstack volume create --source`) and verify the clone is in `available` state **before** deleting the PVC/PV. Deleting the PVC first would trigger `ControllerUnpublishVolume` which deletes the source volume, causing the clone to fail.
 
 ---
 
@@ -1017,9 +1075,12 @@ Orchestrator clones the migration volume **before** deleting the PVC/PV. When th
 
 ### 5.1 End-to-End Workflow
 
+#### 5.1.1 VMware → OpenStack (V2O) — CDI Multi-Phase Warm Migration
+
 ```
 ┌────────────────────────────────────────────────────────────────────────────────┐
-│                    END-TO-END NFS-BACKED MIGRATION FLOW                        │
+│              END-TO-END V2O NFS-BACKED MIGRATION FLOW                          │
+│              (CDI Multi-Phase Precopy + CSI NFS-Cinder Driver)                 │
 └────────────────────────────────────────────────────────────────────────────────┘
 
  WRC Blueprint Orchestrator
@@ -1031,55 +1092,127 @@ Orchestrator clones the migration volume **before** deleting the PVC/PV. When th
     ▼
  Stage 1: CLEANUP
     │  Remove previous migration artifacts
-    │  Cleanup old NFS mounts on WRCP host
     ▼
  ┌─────────────────────────────────────────────────────────────┐
- │ NEW: NFS Volume Setup (replaces addon K8S + CSI)            │
+ │ CSI Volume Provisioning (via PVC + StorageClass)            │
  │                                                             │
- │  1. Create Cinder volume (--type netapp-nfs)                │
- │  2. Create Shadow VM (triggers NFS attachment properties)   │
- │  3. Stop Shadow VM                                          │
- │  4. Query volume attachment → extract NFS export info       │
- │  5. Mount NFS export on WRCP worker host                    │
- │  6. Create static PV/PVC pointing to volume file            │
+ │  Blueprint: kubectl apply PVC (StorageClass: cinder-nfs)    │
+ │  CSI CreateVolume:                                          │
+ │    1. Create Cinder volume (--type netapp-nfs)              │
+ │    2. Store csi.shadow_vm_id in Cinder metadata             │
+ │    3. Create Shadow VM (triggers NFS attachment record)     │
+ │    4. Stop Shadow VM (volume status: in-use)                │
+ │                                                             │
+ │  Result: PV bound to PVC, Cinder vol locked by Shadow VM    │
  └─────────────────────────────────────────────────────────────┘
     │
     ▼
  Stage 2: FULL COPY
     │  Create initial VMware snapshot
-    │  CDI importer on WRC K8S → VDDK full disk copy
-    │  Writes to /dev/cdi-block-volume → NFS → Cinder volume
+    │  CDI importer pod 1 on WRC K8S:
+    │    CSI ControllerPublish → query attachment → NFS info
+    │    CSI NodeStage → mount NFS on WRCP host
+    │    CSI NodePublish → bind mount vol file into pod
+    │    VDDK full disk copy → /dev/cdi-block-volume → NFS
+    │  Pod 1 exits:
+    │    CSI NodeUnpublish + NodeUnstage → umount NFS
+    │    CSI ControllerUnpublish → NO-OP (Shadow VM persists)
     ▼
- Stage 3: PRECOPY (Loop)
+ Stage 3: PRECOPY (Loop — repeat N times)
     │  Create incremental snapshot
-    │  CDI importer → VDDK delta copy (changed blocks only)
-    │  Writes delta to same NFS-backed Cinder volume
+    │  CDI importer pod N on WRC K8S:
+    │    CSI ControllerPublish → query SAME attachment → NFS info ✓
+    │    CSI NodeStage → mount NFS again
+    │    CSI NodePublish → bind mount again
+    │    VDDK delta copy (changed blocks only) → NFS
+    │  Pod N exits:
+    │    CSI ControllerUnpublish → NO-OP (Shadow VM persists) ✓
     │  Repeat until cutover triggered
     ▼
  Stage 4: CUTOVER
     │  Power off source VM
-    │  Final snapshot + final delta transfer
-    │  Unmount NFS on WRCP host
+    │  Final snapshot + final delta transfer (same pod pattern)
+    │  Final CSI ControllerUnpublish → NO-OP
     ▼
  ┌─────────────────────────────────────────────────────────────┐
- │ NEW: Volume Finalization (depends on StorageClass config)    │
+ │ Volume Release + Finalization                               │
  │                                                             │
- │  Path A (default — Shadow VM still exists):                 │
+ │  Blueprint: kubectl delete pvc                              │
+ │  CSI DeleteVolume:                                          │
+ │    1. Detach volume from Shadow VM                          │
+ │    2. Wait for volume status → "available"                  │
+ │    3. Delete Shadow VM                                      │
+ │  Result: Cinder volume available, no attachments            │
+ │                                                             │
+ │  Blueprint (post-CSI):                                      │
  │    1. virt-v2v-in-place (inject virtio drivers)             │
- │    2. Detach volume from Shadow VM (orchestrator)           │
- │    3. Delete Shadow VM (orchestrator)                       │
- │    4. Mark volume bootable                                  │
- │                                                             │
- │  Path B (deleteVolumeOnUnpublish — auto cleanup):           │
- │    1. Clone volume with tenant naming                       │
- │    2. virt-v2v-in-place on cloned volume                    │
- │    3. Mark cloned volume bootable                           │
- │    4. Delete PVC/PV → CSI auto-deletes original volume      │
+ │    2. openstack volume set --bootable ${VOLUME_ID}          │
  └─────────────────────────────────────────────────────────────┘
     │
     ▼
  Stage 5+7: CREATE VM (OpenStack)
-    │  openstack server create --volume ${VOLUME_ID or CLONE_ID}
+    │  openstack server create --volume ${VOLUME_ID}
+    │  VM boots from Cinder volume directly
+    ▼
+ ✓ MIGRATION COMPLETE
+```
+
+#### 5.1.2 OpenStack → OpenStack (O2O) — virsh blockcopy
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│              END-TO-END O2O NFS-BACKED MIGRATION FLOW                          │
+│              (virsh blockcopy + CSI NFS-Cinder Driver)                         │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+ WRC Blueprint Orchestrator
+ ═════════════════════════
+
+ Stage 0: PRECHECK
+    │  Validate source VM, inspect disk layout
+    │  Validate target OpenStack NFS backend
+    ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ CSI Volume Provisioning (via PVC + StorageClass)            │
+ │                                                             │
+ │  Blueprint: kubectl apply PVC (StorageClass: cinder-nfs)    │
+ │  CSI CreateVolume:                                          │
+ │    1. Create Cinder volume (--type netapp-nfs)              │
+ │    2. Create Shadow VM + stop (volume: in-use)              │
+ │                                                             │
+ │  CSI ControllerPublishVolume:                               │
+ │    Query attachment → NFS export + volume file info         │
+ │  Blueprint reads NFS info from PV volumeAttributes          │
+ └─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+ Stage 2: BLOCK MIRROR
+    │  Blueprint mounts NFS on source compute host directly
+    │  (NOT via CSI Node RPCs — this is a hypervisor operation)
+    │  virsh blockcopy source-vm vda → NFS volume file
+    │  Mirror runs until ready for pivot
+    ▼
+ Stage 3: CUTOVER
+    │  virsh blockjob --pivot (switch source to NFS target)
+    │  Power off source VM
+    │  Unmount NFS on compute host
+    ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ Volume Release + Finalization                               │
+ │                                                             │
+ │  Blueprint: kubectl delete pvc                              │
+ │  CSI DeleteVolume:                                          │
+ │    1. Detach from Shadow VM → delete Shadow VM              │
+ │    2. Volume → "available"                                  │
+ │                                                             │
+ │  Blueprint (post-CSI):                                      │
+ │    1. virt-v2v-in-place (if needed)                         │
+ │    2. openstack volume set --bootable ${VOLUME_ID}          │
+ └─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+ Stage 4: CREATE VM (OpenStack)
+    │  openstack server create --volume ${VOLUME_ID}
     │  VM boots from Cinder volume directly
     ▼
  ✓ MIGRATION COMPLETE
@@ -1116,9 +1249,9 @@ VMware vCenter (Mgmt Network)          WRCP/WRC Worker Host              OpenSta
 
 ## 6. Implementation Details
 
-### 6.1 NFS Volume Discovery Script
+### 6.1 NFS Volume Discovery Script (Reference)
 
-The following script demonstrates the NFS connection discovery from Cinder volume attachment properties:
+The following script demonstrates the NFS connection discovery logic that the CSI driver implements internally in `CreateVolume` and `ControllerPublishVolume`. This script is provided as a **reference** — in production, the CSI driver performs these steps automatically when a PVC is created. For the O2O use case, the Blueprint may also use this logic to mount NFS directly on compute hosts.
 
 ```bash
 #!/bin/bash
@@ -1212,44 +1345,28 @@ echo "Format:        ${VOLUME_FORMAT}"
 echo "========================================"
 ```
 
-### 6.2 PV/PVC Definition for NFS Volume
+### 6.2 StorageClass and PVC Definition
 
-**Static PV and PVC** to expose the NFS-mounted Cinder volume file as a block device to the CDI importer pod:
+With the CSI driver managing Shadow VM lifecycle, PV/PVC provisioning is **dynamic** — the Blueprint only creates a PVC referencing a StorageClass. The CSI driver handles all OpenStack resource creation.
+
+**StorageClass:**
 
 ```yaml
-# =============================================================================
-# PersistentVolume: points to the NFS-mounted Cinder volume file on the host
-# =============================================================================
-apiVersion: v1
-kind: PersistentVolume
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
 metadata:
-  name: migration-${VM_NAME}-vda-pv
-  labels:
-    migration.wrc.windriver.com/volume: "migration-${VM_NAME}-vda"
-    migration.wrc.windriver.com/type: "nfs-cinder"
-spec:
-  capacity:
-    storage: ${DISK_SIZE}Gi
-  volumeMode: Block
-  accessModes:
-    - ReadWriteOnce
-  persistentVolumeReclaimPolicy: Retain
-  # hostPath points to the volume FILE on the NFS mount
-  # This file IS the Cinder volume — writes go through NFS to the backend
-  local:
-    path: /var/lib/cinder-nfs/migration-${VM_NAME}-vda/${VOLUME_FILE}
-  nodeAffinity:
-    required:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: kubernetes.io/hostname
-              operator: In
-              values:
-                - ${WRCP_WORKER_HOSTNAME}
----
-# =============================================================================
-# PersistentVolumeClaim: CDI importer pod binds to this
-# =============================================================================
+  name: cinder-nfs-migration
+provisioner: cinder-nfs.csi.openstack.org
+parameters:
+  type: netapp-nfs       # Cinder volume type (must be NFS-backed)
+  availability: nova     # Target availability zone
+reclaimPolicy: Delete    # PVC deletion triggers DeleteVolume → Shadow VM cleanup
+volumeBindingMode: Immediate
+```
+
+**PVC (created by Blueprint):**
+
+```yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -1259,7 +1376,6 @@ metadata:
     app: containerized-data-importer
     migration.wrc.windriver.com/volume: "migration-${VM_NAME}-vda"
   annotations:
-    cdi.kubevirt.io/storage.createdByController: "false"
     cdi.kubevirt.io/storage.import.source: vddk
 spec:
   accessModes:
@@ -1268,9 +1384,10 @@ spec:
   resources:
     requests:
       storage: ${DISK_SIZE}Gi
-  storageClassName: ""   # Empty string for static binding
-  volumeName: migration-${VM_NAME}-vda-pv
+  storageClassName: cinder-nfs-migration
 ```
+
+The CSI driver provisions the PV automatically with `VolumeContext` containing NFS connection info. The CO passes this context through `ControllerPublishVolume` → `NodeStageVolume` → `NodePublishVolume`. No static PV or manual NFS mount is needed for the V2O use case.
 
 ### 6.3 CDI Importer Pod Specification
 
@@ -1290,9 +1407,6 @@ metadata:
     migration.wrc.windriver.com/type: nfs-cinder
 spec:
   restartPolicy: OnFailure
-  # Pin to the worker node where NFS is mounted
-  nodeSelector:
-    kubernetes.io/hostname: ${WRCP_WORKER_HOSTNAME}
   containers:
     - name: importer
       image: registry.local:9001/quay.io/kubevirt/cdi-importer:v1.58.0
@@ -1344,7 +1458,7 @@ spec:
         - mountPath: /opt
           name: vddk-vol-mount
   volumes:
-    # PVC backed by static PV → NFS-mounted Cinder volume file
+    # Dynamic PVC provisioned by cinder-nfs-migration StorageClass
     - name: cdi-data-vol
       persistentVolumeClaim:
         claimName: migration-${VM_NAME}-vda-pvc
@@ -1354,70 +1468,51 @@ spec:
 
 ### 6.4 Shadow VM Lifecycle Management
 
-The Shadow VM is a temporary resource used only for Cinder volume attachment record creation. Its lifecycle:
+The Shadow VM is a temporary resource whose **sole purpose** is to trigger Cinder's NFS attachment record creation. Its lifecycle is fully managed by the CSI driver:
 
 ```
-Created ──► Running ──► Stopped ──► (Migration runs) ──► Volume Detached ──► Deleted
-   │            │            │                                   │                │
-   └ Triggers   └ Attachment └ Minimal resource               └ Volume freed   └ Cleanup
-     volume       record       consumption                      for target VM
-     attachment   populated
+  CSI CreateVolume                              CSI DeleteVolume (PVC deleted)
+  ══════════════                                ══════════════════════════════
+  Created ──► Running ──► Stopped ──►  Migration runs  ──► Detached ──► Deleted
+     │            │            │       (multiple CDI         │             │
+     └ Triggers   └ Attachment └ Vol   stages cycle,        └ Volume      └ Full
+       volume       record       stays Shadow VM             freed:        cleanup
+       attachment   populated    in-   persists via          "available"
+                                use    no-op Unpublish)
 ```
 
-**Cleanup Script — Path A (default, `deleteVolumeOnUnpublish: "false"`):**
+**Key lifecycle invariants:**
+
+| Phase | Shadow VM State | Volume State | Attachment Record |
+|-------|----------------|--------------|-------------------|
+| After `CreateVolume` | Stopped | `in-use` | Exists (NFS connection_info populated) |
+| During CDI precopy stages | Stopped | `in-use` | Persists (ControllerUnpublish = no-op) |
+| Between CDI stages (no pod) | Stopped | `in-use` | Persists (acts as lock) |
+| After `DeleteVolume` (success) | Deleted | `available` | Removed |
+| After `DeleteVolume` (failure) | Deleted | Deleted | Removed |
+
+**Blueprint cleanup script (success path):**
 
 ```bash
-# After migration is complete and target VM is created:
-
-# 1. Unmount NFS from WRCP host (handled by NodeUnstageVolume)
-umount /var/lib/cinder-nfs/migration-${VM_NAME}-vda
-rmdir /var/lib/cinder-nfs/migration-${VM_NAME}-vda
-
-# 2. Delete K8S PV/PVC resources
+# Migration complete — Blueprint deletes PVC
+# CSI DeleteVolume automatically: detach → delete Shadow VM → volume "available"
 kubectl delete pvc migration-${VM_NAME}-vda-pvc
-kubectl delete pv migration-${VM_NAME}-vda-pv
 
-# 3. Detach volume from Shadow VM (post-CSI orchestrator step)
-openstack server remove volume shadow-${VM_NAME} ${VOLUME_ID}
-
-# 4. Delete Shadow VM
-openstack server delete shadow-${VM_NAME}
-
-# 5. Volume is now available for target VM creation
-openstack server create --volume ${VOLUME_ID} ...
+# Volume is now ready for target VM creation
+openstack volume set --bootable ${VOLUME_ID}
+openstack server create --volume ${VOLUME_ID} \
+  --flavor ${FLAVOR} --network ${NETWORK} target-${VM_NAME}
 ```
 
-**Cleanup Script — Path B (`deleteVolumeOnUnpublish: "true"`, auto cleanup):**
+**Blueprint cleanup script (failure/cancellation):**
 
 ```bash
-# After migration data transfer is complete:
+# Mark volume for full cleanup before deleting PVC
+openstack volume set --property csi.cleanupVolume=true ${VOLUME_ID}
 
-# 1. Clone volume BEFORE deleting PVC (order is critical!)
-openstack volume create \
-  --source ${VOLUME_ID} \
-  --name ${TENANT_VM_NAME}-root \
-  --type ${TENANT_VOLUME_TYPE}
-
-CLONE_VOLUME_ID=$(openstack volume show ${TENANT_VM_NAME}-root -f value -c id)
-
-# 2. Wait for clone to complete
-openstack volume show ${CLONE_VOLUME_ID} -f value -c status
-# Must be 'available' before proceeding
-
-# 3. virt-v2v + set bootable + create target VM from clone
-openstack volume set --bootable ${CLONE_VOLUME_ID}
-openstack server create --volume ${CLONE_VOLUME_ID} ...
-
-# 4. NOW delete the PVC/PV — this triggers ControllerUnpublishVolume
-#    which automatically:
-#    - Unmounts NFS (via NodeUnstageVolume)
-#    - Detaches volume from Shadow VM
-#    - Deletes Shadow VM
-#    - DELETES the original Cinder volume  ◄── Automatic!
+# Delete PVC — CSI DeleteVolume will delete Shadow VM AND the Cinder volume
 kubectl delete pvc migration-${VM_NAME}-vda-pvc
-kubectl delete pv migration-${VM_NAME}-vda-pv
-
-# No need to call 'openstack volume delete' — CSI handled it!
+# Result: no orphaned volumes or Shadow VMs
 ```
 
 ---
@@ -1494,8 +1589,8 @@ kubectl delete pv migration-${VM_NAME}-vda-pv
 | **Management Network Access** | WRCP/WRC worker hosts must have connectivity to VMware vCenter on the management network for VDDK data transfer. |
 | **OpenStack Credentials** | Valid OpenStack credentials with permissions for Cinder volume operations, Nova instance management, and volume attachment queries. |
 | **WRC K8S Cluster** | Existing WRC K8S cluster with CDI installed and operational. |
-| **Privileged Host Access** | Ability to run `mount` commands on WRCP/WRC worker hosts (for NFS mounting). |
-| **Static PV Support** | WRC K8S cluster must support `local` PersistentVolumes with `volumeMode: Block`. |
+| **Privileged Host Access** | Ability to run `mount` commands on WRCP/WRC worker hosts (for NFS mounting via CSI Node plugin). For O2O use case, also on source compute hosts (Blueprint-managed). |
+| **CSI Driver Deployment** | NFS-Cinder CSI driver (`cinder-nfs.csi.openstack.org`) deployed on WRC K8S cluster with Controller and Node plugins. |
 
 ---
 
@@ -1516,17 +1611,17 @@ kubectl delete pv migration-${VM_NAME}-vda-pv
 
 ## 10. Future Work
 
-1. **Automation via WRC Blueprint Integration** — Integrate the NFS mount, PV/PVC creation, and Shadow VM lifecycle into the WRC migration blueprint as dedicated node templates, eliminating manual steps.
+1. **Multi-Disk Support** — Extend the workflow to handle VMs with multiple disks, creating one Cinder volume + NFS mount + PV/PVC per disk via multiple PVCs in a single StorageClass.
 
-2. **Multi-Disk Support** — Extend the workflow to handle VMs with multiple disks, creating one Cinder volume + NFS mount + PV/PVC per disk.
+2. **NFS Mount DaemonSet** — Deploy a privileged DaemonSet on WRC workers that handles NFS mount/unmount operations via a gRPC or REST API, removing the need for direct host SSH access in the O2O use case.
 
-3. **NFS Mount DaemonSet** — Deploy a privileged DaemonSet on WRC workers that handles NFS mount/unmount operations via a gRPC or REST API, removing the need for direct host SSH access.
+3. **Support for Non-NFS Backends** — Investigate extending the approach to other Cinder backends (e.g., using `tgt`/iSCSI initiator on WRCP hosts for iSCSI-backed volumes).
 
-4. **Custom CSI Driver for NFS-Cinder** — Build a thin CSI driver (`cinder-nfs.csi.wrc.windriver.com`) that encapsulates the Shadow VM + NFS discovery + mount logic behind standard CSI RPCs, enabling seamless CDI/DataVolume integration without static PV/PVC management.
+4. **virt-v2v Driver Injection via NFS** — Perform virtio driver injection directly on the NFS-mounted volume file from the WRCP host, avoiding the need to re-mount NFS post-CSI for driver injection.
 
-5. **Support for Non-NFS Backends** — Investigate extending the approach to other Cinder backends (e.g., using `tgt`/iSCSI initiator on WRCP hosts for iSCSI-backed volumes).
+5. **Volume Cloning Support** — Add `CLONE_VOLUME` capability to enable clone-to-tenant-volume workflows directly within the CSI driver, eliminating the need for Blueprint to call `openstack volume create --source` separately.
 
-6. **virt-v2v Driver Injection via NFS** — Perform virtio driver injection directly on the NFS-mounted volume file from the WRCP host, avoiding the need to re-mount or use the Shadow VM for this step.
+6. **Automatic virt-v2v Integration** — Run virt-v2v as a post-migration CSI hook or sidecar, eliminating the Blueprint step between PVC deletion and VM creation.
 
 ---
 
