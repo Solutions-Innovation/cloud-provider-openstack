@@ -284,7 +284,7 @@ The table below summarizes how each CSI RPC maps to OpenStack operations in the 
 | **`NodePublishVolume`** | Bind mount staging path (or raw block device) → target path | Bind mount NFS volume file → target path as block device (`/dev/cdi-block-volume`) |
 | **`NodeUnpublishVolume`** | `umount` target path | `umount` bind mount at target path |
 | **`NodeGetInfo`** | Returns Nova instance ID + AZ topology | Returns WRCP host ID + topology label |
-| **`ValidateVolumeCapabilities`** | Validates `SINGLE_NODE_WRITER` | Validates `SINGLE_NODE_WRITER`, `Block` access type, `nfs` driver_volume_type |
+| **`ValidateVolumeCapabilities`** | Validates `SINGLE_NODE_WRITER` | Validates `SINGLE_NODE_WRITER`, `Block` access type; queries attachment `connection_info.driver_volume_type == "nfs"` |
 
 ### 4.1 CSI Identity Service
 
@@ -442,11 +442,7 @@ In the existing Cinder CSI driver, this RPC calls `Nova os-volume_attachments` t
        │     → Cinder GET /v3/volumes/{id}        │
        ├────────────────────────────────────────► │
        │                                          │
-       │  2. Validate driver_volume_type:         │
-       │     if volume.VolumeType != nfs-backed   │
-       │       → return INVALID_ARGUMENT          │
-       │                                          │
-       │  3. Get attachment ID:                   │
+       │  2. Get attachment ID:                   │
        │     cloud.ListVolumeAttachments(          │
        │       VolumeId: req.VolumeId             │
        │     )                                    │
@@ -455,7 +451,7 @@ In the existing Cinder CSI driver, this RPC calls `Nova os-volume_attachments` t
        │                                          │
        │  ◄── ATTACHMENT_ID                       │
        │                                          │
-       │  4. Get attachment connection_info:      │
+       │  3. Get attachment connection_info:      │
        │     cloud.GetVolumeAttachment(            │
        │       ATTACHMENT_ID                      │
        │     )                                    │
@@ -471,6 +467,15 @@ In the existing Cinder CSI driver, this RPC calls `Nova os-volume_attachments` t
        │        "driver_volume_type": "nfs",      │
        │        "mount_point_base": "/opt/stack/data/cinder/mnt"
        │      }                                   │
+       │                                          │
+       │  4. Validate driver_volume_type:         │
+       │     if connection_info.driver_volume_type │
+       │        != "nfs"                           │
+       │       → return INVALID_ARGUMENT          │
+       │     (Cinder NFS driver sets              │
+       │      driver_volume_type = "nfs" —        │
+       │      see NfsDriver.driver_volume_type    │
+       │      in cinder/volume/drivers/nfs.py)    │
        │                                          │
        │  5. Return ControllerPublishVolumeResponse:
        │     PublishContext = {                    │
