@@ -41,7 +41,7 @@
   - [5. Component Flow](#5-component-flow)
     - [5.1 End-to-End Workflow](#51-end-to-end-workflow)
       - [5.1.1 VMware → OpenStack (V2O) — CDI Multi-Phase Warm Migration](#511-vmware--openstack-v2o--cdi-multi-phase-warm-migration)
-      - [5.1.2 OpenStack → OpenStack (O2O) — virsh blockcopy](#512-openstack--openstack-o2o--virsh-blockcopy)
+      - [5.1.2 OpenStack → OpenStack (O2O) — NBD Receiver + virsh blockcopy](#512-openstack--openstack-o2o--nbd-receiver--virsh-blockcopy)
     - [5.2 Data Path Visualization](#52-data-path-visualization)
   - [6. Implementation Details](#6-implementation-details)
     - [6.1 NFS Volume Discovery Script (Reference)](#61-nfs-volume-discovery-script-reference)
@@ -130,12 +130,12 @@ This design consolidates **two migration use cases** under a single CSI driver t
 | Use Case | Data Transfer Tool | Data Writer | NFS Mount Location | Description |
 |----------|-------------------|-------------|-------------------|-------------|
 | **VMware → OpenStack (V2O)** | CDI importer pod (VDDK multi-phase warm migration) | CDI pod on WRC K8S | WRCP/WRC worker host (via CSI Node RPCs) | CDI runs full copy + N precopy delta stages. Each stage may create/destroy importer pods. CSI must survive pod cycling without losing NFS metadata. |
-| **OpenStack → OpenStack (O2O)** | `virsh blockcopy` (libvirt block mirror) | libvirt/QEMU on source compute host | Source OpenStack compute host (Blueprint mounts directly) | Blueprint reads NFS connection info from CSI `ControllerPublishVolume`, mounts NFS on the compute host, and runs `virsh blockcopy` to mirror the source VM's vda to the NFS volume file. |
+| **OpenStack → OpenStack (O2O)** | NBD receiver pod + `virsh blockcopy` | NBD receiver pod on WRC K8S (writes to PVC via NBD) | WRCP/WRC worker host (via CSI Node RPCs) | Blueprint launches a long-running NBD receiver pod that mounts the PVC/PV (backed by this CSI driver) and exposes it via the NBD protocol. Source libvirt `virsh blockcopy` targets the NBD endpoint to mirror the source VM's vda to the Cinder volume. |
 
-**Consolidation Principle:** The CSI driver's Controller plugin manages the Shadow VM lifecycle (create, stop, persist attachment, cleanup on `DeleteVolume`) identically for both use cases. The difference is only in who performs the NFS mount and writes data:
+**Consolidation Principle:** The CSI driver's Controller plugin manages the Shadow VM lifecycle (create, stop, persist attachment, cleanup on `DeleteVolume`) identically for both use cases. Both use cases consume the Cinder volume via a PVC on the WRC K8S cluster — the CSI Node plugin mounts NFS on the WRCP worker and bind-mounts the volume file into the consumer pod. The difference is only in the **consumer pod**:
 
-- **V2O**: CSI Node plugin mounts NFS on the WRCP worker, bind-mounts the volume file into the CDI pod
-- **O2O**: Blueprint reads NFS info from the PV's `volumeAttributes` (populated by `ControllerPublishVolume`) and mounts NFS directly on the compute host
+- **V2O**: CDI importer pod — multi-phase (pods cycle between full copy and precopy stages)
+- **O2O**: NBD receiver pod — long-running single pod that exposes the volume via NBD protocol as the target for source libvirt `virsh blockcopy`
 
 ### 2.3 Design Goals
 
@@ -507,6 +507,8 @@ CDI warm migration uses **multi-phase precopy** (full copy → precopy 1 → pre
 ```
 
 If `ControllerUnpublishVolume` were to detach the volume from the Shadow VM or delete the Shadow VM, then `ControllerPublishVolume` in the next stage would fail — there would be no attachment record to query for NFS connection info. Therefore, `ControllerUnpublishVolume` must be a no-op.
+
+For the **O2O use case** (NBD receiver pod), the pod is long-running so `ControllerUnpublishVolume` fires only once (when the pod is deleted after blockcopy completes). The no-op behavior is equally correct here — cleanup is always deferred to `DeleteVolume`.
 
 **Implementation:**
 
@@ -984,41 +986,49 @@ The following diagram shows the complete CSI RPC call sequence during a CDI mult
   └─────┤                              │                         │
 ```
 
-**OpenStack → OpenStack (O2O) variant** — the sequence is simpler because there are no CDI pod cycles:
+**OpenStack → OpenStack (O2O) variant** — the sequence is simpler because there is a single long-running NBD receiver pod (no CDI pod cycles):
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│   CSI RPC Call Sequence — virsh blockcopy (O2O)                                 │
+│   CSI RPC Call Sequence — NBD receiver pod (O2O)                                │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
- Blueprint                      Controller Plugin
- ═════════                      ═════════════════
-     │                                 │
-     │─ Create PVC ───────────────────►│
-     │                                 │── CreateVolume:
-     │                                 │   Cinder vol + Shadow VM
-     │                                 │
-     │─ (Force ControllerPublish) ────►│
-     │                                 │── ControllerPublishVolume:
-     │                                 │   Query attachment → NFS info
-     │  ◄── NFS info in PV annotations│
-     │                                 │
-     │─ Mount NFS on compute host ─────┤  (Blueprint does this directly,
-     │  using nfs_export from PV       │   NOT via CSI Node RPCs)
-     │                                 │
-     │─ virsh blockcopy source-vda ────┤  (libvirt mirrors to NFS vol file)
-     │  → NFS vol file                 │
-     │                                 │
-     │─ blockcopy complete ────────────┤
-     │─ Unmount NFS on compute host ───┤
-     │                                 │
-     │─ Delete PVC ───────────────────►│
-     │                                 │── DeleteVolume:
-     │                                 │   Detach + delete Shadow VM
-     │                                 │   Volume → "available"
-     │                                 │
-     │─ set bootable + server create ──┤
-     ✓ Done                            │
+ Blueprint                   Controller Plugin           Node Plugin (WRCP host)
+ ═════════                   ═════════════════           ═══════════════════════
+     │                              │                            │
+     │─ Create PVC ────────────────►│                            │
+     │                              │── CreateVolume:            │
+     │                              │   Cinder vol + Shadow VM   │
+     │                              │                            │
+     │─ Launch NBD receiver pod ────┤                            │
+     │  (PVC mounted as volume)     │                            │
+     │                              │── ControllerPublishVolume: │
+     │                              │   Query attachment → NFS   │
+     │                              │──────────────────────────►│
+     │                              │                            │── NodeStage: mount NFS
+     │                              │                            │── NodePublish: bind mount
+     │                              │                            │   vol file into pod
+     │                              │                            │
+     │  NBD receiver pod running ───┤   (exposes volume via NBD) │
+     │                              │                            │
+     │─ virsh blockcopy ───────────►│   source libvirt writes    │
+     │  source-vda → nbd://receiver │   to NBD → vol file → NFS  │
+     │                              │                            │
+     │─ blockcopy complete ─────────┤                            │
+     │─ virsh blockjob --pivot ─────┤                            │
+     │                              │                            │
+     │─ Delete NBD receiver pod ────┤                            │
+     │                              │                            │── NodeUnpublish + Unstage
+     │                              │── ControllerUnpublish:     │
+     │                              │   NO-OP                    │
+     │                              │                            │
+     │─ Delete PVC ────────────────►│                            │
+     │                              │── DeleteVolume:            │
+     │                              │   Detach + delete Shadow VM│
+     │                              │   Volume → "available"     │
+     │                              │                            │
+     │─ set bootable + server create┤                            │
+     ✓ Done                         │                            │
 ```
 
 ### 4.6 Volume Finalization and VM Creation (Post-CSI)
@@ -1157,12 +1167,12 @@ kubectl delete pvc migration-${VM_NAME}-vda-pvc
  ✓ MIGRATION COMPLETE
 ```
 
-#### 5.1.2 OpenStack → OpenStack (O2O) — virsh blockcopy
+#### 5.1.2 OpenStack → OpenStack (O2O) — NBD Receiver + virsh blockcopy
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────┐
 │              END-TO-END O2O NFS-BACKED MIGRATION FLOW                          │
-│              (virsh blockcopy + CSI NFS-Cinder Driver)                         │
+│              (NBD Receiver Pod + virsh blockcopy + CSI NFS-Cinder Driver)       │
 └────────────────────────────────────────────────────────────────────────────────┘
 
  WRC Blueprint Orchestrator
@@ -1180,25 +1190,35 @@ kubectl delete pvc migration-${VM_NAME}-vda-pvc
  │    1. Create Cinder volume (--type netapp-nfs)              │
  │    2. Create Shadow VM + stop (volume: in-use)              │
  │                                                             │
- │  CSI ControllerPublishVolume:                               │
- │    Query attachment → NFS export + volume file info         │
- │  Blueprint reads NFS info from PV volumeAttributes          │
+ │  Result: PV bound to PVC, Cinder vol locked by Shadow VM    │
  └─────────────────────────────────────────────────────────────┘
     │
     ▼
+ Stage 1: LAUNCH NBD RECEIVER
+    │  Blueprint launches NBD receiver pod on WRC K8S:
+    │    Pod spec references the PVC (volumeMode: Block)
+    │    CSI ControllerPublish → query attachment → NFS info
+    │    CSI NodeStage → mount NFS on WRCP host
+    │    CSI NodePublish → bind mount vol file into pod
+    │  NBD receiver pod starts:
+    │    Exposes /dev/cdi-block-volume via NBD protocol
+    │    Listens on nbd://<pod-ip>:10809/export
+    ▼
  Stage 2: BLOCK MIRROR
-    │  Blueprint mounts NFS on source compute host directly
-    │  (NOT via CSI Node RPCs — this is a hypervisor operation)
-    │  virsh blockcopy source-vm vda → NFS volume file
+    │  virsh blockcopy source-vm vda nbd://<nbd-receiver>:10809
+    │    (source libvirt mirrors disk to NBD target → NFS volume)
     │  Mirror runs until ready for pivot
     ▼
  Stage 3: CUTOVER
-    │  virsh blockjob --pivot (switch source to NFS target)
+    │  virsh blockjob --pivot (switch source to NBD/NFS target)
     │  Power off source VM
-    │  Unmount NFS on compute host
     ▼
  ┌─────────────────────────────────────────────────────────────┐
  │ Volume Release + Finalization                               │
+ │                                                             │
+ │  Blueprint: delete NBD receiver pod                         │
+ │    CSI NodeUnpublish + NodeUnstage → umount NFS             │
+ │    CSI ControllerUnpublish → NO-OP                          │
  │                                                             │
  │  Blueprint: kubectl delete pvc                              │
  │  CSI DeleteVolume:                                          │
@@ -1251,7 +1271,7 @@ VMware vCenter (Mgmt Network)          WRCP/WRC Worker Host              OpenSta
 
 ### 6.1 NFS Volume Discovery Script (Reference)
 
-The following script demonstrates the NFS connection discovery logic that the CSI driver implements internally in `CreateVolume` and `ControllerPublishVolume`. This script is provided as a **reference** — in production, the CSI driver performs these steps automatically when a PVC is created. For the O2O use case, the Blueprint may also use this logic to mount NFS directly on compute hosts.
+The following script demonstrates the NFS connection discovery logic that the CSI driver implements internally in `CreateVolume` and `ControllerPublishVolume`. This script is provided as a **reference** — in production, the CSI driver performs these steps automatically when a PVC is created.
 
 ```bash
 #!/bin/bash
@@ -1474,11 +1494,12 @@ The Shadow VM is a temporary resource whose **sole purpose** is to trigger Cinde
   CSI CreateVolume                              CSI DeleteVolume (PVC deleted)
   ══════════════                                ══════════════════════════════
   Created ──► Running ──► Stopped ──►  Migration runs  ──► Detached ──► Deleted
-     │            │            │       (multiple CDI         │             │
-     └ Triggers   └ Attachment └ Vol   stages cycle,        └ Volume      └ Full
-       volume       record       stays Shadow VM             freed:        cleanup
-       attachment   populated    in-   persists via          "available"
-                                use    no-op Unpublish)
+     │            │            │       (V2O: CDI pods     │             │
+     └ Triggers   └ Attachment └ Vol    cycle; O2O: NBD   └ Volume      └ Full
+       volume       record       stays  receiver pod      freed:        cleanup
+       attachment   populated    in-    runs; Shadow VM   "available"
+                                use     persists via
+                                        no-op Unpublish)
 ```
 
 **Key lifecycle invariants:**
@@ -1486,7 +1507,8 @@ The Shadow VM is a temporary resource whose **sole purpose** is to trigger Cinde
 | Phase | Shadow VM State | Volume State | Attachment Record |
 |-------|----------------|--------------|-------------------|
 | After `CreateVolume` | Stopped | `in-use` | Exists (NFS connection_info populated) |
-| During CDI precopy stages | Stopped | `in-use` | Persists (ControllerUnpublish = no-op) |
+| During V2O CDI precopy stages | Stopped | `in-use` | Persists (ControllerUnpublish = no-op) |
+| During O2O NBD receiver pod | Stopped | `in-use` | Persists (long-running pod, single mount) |
 | Between CDI stages (no pod) | Stopped | `in-use` | Persists (acts as lock) |
 | After `DeleteVolume` (success) | Deleted | `available` | Removed |
 | After `DeleteVolume` (failure) | Deleted | Deleted | Removed |
@@ -1589,7 +1611,7 @@ kubectl delete pvc migration-${VM_NAME}-vda-pvc
 | **Management Network Access** | WRCP/WRC worker hosts must have connectivity to VMware vCenter on the management network for VDDK data transfer. |
 | **OpenStack Credentials** | Valid OpenStack credentials with permissions for Cinder volume operations, Nova instance management, and volume attachment queries. |
 | **WRC K8S Cluster** | Existing WRC K8S cluster with CDI installed and operational. |
-| **Privileged Host Access** | Ability to run `mount` commands on WRCP/WRC worker hosts (for NFS mounting via CSI Node plugin). For O2O use case, also on source compute hosts (Blueprint-managed). |
+| **Privileged Host Access** | Ability to run `mount` commands on WRCP/WRC worker hosts (for NFS mounting via CSI Node plugin). |
 | **CSI Driver Deployment** | NFS-Cinder CSI driver (`cinder-nfs.csi.openstack.org`) deployed on WRC K8S cluster with Controller and Node plugins. |
 
 ---
