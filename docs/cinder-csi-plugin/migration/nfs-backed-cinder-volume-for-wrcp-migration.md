@@ -37,7 +37,9 @@
       - [4.3.4 `NodeUnstageVolume` — Unmount NFS Export](#434-nodeunstagevolume--unmount-nfs-export)
     - [4.4 Cinder Volume Status Lifecycle](#44-cinder-volume-status-lifecycle)
     - [4.5 End-to-End CSI RPC Call Sequence (CDI Multi-Phase Precopy)](#45-end-to-end-csi-rpc-call-sequence-cdi-multi-phase-precopy)
-    - [4.6 Volume Finalization and VM Creation (Post-CSI)](#46-volume-finalization-and-vm-creation-post-csi)
+    - [4.6 Volume Finalization and VM Creation](#46-volume-finalization-and-vm-creation)
+      - [4.6.1 Phase 1: Driver Injection (Pre-CSI Cleanup — PVC Still Exists)](#461-phase-1-driver-injection-pre-csi-cleanup--pvc-still-exists)
+      - [4.6.2 Phase 2: Volume Release + VM Creation (Post-CSI)](#462-phase-2-volume-release--vm-creation-post-csi)
   - [5. Component Flow](#5-component-flow)
     - [5.1 End-to-End Workflow](#51-end-to-end-workflow)
       - [5.1.1 VMware → OpenStack (V2O) — CDI Multi-Phase Warm Migration](#511-vmware--openstack-v2o--cdi-multi-phase-warm-migration)
@@ -1027,6 +1029,16 @@ The following diagram shows the complete CSI RPC call sequence during a CDI mult
      │                              │── ControllerUnpublish:     │
      │                              │   NO-OP                    │
      │                              │                            │
+     │─ Launch helper pod ──────────┤  (PVC still exists)        │
+     │  (virt-v2v-in-place)         │                            │
+     │                              │── ControllerPublish        │
+     │                              │──────────────────────────►│── NodeStage + NodePublish
+     │  helper pod: inject virtio   │                            │   (mount NFS, bind mount)
+     │  drivers into volume         │                            │
+     │─ Helper pod exits ───────────┤                            │── NodeUnpublish + Unstage
+     │                              │── ControllerUnpublish:     │
+     │                              │   NO-OP                    │
+     │                              │                            │
      │─ Delete PVC ────────────────►│                            │
      │                              │── DeleteVolume:            │
      │                              │   Detach + delete Shadow VM│
@@ -1036,24 +1048,67 @@ The following diagram shows the complete CSI RPC call sequence during a CDI mult
      ✓ Done                         │                            │
 ```
 
-### 4.6 Volume Finalization and VM Creation (Post-CSI)
+### 4.6 Volume Finalization and VM Creation
 
-After `DeleteVolume` completes (triggered by PVC deletion), the Cinder volume is `available` with no attachments. The Blueprint performs the final steps:
+Volume finalization is a **two-phase** process: driver injection happens **before** PVC deletion (while NFS is still accessible via CSI), and VM creation happens **after** volume release.
+
+#### 4.6.1 Phase 1: Driver Injection (Pre-CSI Cleanup — PVC Still Exists)
+
+The Blueprint launches a **helper pod** on the WRC K8S cluster that mounts the same PVC. This pod runs `virt-v2v-in-place` to inject virtio drivers into the volume. Because the PVC still exists, the full CSI mount chain is available (ControllerPublish → NodeStage → NodePublish).
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│       Post-CSI: Volume Finalization (both V2O and O2O)                     │
-│       (Orchestrated by WRC Blueprint, not CSI RPCs)                        │
+│       Driver Injection via Helper Pod (PVC still exists)                    │
+│       (Orchestrated by WRC Blueprint, uses CSI mount chain)                │
+└────────────────────────────────────────────────────────────────────────────┘
+
+  WRC Blueprint                             WRC K8S Cluster
+       │                                         │
+       │  PVC still bound to PV                   │
+       │  Shadow VM still holds attachment         │
+       │                                          │
+       │  1. Launch helper pod:                   │
+       │     - References same PVC                │
+       │     - volumeMode: Block                  │
+       │     - image: virt-v2v tooling             │
+       │     CSI fires:                           │
+       │       ControllerPublish → NFS info        │
+       │       NodeStage → mount NFS              │
+       │       NodePublish → bind mount vol file   │
+       │                                          │
+       │  2. Helper pod runs virt-v2v-in-place:    │
+       │     - Injects virtio drivers             │
+       │     - Fixes boot config for KVM          │
+       │     - Writes to /dev/cdi-block-volume     │
+       │       → NFS volume file (same path)       │
+       │                                          │
+       │  3. Helper pod exits:                    │
+       │     CSI fires:                           │
+       │       NodeUnpublish + NodeUnstage         │
+       │       ControllerUnpublish → NO-OP         │
+       │                                          │
+       │  Volume now has virtio drivers injected   │
+       │  PVC/PV still exist, Shadow VM intact     │
+```
+
+#### 4.6.2 Phase 2: Volume Release + VM Creation (Post-CSI)
+
+After driver injection completes, the Blueprint deletes the PVC to trigger `DeleteVolume`, which releases the volume from the Shadow VM.
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│       Volume Release + VM Creation                                         │
+│       (Orchestrated by WRC Blueprint)                                      │
 └────────────────────────────────────────────────────────────────────────────┘
 
   WRC Orchestrator                          Target OpenStack
        │                                         │
-       │  Volume is now "available" (post-CSI)    │
-       │                                          │
-       │  1. virt-v2v-in-place                    │
-       │     (inject virtio drivers into          │
-       │      the volume — can re-mount NFS       │
-       │      temporarily for this step)          │
+       │  1. Delete PVC:                          │
+       │     kubectl delete pvc migration-xxx     │
+       │     CSI DeleteVolume:                    │
+       │       Detach volume from Shadow VM       │
+       │       Delete Shadow VM                   │
+       │     Volume status: "available"           │
        │                                          │
        │  2. Set volume bootable                  │
        │     openstack volume set --bootable      │
@@ -1150,7 +1205,28 @@ kubectl delete pvc migration-${VM_NAME}-vda-pvc
     │  Final CSI ControllerUnpublish → NO-OP
     ▼
  ┌─────────────────────────────────────────────────────────────┐
- │ Volume Release + Finalization                               │
+ │ Stage 5: DRIVER INJECTION (virt-v2v-in-place)               │
+ │  (PVC still exists — NFS mount available via CSI)           │
+ │                                                             │
+ │  Blueprint launches helper pod on WRC K8S:                  │
+ │    Pod spec references SAME PVC (volumeMode: Block)         │
+ │    CSI ControllerPublish → query attachment → NFS info      │
+ │    CSI NodeStage → mount NFS on WRCP host                   │
+ │    CSI NodePublish → bind mount vol file into helper pod    │
+ │                                                             │
+ │  Helper pod runs virt-v2v-in-place:                         │
+ │    - Injects virtio drivers into volume                     │
+ │    - Fixes boot configuration for KVM/OpenStack             │
+ │    - Writes changes directly to NFS volume file             │
+ │                                                             │
+ │  Helper pod exits:                                          │
+ │    CSI NodeUnpublish + NodeUnstage → umount NFS             │
+ │    CSI ControllerUnpublish → NO-OP                          │
+ └─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ Stage 6: VOLUME RELEASE                                     │
  │                                                             │
  │  Blueprint: kubectl delete pvc                              │
  │  CSI DeleteVolume:                                          │
@@ -1158,14 +1234,12 @@ kubectl delete pvc migration-${VM_NAME}-vda-pvc
  │    2. Wait for volume status → "available"                  │
  │    3. Delete Shadow VM                                      │
  │  Result: Cinder volume available, no attachments            │
- │                                                             │
- │  Blueprint (post-CSI):                                      │
- │    1. virt-v2v-in-place (inject virtio drivers)             │
- │    2. openstack volume set --bootable ${VOLUME_ID}          │
+ │          Volume already has virtio drivers injected         │
  └─────────────────────────────────────────────────────────────┘
     │
     ▼
- Stage 5+7: CREATE VM (OpenStack)
+ Stage 7: CREATE VM (OpenStack)
+    │  openstack volume set --bootable ${VOLUME_ID}
     │  openstack server create --volume ${VOLUME_ID}
     │  VM boots from Cinder volume directly
     ▼
