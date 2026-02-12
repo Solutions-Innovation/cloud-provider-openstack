@@ -50,6 +50,16 @@
     - [6.2 StorageClass and PVC Definition](#62-storageclass-and-pvc-definition)
     - [6.3 CDI Importer Pod Specification](#63-cdi-importer-pod-specification)
     - [6.4 Shadow VM Lifecycle Management](#64-shadow-vm-lifecycle-management)
+    - [6.5 Driver Configuration — ConfigMap and Secret](#65-driver-configuration--configmap-and-secret)
+      - [6.5.1 Configuration File Format (`driver.conf`)](#651-configuration-file-format-driverconf)
+      - [6.5.2 Go Config Struct](#652-go-config-struct)
+      - [6.5.3 ConfigMap Manifest](#653-configmap-manifest)
+      - [6.5.4 Secret Manifest (OpenStack Credentials)](#654-secret-manifest-openstack-credentials)
+      - [6.5.5 Controller Deployment — Volume Mounts](#655-controller-deployment--volume-mounts)
+      - [6.5.6 Node DaemonSet — Volume Mounts](#656-node-daemonset--volume-mounts)
+      - [6.5.7 Configuration Validation and Defaults](#657-configuration-validation-and-defaults)
+      - [6.5.8 StorageClass Parameter Overrides](#658-storageclass-parameter-overrides)
+      - [6.5.9 Configuration Diagram](#659-configuration-diagram)
   - [7. Network Architecture](#7-network-architecture)
     - [7.1 Network Topology](#71-network-topology)
     - [7.2 Network Requirements](#72-network-requirements)
@@ -1614,6 +1624,435 @@ openstack volume set --property csi.cleanupVolume=true ${VOLUME_ID}
 # Delete PVC — CSI DeleteVolume will delete Shadow VM AND the Cinder volume
 kubectl delete pvc migration-${VM_NAME}-vda-pvc
 # Result: no orphaned volumes or Shadow VMs
+```
+
+### 6.5 Driver Configuration — ConfigMap and Secret
+
+The NFS-Cinder CSI driver follows the same **dual-config pattern** used by the existing `cinder.csi.openstack.org` driver in this project (see [manifests/cinder-csi-plugin/](../../../manifests/cinder-csi-plugin/)):
+
+| Config Object | K8S Kind | Purpose | Contains |
+|---|---|---|---|
+| `cloud-config` | **Secret** | OpenStack authentication credentials | `cloud.conf` — Keystone auth-url, username, password, project-id, domain, region (same INI format as existing Cinder CSI) |
+| `cinder-nfs-config` | **ConfigMap** | Shadow VM + NFS operational parameters | `driver.conf` — non-sensitive driver configuration: flavor, network, AZ, NFS mount options, timeouts |
+
+**Why a ConfigMap for Shadow VM config (not Secret)?**
+
+Shadow VM parameters (flavor ID, network ID, AZ) are **infrastructure identifiers**, not credentials. Placing them in a ConfigMap:
+- Allows `kubectl edit configmap` for live reconfiguration without re-encoding base64
+- Follows the Kubernetes convention of Secret for credentials, ConfigMap for configuration
+- Matches the existing project pattern where `BlockStorageOpts` struct fields are non-sensitive operational knobs (see [`pkg/csi/cinder/openstack/openstack.go`](../../../pkg/csi/cinder/openstack/openstack.go) — `Config` struct)
+
+#### 6.5.1 Configuration File Format (`driver.conf`)
+
+The driver configuration uses the same INI-style format (`gcfg`) as the existing [`cloud.conf`](../../../pkg/csi/cinder/etc/cloud.conf) in this project. This ensures the driver can reuse the existing `gcfg` parsing infrastructure from `pkg/csi/cinder/openstack`.
+
+```ini
+# =============================================================================
+# driver.conf — NFS-Cinder CSI Driver Configuration
+# Mounted via ConfigMap: cinder-nfs-config
+# Path: /etc/cinder-nfs/driver.conf
+# =============================================================================
+
+# -----------------------------------------------------------
+# [ShadowVM] — Shadow VM lifecycle configuration
+#
+# The Shadow VM is a lightweight Nova instance whose sole
+# purpose is to trigger Cinder's NFS attachment record
+# creation. These parameters control how the Shadow VM is
+# provisioned during the CreateVolume RPC.
+# -----------------------------------------------------------
+[ShadowVM]
+
+# Nova flavor for the Shadow VM.
+# Should be the smallest available flavor — the Shadow VM is
+# stopped immediately after creation and performs zero I/O.
+# Accepts either a flavor ID (UUID) or flavor name.
+# Required.
+flavor-ref = m1.small
+
+# Network ID (UUID) to attach the Shadow VM to.
+# This network must be accessible from the Nova compute host
+# and reachable from the Cinder NFS backend. It does NOT need
+# to be the storage network — the NFS mount is handled
+# separately by the CSI Node plugin on WRCP worker hosts.
+# Required.
+network-id = 8e3f3c4a-1234-5678-abcd-9876543210ab
+
+# Availability zone for the Shadow VM.
+# Should match the AZ where the Cinder NFS backend resides
+# to ensure volume attachment locality.
+# Default: "" (Nova picks the AZ)
+availability-zone = nova
+
+# Name prefix for Shadow VM instances.
+# CreateVolume generates names as: {prefix}-{req.Name}
+# e.g., "shadow-migration-myvm-vda"
+# Default: shadow
+name-prefix = shadow
+
+# Timeout (seconds) to wait for Shadow VM to reach ACTIVE
+# state before being stopped.
+# Default: 300
+create-timeout = 300
+
+# Timeout (seconds) to wait for Shadow VM to reach SHUTOFF
+# state after stop request.
+# Default: 120
+stop-timeout = 120
+
+# Optional: Security group ID(s) for the Shadow VM.
+# Comma-separated list of security group IDs.
+# Default: "" (Nova default security group)
+security-groups =
+
+# Optional: Image ID for the Shadow VM boot disk.
+# Only required if the Shadow VM is NOT booted from the
+# Cinder volume directly (boot-from-volume = true is default).
+# Default: "" (boot from volume)
+image-ref =
+
+# -----------------------------------------------------------
+# [NFS] — NFS mount configuration for CSI Node plugin
+#
+# Controls how the Node plugin mounts NFS exports on
+# WRCP/WRC worker hosts during NodeStageVolume.
+# -----------------------------------------------------------
+[NFS]
+
+# Default NFS mount options applied when the Cinder
+# attachment record does not specify mount options.
+# Override per-volume via StorageClass parameters.
+# Default: rw,hard,intr
+mount-options = rw,hard,intr,rsize=1048576,wsize=1048576
+
+# Base path on WRCP worker hosts for NFS mount points.
+# NodeStageVolume creates per-volume subdirectories under
+# this path. Must be writable by the CSI Node plugin.
+# Default: /var/lib/cinder-nfs
+mount-base-path = /var/lib/cinder-nfs
+
+# NFS version to use for mounting.
+# Default: 4.1
+nfs-version = 4.1
+
+# -----------------------------------------------------------
+# [Volume] — Volume lifecycle configuration
+#
+# Controls volume handling during CreateVolume and
+# DeleteVolume RPCs.
+# -----------------------------------------------------------
+[Volume]
+
+# Timeout (seconds) to wait for Cinder volume to reach
+# "available" status after creation.
+# Default: 300
+create-timeout = 300
+
+# Timeout (seconds) to wait for volume to reach "available"
+# status after detaching from Shadow VM during DeleteVolume.
+# Default: 120
+detach-timeout = 120
+
+# Default Cinder volume type.
+# Can be overridden per-PVC via StorageClass parameters.
+# Must be an NFS-backed volume type.
+# Default: "" (use StorageClass parameter "type")
+default-volume-type =
+
+# Cinder volume metadata key prefix for CSI-managed metadata.
+# The driver stores Shadow VM ID and cleanup flags in Cinder
+# volume metadata using keys like: {prefix}.shadow_vm_id
+# Default: csi
+metadata-prefix = csi
+```
+
+#### 6.5.2 Go Config Struct
+
+Following the pattern in [`pkg/csi/cinder/openstack/openstack.go`](../../../pkg/csi/cinder/openstack/openstack.go) where `Config` contains `BlockStorageOpts`:
+
+```go
+// Config for the NFS-Cinder CSI driver (parsed from driver.conf via gcfg)
+type NfsCinderConfig struct {
+    Global   map[string]*client.AuthOpts  // from cloud.conf (Secret)
+    ShadowVM ShadowVMOpts                 // from driver.conf (ConfigMap)
+    NFS      NFSOpts                      // from driver.conf (ConfigMap)
+    Volume   VolumeOpts                   // from driver.conf (ConfigMap)
+}
+
+// ShadowVMOpts controls the Shadow VM lifecycle in CreateVolume/DeleteVolume
+type ShadowVMOpts struct {
+    FlavorRef        string `gcfg:"flavor-ref"`
+    NetworkID        string `gcfg:"network-id"`
+    AvailabilityZone string `gcfg:"availability-zone"`
+    NamePrefix       string `gcfg:"name-prefix"`
+    CreateTimeout    int    `gcfg:"create-timeout"`
+    StopTimeout      int    `gcfg:"stop-timeout"`
+    SecurityGroups   string `gcfg:"security-groups"`
+    ImageRef         string `gcfg:"image-ref"`
+}
+
+// NFSOpts controls NFS mount behavior in NodeStageVolume/NodeUnstageVolume
+type NFSOpts struct {
+    MountOptions  string `gcfg:"mount-options"`
+    MountBasePath string `gcfg:"mount-base-path"`
+    NFSVersion    string `gcfg:"nfs-version"`
+}
+
+// VolumeOpts controls Cinder volume lifecycle
+type VolumeOpts struct {
+    CreateTimeout     int    `gcfg:"create-timeout"`
+    DetachTimeout     int    `gcfg:"detach-timeout"`
+    DefaultVolumeType string `gcfg:"default-volume-type"`
+    MetadataPrefix    string `gcfg:"metadata-prefix"`
+}
+```
+
+#### 6.5.3 ConfigMap Manifest
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cinder-nfs-config
+  namespace: kube-system
+data:
+  driver.conf: |
+    [ShadowVM]
+    flavor-ref = m1.small
+    network-id = 8e3f3c4a-1234-5678-abcd-9876543210ab
+    availability-zone = nova
+    name-prefix = shadow
+    create-timeout = 300
+    stop-timeout = 120
+
+    [NFS]
+    mount-options = rw,hard,intr,rsize=1048576,wsize=1048576
+    mount-base-path = /var/lib/cinder-nfs
+    nfs-version = 4.1
+
+    [Volume]
+    create-timeout = 300
+    detach-timeout = 120
+    metadata-prefix = csi
+```
+
+#### 6.5.4 Secret Manifest (OpenStack Credentials)
+
+Reuses the same format and pattern as the existing Cinder CSI driver's [`csi-secret-cinderplugin.yaml`](../../../manifests/cinder-csi-plugin/csi-secret-cinderplugin.yaml):
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cinder-nfs-cloud-config
+  namespace: kube-system
+data:
+  # Base64-encoded cloud.conf (same INI format as existing Cinder CSI)
+  #
+  # [Global]
+  # auth-url = https://<keystone_ip>/identity/v3
+  # username = cinder-nfs-service
+  # password = <service_password>
+  # domain-name = default
+  # tenant-id = cc34b11ff95d42309081d0bd46c0ff89
+  # region = RegionOne
+  cloud.conf: W0dsb2JhbF0KYXV0aC11cmwgPSBodHRwczovLzxrZXlzdG9uZV9pcD4vaWRlbnRpdHkvdjMKdXNlcm5hbWUgPSBjaW5kZXItbmZzLXNlcnZpY2UKcGFzc3dvcmQgPSA8c2VydmljZV9wYXNzd29yZD4KZG9tYWluLW5hbWUgPSBkZWZhdWx0CnRlbmFudC1pZCA9IGNjMzRiMTFmZjk1ZDQyMzA5MDgxZDBiZDQ2YzBmZjg5CnJlZ2lvbiA9IFJlZ2lvbk9uZQo=
+```
+
+#### 6.5.5 Controller Deployment — Volume Mounts
+
+The Controller Deployment mounts **both** the Secret (credentials) and ConfigMap (driver config), following the same mount pattern as the existing [`cinder-csi-controllerplugin.yaml`](../../../manifests/cinder-csi-plugin/cinder-csi-controllerplugin.yaml):
+
+```yaml
+# Excerpt from cinder-nfs-csi-controllerplugin.yaml
+containers:
+  - name: cinder-nfs-csi-plugin
+    image: registry.k8s.io/provider-os/cinder-nfs-csi-plugin:v1.0.0
+    args:
+      - /bin/cinder-nfs-csi-plugin
+      - "--endpoint=$(CSI_ENDPOINT)"
+      - "--cloud-config=$(CLOUD_CONFIG)"         # OpenStack credentials (Secret)
+      - "--driver-config=$(DRIVER_CONFIG)"        # Shadow VM + NFS config (ConfigMap)
+      - "--v=1"
+    env:
+      - name: CSI_ENDPOINT
+        value: unix://csi/csi.sock
+      - name: CLOUD_CONFIG
+        value: /etc/cloud-config/cloud.conf       # from Secret
+      - name: DRIVER_CONFIG
+        value: /etc/cinder-nfs/driver.conf         # from ConfigMap
+    volumeMounts:
+      - name: socket-dir
+        mountPath: /csi
+      - name: cloud-config                         # Secret: OpenStack credentials
+        mountPath: /etc/cloud-config
+        readOnly: true
+      - name: driver-config                        # ConfigMap: Shadow VM + NFS config
+        mountPath: /etc/cinder-nfs
+        readOnly: true
+volumes:
+  - name: socket-dir
+    emptyDir: {}
+  - name: cloud-config                             # Same pattern as existing Cinder CSI
+    secret:
+      secretName: cinder-nfs-cloud-config
+  - name: driver-config                            # New: ConfigMap for operational config
+    configMap:
+      name: cinder-nfs-config
+```
+
+#### 6.5.6 Node DaemonSet — Volume Mounts
+
+The Node DaemonSet only needs the ConfigMap (for NFS mount options) — it does not call OpenStack APIs at all. However, mounting the Secret as well gives the option for `Probe` RPC to validate Keystone connectivity:
+
+```yaml
+# Excerpt from cinder-nfs-csi-nodeplugin.yaml
+containers:
+  - name: cinder-nfs-csi-plugin
+    securityContext:
+      privileged: true
+      capabilities:
+        add: ["SYS_ADMIN"]
+    args:
+      - /bin/cinder-nfs-csi-plugin
+      - "--endpoint=$(CSI_ENDPOINT)"
+      - "--provide-controller-service=false"
+      - "--driver-config=$(DRIVER_CONFIG)"
+      - "--v=1"
+    env:
+      - name: CSI_ENDPOINT
+        value: unix://csi/csi.sock
+      - name: DRIVER_CONFIG
+        value: /etc/cinder-nfs/driver.conf
+    volumeMounts:
+      - name: socket-dir
+        mountPath: /csi
+      - name: kubelet-dir
+        mountPath: /var/lib/kubelet
+        mountPropagation: "Bidirectional"
+      - name: driver-config
+        mountPath: /etc/cinder-nfs
+        readOnly: true
+volumes:
+  - name: driver-config
+    configMap:
+      name: cinder-nfs-config
+```
+
+#### 6.5.7 Configuration Validation and Defaults
+
+The driver validates configuration at startup and applies defaults for optional fields:
+
+| Field | Required | Default | Validation |
+|-------|----------|---------|------------|
+| `ShadowVM.flavor-ref` | **Yes** | — | Must resolve to a valid Nova flavor (UUID or name) |
+| `ShadowVM.network-id` | **Yes** | — | Must be a valid Neutron network UUID |
+| `ShadowVM.availability-zone` | No | `""` (Nova default) | If set, must match an existing Nova AZ |
+| `ShadowVM.name-prefix` | No | `shadow` | Non-empty string, safe for Nova server names |
+| `ShadowVM.create-timeout` | No | `300` | > 0 |
+| `ShadowVM.stop-timeout` | No | `120` | > 0 |
+| `ShadowVM.security-groups` | No | `""` | Comma-separated UUIDs; each must exist in Neutron |
+| `ShadowVM.image-ref` | No | `""` | If set, must be a valid Glance image UUID |
+| `NFS.mount-options` | No | `rw,hard,intr` | Valid NFS mount option string |
+| `NFS.mount-base-path` | No | `/var/lib/cinder-nfs` | Absolute path, writable by Node plugin |
+| `NFS.nfs-version` | No | `4.1` | `3`, `4`, `4.0`, `4.1`, or `4.2` |
+| `Volume.create-timeout` | No | `300` | > 0 |
+| `Volume.detach-timeout` | No | `120` | > 0 |
+| `Volume.default-volume-type` | No | `""` | If set, must be a valid Cinder volume type |
+| `Volume.metadata-prefix` | No | `csi` | Non-empty string |
+
+**Startup validation flow:**
+
+```
+  Driver startup (main.go):
+    1. Parse --cloud-config → load cloud.conf from Secret
+       → Authenticate to Keystone (same as existing Cinder CSI)
+
+    2. Parse --driver-config → load driver.conf from ConfigMap
+       → Validate [ShadowVM]:
+           flavor-ref: GET /v2/flavors/{id} or /v2/flavors?name=...
+           network-id: GET /v2.0/networks/{id}
+       → Apply defaults for optional fields
+       → Log effective configuration
+
+    3. Initialize Controller + Node servers with validated config
+```
+
+#### 6.5.8 StorageClass Parameter Overrides
+
+Several ConfigMap defaults can be **overridden per-PVC** via StorageClass parameters. This allows different migration workloads to use different Shadow VM configurations without modifying the global ConfigMap:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cinder-nfs-migration-az2
+provisioner: cinder-nfs.csi.openstack.org
+parameters:
+  type: netapp-nfs                          # Cinder volume type (overrides Volume.default-volume-type)
+  availability: az-2                        # Volume AZ (overrides ShadowVM.availability-zone)
+
+  # Shadow VM overrides (optional — falls back to ConfigMap defaults)
+  shadow-vm-flavor-ref: m1.tiny             # Override ShadowVM.flavor-ref
+  shadow-vm-network-id: <other-net-uuid>    # Override ShadowVM.network-id
+
+  # NFS overrides (optional)
+  nfs-mount-options: "rw,hard,intr,nfsvers=3"  # Override NFS.mount-options
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+```
+
+**Parameter resolution order** (highest priority first):
+
+```
+  1. StorageClass parameters (per-PVC override)
+  2. ConfigMap driver.conf (cluster-wide defaults)
+  3. Hardcoded defaults in driver code (safety net)
+```
+
+This mirrors how the existing Cinder CSI driver handles the `type` and `availability` StorageClass parameters in [`controllerserver.go`](../../../pkg/csi/cinder/controllerserver.go) — the `CreateVolume` RPC reads `req.Parameters["type"]` and `req.Parameters["availability"]` from the StorageClass, falling back to cluster-level config.
+
+#### 6.5.9 Configuration Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Configuration Sources for NFS-Cinder CSI Driver                        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  K8S Secret                 K8S ConfigMap              K8S StorageClass
+  ════════                   ═════════════              ════════════════
+  cinder-nfs-cloud-config    cinder-nfs-config          cinder-nfs-migration
+  ┌───────────────────┐      ┌───────────────────┐      ┌───────────────────┐
+  │ cloud.conf        │      │ driver.conf       │      │ parameters:       │
+  │                   │      │                   │      │   type: netapp-nfs│
+  │ [Global]          │      │ [ShadowVM]        │      │   availability: ..│
+  │ auth-url = ...    │      │ flavor-ref = ...  │      │   shadow-vm-... = │
+  │ username = ...    │      │ network-id = ...  │      │   nfs-mount-... = │
+  │ password = ...    │      │                   │      └─────────┬─────────┘
+  │ tenant-id = ...   │      │ [NFS]             │                │
+  │ region = ...      │      │ mount-options = ..│                │ Per-PVC
+  └─────────┬─────────┘      │                   │                │ overrides
+            │ Mounted at     │ [Volume]          │                │
+            │ /etc/cloud-    │ create-timeout = .│                │
+            │   config/      └─────────┬─────────┘                │
+            │                          │ Mounted at               │
+            │                          │ /etc/cinder-nfs/          │
+            ▼                          ▼                          ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  CSI Controller Plugin                                               │
+  │                                                                      │
+  │  Startup:                                                            │
+  │    cloud.conf → Keystone auth → compute + blockstorage clients       │
+  │    driver.conf → ShadowVMOpts + NFSOpts + VolumeOpts                 │
+  │                                                                      │
+  │  CreateVolume(req):                                                  │
+  │    flavor  = req.Parameters["shadow-vm-flavor-ref"]                  │
+  │              ?? config.ShadowVM.FlavorRef                            │
+  │    network = req.Parameters["shadow-vm-network-id"]                  │
+  │              ?? config.ShadowVM.NetworkID                            │
+  │    volType = req.Parameters["type"]                                  │
+  │              ?? config.Volume.DefaultVolumeType                      │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
