@@ -55,8 +55,12 @@
   - [8. Build and Deployment](#8-build-and-deployment)
     - [8.1 Makefile Changes](#81-makefile-changes)
     - [8.2 Dockerfile Stage](#82-dockerfile-stage)
+      - [8.2.1 Development Phase — Debian-Based Image (Current)](#821-development-phase--debian-based-image-current)
+      - [8.2.2 Production Phase — 3-Step Distroless Build (TODO)](#822-production-phase--3-step-distroless-build-todo)
     - [8.3 Kubernetes Manifests](#83-kubernetes-manifests)
     - [8.4 Helm Chart](#84-helm-chart)
+    - [8.5 Metrics](#85-metrics)
+    - [8.6 Release Procedure Alignment](#86-release-procedure-alignment)
   - [9. Development Phases](#9-development-phases)
     - [Phase 1 — Scaffold and Interface](#phase-1--scaffold-and-interface)
     - [Phase 2 — Controller Service (Core)](#phase-2--controller-service-core)
@@ -71,7 +75,7 @@
 ## 1. Summary
 
 This document provides a detailed implementation design for the NFS-backed Cinder CSI
-driver (`cinder-nfs.csi.openstack.org`), based on the analysis of the existing Cinder CSI
+driver (`cinder-nfs.csi.windriver.com`), based on the analysis of the existing Cinder CSI
 driver codebase in `cloud-provider-openstack`.
 
 ### Conclusion
@@ -83,7 +87,7 @@ The rationale is summarized below:
 
 | Dimension              | Existing Cinder CSI                        | NFS-Cinder Requirement                            | Compatible? |
 |------------------------|--------------------------------------------|----------------------------------------------------|:-----------:|
-| Driver name            | `cinder.csi.openstack.org` (hardcoded)     | `cinder-nfs.csi.openstack.org`                     | **No**      |
+| Driver name            | `cinder.csi.openstack.org` (hardcoded)     | `cinder-nfs.csi.windriver.com`                     | **No**      |
 | Controller Publish     | Nova `AttachVolume` (block device)          | Query `connection_info` for NFS export path         | **No**      |
 | Controller Unpublish   | Nova `DetachVolume`                         | No-op (NFS requires no server-side detach)          | **No**      |
 | Create Volume          | Cinder POST only                           | Cinder POST + Shadow VM create + attach + stop      | **No**      |
@@ -142,7 +146,7 @@ Key observations:
    ```go
    const driverName = "cinder.csi.openstack.org"
    ```
-   The NFS driver requires a different name (`cinder-nfs.csi.openstack.org`) to be
+   The NFS driver requires a different name (`cinder-nfs.csi.windriver.com`) to be
    registered as a separate CSI driver in Kubernetes. The name is used in `CSIDriver`
    resource, socket path, and volume handle resolution.
 
@@ -447,7 +451,7 @@ driver in this monorepo:
 |-----------------------|--------------------------------------|----------------------------------------|----------------------------------------|
 | Package               | `pkg/csi/cinder/`                   | `pkg/csi/manila/`                      | `pkg/csi/cinder-nfs/`                  |
 | Binary                | `cmd/cinder-csi-plugin/`            | `cmd/manila-csi-plugin/`               | `cmd/cinder-nfs-csi-plugin/`           |
-| Driver name           | `cinder.csi.openstack.org`          | `manila.csi.openstack.org`             | `cinder-nfs.csi.openstack.org`         |
+| Driver name           | `cinder.csi.openstack.org`          | `manila.csi.openstack.org`             | `cinder-nfs.csi.windriver.com`         |
 | OpenStack service     | Cinder + Nova                        | Manila                                 | Cinder + Nova                          |
 | Volume type           | Block (iSCSI/FC)                     | Shared filesystem (NFS/CephFS)         | NFS-backed Cinder (via Shadow VM)      |
 | Own gRPC server       | Yes (`server.go`)                    | Yes (in `driver.go`)                   | Yes (copy from cinder `server.go`)     |
@@ -514,16 +518,22 @@ charts/cinder-nfs-csi-plugin/
 tests/
 ├── sanity/cinder-nfs/            # CSI sanity tests
 └── e2e/cinder-nfs/               # E2E tests
+
+tools/                                  # (production phase — see Section 8.2.2 TODO)
+├── csi-nfs-deps.sh               # NFS client dependency extractor (Debian → /dest)
+└── csi-nfs-deps-check.sh         # Validates NFS binaries in distroless image
 ```
 
 ### 5.2 Files to Modify in Existing Tree
 
 | File           | Change                                                          |
 |----------------|-----------------------------------------------------------------|
-| `Makefile`     | Add `cinder-nfs-csi-plugin` to `IMAGE_NAMES` and `BUILD_CMDS`  |
-| `Dockerfile`   | Add `cinder-nfs-csi-plugin` build stage                        |
+| `Makefile`     | Add `cinder-nfs-csi-plugin` to `IMAGE_NAMES` and `BUILD_CMDS`; add `test-cinder-nfs-csi-sanity` target; add `gox` cross-build entry |
+| `Dockerfile`   | Add `cinder-nfs-csi-plugin` Debian-based stage (dev); migrate to 3-step distroless for production (see §8.2.2 TODO) |
 | `go.mod`       | No change needed (same module)                                  |
-| `OWNERS`       | Add reviewers for `pkg/csi/cinder-nfs/`                        |
+| `OWNERS`       | Add reviewers/approvers for `pkg/csi/cinder-nfs/` (the review process requires 2× `/lgtm` from reviewers + `/approve` from OWNERS approver) |
+| `tools/csi-nfs-deps.sh` | New file (production phase) — extracts NFS client binaries + shared libs into `/dest` (follows `tools/csi-deps.sh` pattern) |
+| `tools/csi-nfs-deps-check.sh` | New file (production phase) — validates NFS utilities in distroless image (follows `tools/csi-deps-check.sh` pattern) |
 
 ---
 
@@ -707,7 +717,7 @@ cinder.csi.openstack.org/shadow-vm-id = <server-uuid>
 
 | RPC                      | Implementation                                        |
 |--------------------------|-------------------------------------------------------|
-| `GetPluginInfo`          | Return `cinder-nfs.csi.openstack.org` + version       |
+| `GetPluginInfo`          | Return `cinder-nfs.csi.windriver.com` + version       |
 | `GetPluginCapabilities`  | `CONTROLLER_SERVICE`, `VOLUME_EXPANSION` (offline)     |
 | `Probe`                  | Return success (basic health check)                    |
 
@@ -895,6 +905,28 @@ BUILD_CMDS  ?= openstack-cloud-controller-manager \
                client-keystone-auth
 ```
 
+Note: `client-keystone-auth` is in `BUILD_CMDS` but not `IMAGE_NAMES` (it is a
+CLI tool, not a container image). `cinder-nfs-csi-plugin` is both a build target
+and a container image, so it appears in both lists.
+
+Add a **sanity test target** following the existing pattern (`test-cinder-csi-sanity`,
+`test-manila-csi-sanity`):
+
+```makefile
+test-cinder-nfs-csi-sanity: work
+	go test $(GIT_HOST)/$(BASE_DIR)/tests/sanity/cinder-nfs
+```
+
+Add a **cross-build entry** in the `build-cross` target (each binary has an explicit
+`gox` line):
+
+```makefile
+CGO_ENABLED=0 gox -parallel=$(GOX_PARALLEL) \
+  -output="_dist/{{.OS}}-{{.Arch}}/{{.Dir}}" -osarch='$(TARGETS)' \
+  $(GOFLAGS) $(if $(TAGS),-tags '$(TAGS)',) -ldflags '$(GOX_LDFLAGS)' \
+  $(GIT_HOST)/$(BASE_DIR)/cmd/cinder-nfs-csi-plugin/
+```
+
 Build command (automatic via existing pattern):
 ```bash
 make cinder-nfs-csi-plugin
@@ -902,15 +934,42 @@ make cinder-nfs-csi-plugin
 make build-local-image-cinder-nfs-csi-plugin
 ```
 
+**Linting:** The project uses `golangci-lint` via `make check`:
+```bash
+make check   # runs golangci-lint on all packages including cinder-nfs
+```
+All new code must pass linting before PR review. The dev guide requires CI checks
+to pass before review.
+
+**Unit tests:** The project convention uses the `-tags=unit` build tag:
+```bash
+make unit    # runs go test -tags=unit on all packages
+```
+Unit test files should use `//go:build unit` build constraints where appropriate,
+following the existing pattern in `pkg/csi/cinder/`.
+
 ### 8.2 Dockerfile Stage
 
-```dockerfile
-## cinder-nfs-csi-plugin
-##
-FROM ${DISTROLESS_IMAGE} AS cinder-nfs-csi-plugin
+The existing `cinder-csi-plugin` uses a **3-step build** in the Dockerfile: (1) install
+and copy filesystem utilities from a Debian image via `tools/csi-deps.sh`, (2) validate
+them in a check stage, (3) build the final distroless image. This minimizes image size
+and attack surface for production.
 
-# NFS client utilities are needed for NFS mount on node
-# (In practice, nfs-common must be available on the host or in a utility image)
+For the NFS-Cinder driver, we take a **two-phase approach**:
+
+#### 8.2.1 Development Phase — Debian-Based Image (Current)
+
+During development, the image uses a **simple Debian base** with NFS tools installed
+directly via `apt`. This prioritizes fast iteration and easy debugging over image size:
+
+```dockerfile
+##
+## cinder-nfs-csi-plugin (development)
+##
+FROM ${DEBIAN_IMAGE} AS cinder-nfs-csi-plugin
+
+RUN clean-install nfs-common mount util-linux
+
 COPY --from=builder /build/cinder-nfs-csi-plugin /bin/cinder-nfs-csi-plugin
 COPY --from=certs /etc/ssl/certs /etc/ssl/certs
 
@@ -925,9 +984,57 @@ LABEL name="cinder-nfs-csi-plugin" \
 CMD ["/bin/cinder-nfs-csi-plugin"]
 ```
 
-> **Note:** The node DaemonSet requires NFS client utilities (`nfs-common`/`nfs-utils`)
-> available on the host. The CSI node plugin binary itself doesn't bundle NFS tools; it
-> invokes host-level `mount` via `nsenter` or host path mount.
+This gives the container `mount.nfs`, `mount.nfs4`, `umount.nfs`, `showmount`,
+`nfsstat`, `rpcbind`, `findmnt`, and a full shell — useful for exec-ing into the
+container to troubleshoot NFS mount issues during development.
+
+#### 8.2.2 Production Phase — 3-Step Distroless Build (TODO)
+
+> **TODO:** Before GA release, migrate to the 3-step distroless build pattern used by
+> `cinder-csi-plugin` to minimize image size and attack surface. This involves:
+>
+> 1. Create `tools/csi-nfs-deps.sh` — extract only the NFS client binaries (`mount.nfs`,
+>    `mount.nfs4`, `umount.nfs`, `findmnt`, `mount`, `umount`) and their shared library
+>    dependencies into a `/dest` folder, following the `tools/csi-deps.sh` pattern.
+> 2. Create `tools/csi-nfs-deps-check.sh` — validate the extracted binaries work in a
+>    distroless context.
+> 3. Switch the Dockerfile to the 3-step pattern:
+>    - Step 1: `FROM ${DEBIAN_IMAGE}` — install `nfs-common` + run `csi-nfs-deps.sh`
+>    - Step 2: `FROM ${DISTROLESS_IMAGE}` — copy `/dest` + run `csi-nfs-deps-check.sh`
+>    - Step 3: `FROM ${DISTROLESS_IMAGE}` — final image with checked deps + binary
+>
+> The production image should NOT include a shell, package manager, or any tools beyond
+> the minimum NFS mount utilities. Reference implementation:
+>
+> ```dockerfile
+> FROM ${DEBIAN_IMAGE} AS cinder-nfs-csi-plugin-utils
+> RUN clean-install bash rsync mount nfs-common util-linux
+> COPY tools/csi-nfs-deps.sh /tools/csi-nfs-deps.sh
+> RUN /tools/csi-nfs-deps.sh
+>
+> FROM ${DISTROLESS_IMAGE} AS cinder-nfs-csi-plugin-utils-check
+> COPY --from=cinder-nfs-csi-plugin-utils /dest /
+> COPY --from=cinder-nfs-csi-plugin-utils /bin/sh /bin/sh
+> COPY tools/csi-nfs-deps-check.sh /tools/csi-nfs-deps-check.sh
+> SHELL ["/bin/sh"]
+> RUN /tools/csi-nfs-deps-check.sh
+>
+> FROM ${DISTROLESS_IMAGE} AS cinder-nfs-csi-plugin
+> COPY --from=cinder-nfs-csi-plugin-utils-check /tools/csi-nfs-deps-check.sh /bin/csi-nfs-deps-check.sh
+> COPY --from=cinder-nfs-csi-plugin-utils /dest /
+> COPY --from=builder /build/cinder-nfs-csi-plugin /bin/cinder-nfs-csi-plugin
+> COPY --from=certs /etc/ssl/certs /etc/ssl/certs
+> ```
+
+> **Design rationale:** Bundling NFS tools in the container image (rather than relying on
+> host-installed `nfs-common`/`nfs-utils`) ensures consistent behavior across WRCP/WRC
+> worker hosts regardless of host OS version or package availability. This follows the
+> same approach as `cinder-csi-plugin`, which bundles `mount`, `blkid`, `mkfs.*`, etc.
+> The NFS dependency set is much smaller (no filesystem format tools needed), so the
+> resulting image remains lightweight.
+>
+> The node DaemonSet still requires `privileged: true` and `mountPropagation: Bidirectional`
+> to perform NFS mounts that are visible to kubelet and pods on the host.
 
 ### 8.3 Kubernetes Manifests
 
@@ -944,17 +1051,18 @@ The manifest structure mirrors `manifests/cinder-csi-plugin/` with NFS-specific 
 **Node DaemonSet** (`cinder-nfs-csi-nodeplugin.yaml`):
 - Image: `registry.k8s.io/provider-os/cinder-nfs-csi-plugin:latest`
 - Sidecars: `node-driver-registrar`, `livenessprobe`
-- Socket: `/var/lib/kubelet/plugins/cinder-nfs.csi.openstack.org/csi.sock`
+- Socket: `/var/lib/kubelet/plugins/cinder-nfs.csi.windriver.com/csi.sock`
 - Host mount: `/var/lib/kubelet/pods` (for NFS mount propagation)
-- NO `--privileged` needed (NFS mount doesn't require SYS_ADMIN like block devices)
-  - However, `mountPropagation: Bidirectional` is required
+- `privileged: true` with `mountPropagation: Bidirectional` — required for NFS mounts
+  to be visible to kubelet and pods (NFS tools are bundled in the container image,
+  matching the `cinder-csi-plugin` convention)
 
 **CSIDriver resource** (`csi-cinder-nfs-driver.yaml`):
 ```yaml
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
-  name: cinder-nfs.csi.openstack.org
+  name: cinder-nfs.csi.windriver.com
 spec:
   attachRequired: true          # ControllerPublishVolume needed for connection_info
   podInfoOnMount: false
@@ -985,6 +1093,63 @@ csi:
       mountOptions: "nfsvers=4.1,rsize=1048576,wsize=1048576"
       defaultFsType: "nfs4"
 ```
+
+### 8.5 Metrics
+
+The NFS-Cinder CSI driver should integrate with the existing `pkg/metrics/` framework
+to expose Prometheus-compatible metrics. The project's metrics convention (see
+[docs/metrics.md](../../metrics.md)) uses three metric types per operation:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cinder_nfs_csi_operation_duration_seconds` | Histogram | `operation` | Latency of CSI RPC operations |
+| `cinder_nfs_csi_operations_total` | Counter | `operation` | Total number of CSI RPC calls |
+| `cinder_nfs_csi_operation_errors_total` | Counter | `operation` | Total number of failed CSI RPC calls |
+| `cinder_nfs_csi_openstack_api_request_duration_seconds` | Histogram | `request` | Latency of OpenStack API calls (Cinder, Nova) |
+| `cinder_nfs_csi_openstack_api_requests_total` | Counter | `request` | Total OpenStack API calls |
+| `cinder_nfs_csi_openstack_api_request_errors_total` | Counter | `request` | Total failed OpenStack API calls |
+
+Possible `operation` values: `create_volume`, `delete_volume`, `controller_publish_volume`,
+`controller_unpublish_volume`, `node_stage_volume`, `node_unstage_volume`,
+`node_publish_volume`, `node_unpublish_volume`, `shadow_vm_create`, `shadow_vm_stop`,
+`shadow_vm_delete`.
+
+Possible `request` values: `volume_create`, `volume_get`, `volume_delete`,
+`volume_extend`, `volume_attachment_list`, `volume_attachment_get`,
+`server_create`, `server_get`, `server_stop`, `server_delete`.
+
+The controller binary should expose metrics on a configurable HTTPS port (matching the
+OCCM pattern of `--secure-port` with `--authorization-always-allow-paths="/metrics"`).
+
+### 8.6 Release Procedure Alignment
+
+The NFS-Cinder CSI driver must integrate with the existing release process documented
+in [docs/release-procedure.md](../../release-procedure.md):
+
+1. **Version bumping:** `hack/bump-release.sh` performs string replacement across
+   `docs/manifests/tests/examples` directories. New manifests and charts under
+   `manifests/cinder-nfs-csi-plugin/` and `charts/cinder-nfs-csi-plugin/` must use
+   consistent version strings (e.g., `v1.XX.Y`) that match the patterns the script
+   expects.
+
+2. **Helm chart bumping:** `hack/bump-charts.sh` updates chart versions. The new chart
+   `charts/cinder-nfs-csi-plugin/` must follow the version convention
+   (`appVersion: 1.XX.Y`, `version: 2.XX.Y`).
+
+3. **Image promotion:** After tagging a release, staging images are built at
+   `gcr.io/k8s-staging-provider-os/cinder-nfs-csi-plugin`. The image digest must be
+   added to
+   [`images.yaml`](https://github.com/kubernetes/k8s.io/blob/main/registry.k8s.io/images/k8s-staging-provider-os/images.yaml)
+   using `hack/release-image-digests.sh` and verified with `hack/verify-image-digests.sh`.
+
+4. **CI jobs:** A new CI job for the NFS-Cinder CSI driver must be added to
+   [`test-infra`](https://github.com/kubernetes/test-infra/tree/master/config/jobs/kubernetes/cloud-provider-openstack)
+   for the release branch.
+
+5. **Sidecar container versions:** Sidecar images (`external-provisioner`,
+   `node-driver-registrar`, `livenessprobe`) in both manifests and Helm charts should
+   be bumped in sync with Kubernetes releases, paying attention to major version bumps
+   that may require manifest changes.
 
 ---
 
@@ -1048,11 +1213,18 @@ csi:
 |------|--------------------------------------------------|-----------------------------------------------|
 | 4.1  | Create Kubernetes manifests                      | `manifests/cinder-nfs-csi-plugin/`            |
 | 4.2  | Create Helm chart                                | `charts/cinder-nfs-csi-plugin/`               |
-| 4.3  | CSI sanity tests                                 | `tests/sanity/cinder-nfs/`                    |
-| 4.4  | E2E test: provision → mount → read/write → delete| `tests/e2e/cinder-nfs/`                       |
-| 4.5  | E2E test: multi-node mount (RWX)                 |                                               |
-| 4.6  | E2E test: Shadow VM failure recovery             |                                               |
-| 4.7  | Documentation                                    | `docs/cinder-csi-plugin/migration/`           |
+| 4.3  | CSI sanity tests (`make test-cinder-nfs-csi-sanity`) | `tests/sanity/cinder-nfs/`                |
+| 4.4  | E2E CI script + Ansible playbook                 | `tests/ci-csi-cinder-nfs-e2e.sh`, `tests/playbooks/test-csi-cinder-nfs-e2e.yaml` |
+| 4.5  | E2E test: provision → mount → read/write → delete| (within playbook)                             |
+| 4.6  | E2E test: multi-node mount (RWX)                 |                                               |
+| 4.7  | E2E test: Shadow VM failure recovery             |                                               |
+| 4.8  | Documentation                                    | `docs/cinder-csi-plugin/migration/`           |
+
+**E2E Testing Convention:** The project's E2E tests use **Ansible playbooks** orchestrated
+by bash scripts (e.g., `tests/ci-csi-cinder-e2e.sh` → `tests/playbooks/test-csi-cinder-e2e.yaml`).
+The CI provisions a VM (Ubuntu 24.04, 4 vCPUs, 16 GB RAM recommended), installs DevStack
++ k3s, deploys the CSI driver, and runs the tests. The NFS-Cinder E2E tests should follow
+this same pattern with `tests/ci-csi-cinder-nfs-e2e.sh` and a corresponding playbook.
 
 **Deliverable:** Production-ready NFS-Cinder CSI driver with tests and docs.
 
@@ -1077,7 +1249,7 @@ csi:
 ```
 Existing Cinder CSI                     NFS-Cinder CSI
 ─────────────────                       ──────────────
-cinder.csi.openstack.org                cinder-nfs.csi.openstack.org
+cinder.csi.openstack.org                cinder-nfs.csi.windriver.com
 Block device (iSCSI/FC)                 NFS mount
 Nova AttachVolume → /dev/vdb            Shadow VM → connection_info → NFS export
 FormatAndMount(ext4/xfs)                mount -t nfs
@@ -1107,5 +1279,7 @@ K8s node = volume consumer              K8s node = NFS client, Shadow VM = attac
 | `pkg/util/metadata/`                   | ✅     | Import directly                                        |
 | `pkg/util/mount/`                      | ✅     | Import directly — NFS mount via `Mounter()`            |
 | `pkg/util/errors/`                     | ✅     | Import directly                                        |
+| `tools/csi-deps.sh`                   | 📝     | Adapt as `tools/csi-nfs-deps.sh` — NFS utils only (production phase, see §8.2.2) |
+| `tools/csi-deps-check.sh`             | 📝     | Adapt as `tools/csi-nfs-deps-check.sh` — validate NFS binaries (production phase, see §8.2.2) |
 
 Legend: ✅ Import | 📋 Copy | 📝 Rewrite/Adapt | 🆕 New Implementation
