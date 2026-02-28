@@ -28,8 +28,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
-	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder-iscsi/openstack"
+	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
 )
 
 // ── Test Helpers ─────────────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ func TestCreateVolume_Success(t *testing.T) {
 	}).Return(nil)
 
 	req := &csi.CreateVolumeRequest{
-		Name: "test-vol",
+		Name:               "test-vol",
 		VolumeCapabilities: []*csi.VolumeCapability{blockVolumeCapability()},
 		CapacityRange: &csi.CapacityRange{
 			RequiredBytes: 10 * 1024 * 1024 * 1024,
@@ -144,7 +144,7 @@ func TestCreateVolume_Idempotent(t *testing.T) {
 	}, nil)
 
 	req := &csi.CreateVolumeRequest{
-		Name: "test-vol",
+		Name:               "test-vol",
 		VolumeCapabilities: []*csi.VolumeCapability{blockVolumeCapability()},
 		CapacityRange: &csi.CapacityRange{
 			RequiredBytes: 10 * 1024 * 1024 * 1024,
@@ -215,7 +215,7 @@ func TestCreateVolume_ExistingVolumeDifferentSize(t *testing.T) {
 	}, nil)
 
 	req := &csi.CreateVolumeRequest{
-		Name: "test-vol",
+		Name:               "test-vol",
 		VolumeCapabilities: []*csi.VolumeCapability{blockVolumeCapability()},
 		CapacityRange: &csi.CapacityRange{
 			RequiredBytes: 10 * 1024 * 1024 * 1024,
@@ -648,5 +648,3 @@ func TestValidateISCSIConnectionInfo_MissingPortal(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "target_portal")
 }
-
-

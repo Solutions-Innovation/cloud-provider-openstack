@@ -30,7 +30,6 @@ import (
 	"net/http"
 
 	"github.com/gophercloud/gophercloud/v2"
-	gos "github.com/gophercloud/gophercloud/v2/openstack"
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/attachments"
 	"k8s.io/cloud-provider-openstack/pkg/metrics"
 	"k8s.io/klog/v2"
@@ -45,12 +44,10 @@ import (
 // Cinder API: POST /v3/attachments  { volume_uuid: volumeID }
 // Requires microversion >= 3.27.
 func (os *OpenStackISCSI) CreateAttachment(ctx context.Context, volumeID string) (string, error) {
-	// Use a thread-safe copy with the required microversion
-	blockstorageClient, err := gos.NewBlockStorageV3(os.blockstorage.ProviderClient, os.epOpts)
+	blockstorageClient, err := os.blockStorageClient(MvSelfServiceAttach)
 	if err != nil {
-		return "", fmt.Errorf("failed to create blockstorage client: %w", err)
+		return "", err
 	}
-	blockstorageClient.Microversion = "3.27"
 
 	opts := attachments.CreateOpts{
 		VolumeUUID: volumeID,
@@ -78,11 +75,10 @@ func (os *OpenStackISCSI) CreateAttachment(ctx context.Context, volumeID string)
 func (os *OpenStackISCSI) UpdateAttachmentConnector(ctx context.Context, attachmentID string,
 	connector *AttachmentConnector) (*ISCSIConnectionInfo, error) {
 
-	blockstorageClient, err := gos.NewBlockStorageV3(os.blockstorage.ProviderClient, os.epOpts)
+	blockstorageClient, err := os.blockStorageClient(MvSelfServiceAttach)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create blockstorage client: %w", err)
+		return nil, err
 	}
-	blockstorageClient.Microversion = "3.27"
 
 	connectorMap := map[string]any{
 		"initiator": connector.Initiator,
@@ -125,11 +121,10 @@ func (os *OpenStackISCSI) CompleteAttachment(ctx context.Context, attachmentID s
 		return nil
 	}
 
-	blockstorageClient, err := gos.NewBlockStorageV3(os.blockstorage.ProviderClient, os.epOpts)
+	blockstorageClient, err := os.blockStorageClient(MvAttachComplete)
 	if err != nil {
-		return fmt.Errorf("failed to create blockstorage client: %w", err)
+		return err
 	}
-	blockstorageClient.Microversion = "3.44"
 
 	mc := metrics.NewMetricContext("attachment", "complete")
 	err = attachments.Complete(ctx, blockstorageClient, attachmentID).ExtractErr()
@@ -145,11 +140,10 @@ func (os *OpenStackISCSI) CompleteAttachment(ctx context.Context, attachmentID s
 //
 // Cinder API: GET /v3/attachments/{id}
 func (os *OpenStackISCSI) GetAttachment(ctx context.Context, attachmentID string) (*Attachment, error) {
-	blockstorageClient, err := gos.NewBlockStorageV3(os.blockstorage.ProviderClient, os.epOpts)
+	blockstorageClient, err := os.blockStorageClient(MvSelfServiceAttach)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create blockstorage client: %w", err)
+		return nil, err
 	}
-	blockstorageClient.Microversion = "3.27"
 
 	mc := metrics.NewMetricContext("attachment", "get")
 	result, err := attachments.Get(ctx, blockstorageClient, attachmentID).Extract()
@@ -187,11 +181,10 @@ func (os *OpenStackISCSI) GetAttachment(ctx context.Context, attachmentID string
 //
 // Cinder API: DELETE /v3/attachments/{id}
 func (os *OpenStackISCSI) DeleteAttachment(ctx context.Context, attachmentID string) error {
-	blockstorageClient, err := gos.NewBlockStorageV3(os.blockstorage.ProviderClient, os.epOpts)
+	blockstorageClient, err := os.blockStorageClient(MvSelfServiceAttach)
 	if err != nil {
-		return fmt.Errorf("failed to create blockstorage client: %w", err)
+		return err
 	}
-	blockstorageClient.Microversion = "3.27"
 
 	mc := metrics.NewMetricContext("attachment", "delete")
 	err = attachments.Delete(ctx, blockstorageClient, attachmentID).ExtractErr()
@@ -213,45 +206,37 @@ func (os *OpenStackISCSI) DeleteAttachment(ctx context.Context, attachmentID str
 // DiscoverCinderCapabilities probes the Cinder API version endpoint to
 // determine supported microversions. This is called at driver startup.
 func (os *OpenStackISCSI) DiscoverCinderCapabilities(ctx context.Context) (*CinderCapabilities, error) {
-	blockstorageClient, err := gos.NewBlockStorageV3(os.blockstorage.ProviderClient, os.epOpts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create blockstorage client: %w", err)
-	}
-
-	// The Cinder API returns the max microversion in the response headers
-	// when making any request. We use a simple GET to discover it.
-	blockstorageClient.Microversion = "3.0"
-
 	caps := &CinderCapabilities{}
 
-	// Try to get the microversion from the API info endpoint
-	// Gophercloud exposes this through the provider client
-	maxMV := blockstorageClient.ProviderClient.IdentityBase
-	if maxMV != "" {
-		klog.V(4).Infof("DiscoverCinderCapabilities: identity base = %s", maxMV)
+	// Probe 3.27 — self-service attachments
+	client327, err := os.blockStorageClient(MvSelfServiceAttach)
+	if err != nil {
+		return nil, err
 	}
 
-	// For now, attempt a 3.27 request to verify self-service attachments work
-	blockstorageClient.Microversion = "3.27"
 	mc := metrics.NewMetricContext("cinder", "discover_capabilities")
-
-	// Create and immediately delete a dummy capability check
-	// Instead, just check if a list with 3.27 works
-	_, err = attachments.List(blockstorageClient, attachments.ListOpts{Limit: 1}).AllPages(ctx)
+	_, err = attachments.List(client327, attachments.ListOpts{Limit: 1}).AllPages(ctx)
 	if mc.ObserveRequest(err) != nil {
-		return nil, fmt.Errorf("cinder does not support microversion 3.27 (self-service attachments): %w", err)
+		return nil, fmt.Errorf("cinder does not support microversion %s (self-service attachments): %w",
+			MvSelfServiceAttach, err)
 	}
 	caps.SupportsV327 = true
-	klog.V(2).Info("DiscoverCinderCapabilities: Cinder supports microversion 3.27 (self-service attachments)")
+	klog.V(2).Infof("DiscoverCinderCapabilities: Cinder supports microversion %s (self-service attachments)",
+		MvSelfServiceAttach)
 
-	// Check 3.44 support (os-complete action)
-	blockstorageClient.Microversion = "3.44"
-	_, err = attachments.List(blockstorageClient, attachments.ListOpts{Limit: 1}).AllPages(ctx)
+	// Probe 3.44 — os-complete action
+	client344, err := os.blockStorageClient(MvAttachComplete)
 	if err != nil {
-		klog.V(2).Info("DiscoverCinderCapabilities: Cinder does NOT support microversion 3.44 (os-complete)")
+		return nil, err
+	}
+	_, err = attachments.List(client344, attachments.ListOpts{Limit: 1}).AllPages(ctx)
+	if err != nil {
+		klog.V(2).Infof("DiscoverCinderCapabilities: Cinder does NOT support microversion %s (os-complete)",
+			MvAttachComplete)
 		caps.SupportsV344 = false
 	} else {
-		klog.V(2).Info("DiscoverCinderCapabilities: Cinder supports microversion 3.44 (os-complete)")
+		klog.V(2).Infof("DiscoverCinderCapabilities: Cinder supports microversion %s (os-complete)",
+			MvAttachComplete)
 		caps.SupportsV344 = true
 	}
 

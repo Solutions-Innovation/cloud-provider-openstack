@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
-	gos "github.com/gophercloud/gophercloud/v2/openstack"
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/cloud-provider-openstack/pkg/metrics"
@@ -59,9 +58,11 @@ var volumeErrorStates = [...]string{"error", "error_extending", "error_deleting"
 func (os *OpenStackISCSI) CreateVolume(ctx context.Context, opts *volumes.CreateOpts,
 	schedulerHints volumes.SchedulerHintOptsBuilder) (*volumes.Volume, error) {
 
-	blockstorageClient, err := gos.NewBlockStorageV3(os.blockstorage.ProviderClient, os.epOpts)
+	// Volume create does not require a specific microversion, but we use a
+	// thread-safe copy to avoid mutating the shared client.
+	blockstorageClient, err := os.blockStorageClient(MvSelfServiceAttach)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create blockstorage client: %w", err)
+		return nil, err
 	}
 
 	mc := metrics.NewMetricContext("volume", "create")
@@ -110,12 +111,10 @@ func (os *OpenStackISCSI) GetVolume(ctx context.Context, volumeID string) (*volu
 // GetVolumesByName lists Cinder volumes filtered by name.
 // Cinder API: GET /v3/volumes?name={name} (microversion 3.34 for server-side filtering)
 func (os *OpenStackISCSI) GetVolumesByName(ctx context.Context, name string) ([]volumes.Volume, error) {
-	blockstorageClient, err := gos.NewBlockStorageV3(os.blockstorage.ProviderClient, os.epOpts)
+	blockstorageClient, err := os.blockStorageClient(MvServerSideNameFilter)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create blockstorage client: %w", err)
+		return nil, err
 	}
-	// Server-side name filtering available since 3.34
-	blockstorageClient.Microversion = "3.34"
 
 	opts := volumes.ListOpts{Name: name}
 	mc := metrics.NewMetricContext("volume", "list")
@@ -142,11 +141,10 @@ func (os *OpenStackISCSI) ExpandVolume(ctx context.Context, volumeID string, sta
 	switch status {
 	case VolumeInUseStatus:
 		// Online resize requires microversion 3.42
-		blockstorageClient, err := gos.NewBlockStorageV3(os.blockstorage.ProviderClient, os.epOpts)
+		blockstorageClient, err := os.blockStorageClient(MvOnlineResize)
 		if err != nil {
-			return fmt.Errorf("failed to create blockstorage client: %w", err)
+			return err
 		}
-		blockstorageClient.Microversion = "3.42"
 
 		mc := metrics.NewMetricContext("volume", "expand")
 		return mc.ObserveRequest(volumes.ExtendSize(ctx, blockstorageClient, volumeID, extendOpts).ExtractErr())

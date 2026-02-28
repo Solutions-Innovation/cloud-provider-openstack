@@ -30,8 +30,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder-iscsi/openstack"
-	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
 	"k8s.io/cloud-provider-openstack/pkg/util"
+	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
 	"k8s.io/klog/v2"
 )
 
