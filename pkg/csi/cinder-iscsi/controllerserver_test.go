@@ -85,6 +85,9 @@ func TestCreateVolume_Success(t *testing.T) {
 	// No existing volumes with this name
 	mockCloud.On("GetVolumesByName", ctx, "test-vol").Return([]volumes.Volume{}, nil)
 
+	// VolumeOpts for default volume type, timeout, and metadata prefix
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
+
 	// Create volume returns success
 	mockCloud.On("CreateVolume", ctx, mock.AnythingOfType("*volumes.CreateOpts"), mock.Anything).
 		Return(&volumes.Volume{
@@ -95,7 +98,7 @@ func TestCreateVolume_Success(t *testing.T) {
 		}, nil)
 
 	// Wait for available
-	mockCloud.On("WaitVolumeTargetStatus", ctx, "vol-123", []string{"available"}).Return(nil)
+	mockCloud.On("WaitVolumeTargetStatus", ctx, "vol-123", []string{"available"}, 0).Return(nil)
 
 	// Create attachment
 	mockCloud.On("CreateAttachment", ctx, "vol-123").Return("att-456", nil)
@@ -142,6 +145,9 @@ func TestCreateVolume_Idempotent(t *testing.T) {
 			},
 		},
 	}, nil)
+
+	// VolumeOpts for metadata prefix resolution
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
 
 	req := &csi.CreateVolumeRequest{
 		Name:               "test-vol",
@@ -213,6 +219,7 @@ func TestCreateVolume_ExistingVolumeDifferentSize(t *testing.T) {
 	mockCloud.On("GetVolumesByName", ctx, "test-vol").Return([]volumes.Volume{
 		{ID: "vol-123", Name: "test-vol", Size: 20},
 	}, nil)
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
 
 	req := &csi.CreateVolumeRequest{
 		Name:               "test-vol",
@@ -227,6 +234,103 @@ func TestCreateVolume_ExistingVolumeDifferentSize(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, resp)
 	assert.Contains(t, err.Error(), "AlreadyExists")
+}
+
+// TestCreateVolume_DefaultVolumeType verifies that the default-volume-type
+// from driver.conf is used when no type parameter is in the CreateVolume request.
+func TestCreateVolume_DefaultVolumeType(t *testing.T) {
+	cs, mockCloud := newTestControllerServer()
+	ctx := context.Background()
+
+	mockCloud.On("GetVolumesByName", ctx, "test-vol").Return([]volumes.Volume{}, nil)
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{
+		DefaultVolumeType: "pure-iscsi",
+	})
+
+	// Capture the CreateOpts to verify VolumeType was set from config
+	mockCloud.On("CreateVolume", ctx, mock.AnythingOfType("*volumes.CreateOpts"), mock.Anything).
+		Run(func(args mock.Arguments) {
+			opts := args.Get(1).(*volumes.CreateOpts)
+			assert.Equal(t, "pure-iscsi", opts.VolumeType, "expected default volume type from config")
+		}).
+		Return(&volumes.Volume{
+			ID:   "vol-dvt",
+			Name: "test-vol",
+			Size: 10,
+		}, nil)
+
+	mockCloud.On("WaitVolumeTargetStatus", ctx, "vol-dvt", []string{"available"}, 0).Return(nil)
+	mockCloud.On("CreateAttachment", ctx, "vol-dvt").Return("att-dvt", nil)
+	mockCloud.On("SetVolumeMetadata", ctx, "vol-dvt", map[string]string{
+		"csi.attachment_id": "att-dvt",
+	}).Return(nil)
+
+	req := &csi.CreateVolumeRequest{
+		Name:               "test-vol",
+		VolumeCapabilities: []*csi.VolumeCapability{blockVolumeCapability()},
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: 10 * 1024 * 1024 * 1024,
+		},
+		// No "type" parameter — should use config default
+		Parameters: map[string]string{
+			"availability": "nova",
+		},
+	}
+
+	resp, err := cs.CreateVolume(ctx, req)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+	assert.Equal(t, "vol-dvt", resp.Volume.VolumeId)
+	mockCloud.AssertExpectations(t)
+}
+
+// TestCreateVolume_CustomMetadataPrefix verifies that the metadata-prefix
+// from driver.conf is used for Cinder volume metadata keys.
+func TestCreateVolume_CustomMetadataPrefix(t *testing.T) {
+	cs, mockCloud := newTestControllerServer()
+	ctx := context.Background()
+
+	mockCloud.On("GetVolumesByName", ctx, "test-vol").Return([]volumes.Volume{}, nil)
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{
+		MetadataPrefix: "mydriver",
+		CreateTimeout:  60,
+	})
+
+	mockCloud.On("CreateVolume", ctx, mock.AnythingOfType("*volumes.CreateOpts"), mock.Anything).
+		Return(&volumes.Volume{
+			ID:   "vol-pfx",
+			Name: "test-vol",
+			Size: 10,
+		}, nil)
+
+	// Should use custom timeout from config
+	mockCloud.On("WaitVolumeTargetStatus", ctx, "vol-pfx", []string{"available"}, 60).Return(nil)
+	mockCloud.On("CreateAttachment", ctx, "vol-pfx").Return("att-pfx", nil)
+
+	// Metadata key should use custom prefix: "mydriver.attachment_id"
+	mockCloud.On("SetVolumeMetadata", ctx, "vol-pfx", map[string]string{
+		"mydriver.attachment_id": "att-pfx",
+	}).Return(nil)
+
+	req := &csi.CreateVolumeRequest{
+		Name:               "test-vol",
+		VolumeCapabilities: []*csi.VolumeCapability{blockVolumeCapability()},
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: 10 * 1024 * 1024 * 1024,
+		},
+		Parameters: map[string]string{
+			"type":         "pure-iscsi",
+			"availability": "nova",
+		},
+	}
+
+	resp, err := cs.CreateVolume(ctx, req)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+	assert.Equal(t, "vol-pfx", resp.Volume.VolumeId)
+	mockCloud.AssertExpectations(t)
 }
 
 // ── DeleteVolume Tests ───────────────────────────────────────────────────────
@@ -244,7 +348,7 @@ func TestDeleteVolume_SuccessHandoff(t *testing.T) {
 	}, nil)
 
 	mockCloud.On("DeleteAttachment", ctx, "att-456").Return(nil)
-	// No csi.cleanupVolume metadata → falls back to driver config (retain)
+	// vopts always retrieved for metadata prefix + delete-volume-mode fallback
 	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{
 		DeleteVolumeMode: openstack.DeleteVolumeModeRetain,
 	})
@@ -274,6 +378,7 @@ func TestDeleteVolume_SuccessCleanup(t *testing.T) {
 	}, nil)
 
 	mockCloud.On("DeleteAttachment", ctx, "att-456").Return(nil)
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
 	mockCloud.On("DeleteVolume", ctx, "vol-123").Return(nil)
 
 	req := &csi.DeleteVolumeRequest{VolumeId: "vol-123"}
@@ -359,7 +464,11 @@ func TestDeleteVolume_PerVolumeOverridesDriverConfig(t *testing.T) {
 	}, nil)
 
 	mockCloud.On("DeleteAttachment", ctx, "att-ovr").Return(nil)
-	// Per-volume metadata is set → GetVolumeOpts should NOT be called
+	// vopts always retrieved for metadata prefix resolution
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{
+		DeleteVolumeMode: openstack.DeleteVolumeModeDelete, // would delete, but per-volume overrides
+	})
+	// Per-volume metadata is set → DeleteVolumeMode is ignored
 	mockCloud.On("DeleteVolumeMetadata", ctx, "vol-ovr", []string{
 		"csi.attachment_id", "csi.cleanupVolume",
 	}).Return(nil)
@@ -370,8 +479,6 @@ func TestDeleteVolume_PerVolumeOverridesDriverConfig(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 	mockCloud.AssertExpectations(t)
-	// Ensure GetVolumeOpts was NOT called (per-volume metadata takes precedence)
-	mockCloud.AssertNotCalled(t, "GetVolumeOpts")
 	// Ensure volume was NOT deleted (retain mode via per-volume override)
 	mockCloud.AssertNotCalled(t, "DeleteVolume")
 }
@@ -431,6 +538,9 @@ func TestControllerPublishVolume_FallbackToMetadata(t *testing.T) {
 			"csi.attachment_id": "att-789",
 		},
 	}, nil)
+
+	// VolumeOpts for metadata prefix resolution in fallback path
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
 
 	connInfo := &openstack.ISCSIConnectionInfo{
 		DriverVolumeType: "iscsi",
@@ -512,6 +622,7 @@ func TestControllerUnpublishVolume_Success(t *testing.T) {
 
 	mockCloud.On("DeleteAttachment", ctx, "att-old").Return(nil)
 	mockCloud.On("CreateAttachment", ctx, "vol-123").Return("att-new", nil)
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
 	mockCloud.On("SetVolumeMetadata", ctx, "vol-123", map[string]string{
 		"csi.attachment_id": "att-new",
 	}).Return(nil)
@@ -560,6 +671,7 @@ func TestControllerUnpublishVolume_NoExistingAttachment(t *testing.T) {
 
 	// No DeleteAttachment call expected - attachment is empty
 	mockCloud.On("CreateAttachment", ctx, "vol-123").Return("att-new", nil)
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
 	mockCloud.On("SetVolumeMetadata", ctx, "vol-123", map[string]string{
 		"csi.attachment_id": "att-new",
 	}).Return(nil)

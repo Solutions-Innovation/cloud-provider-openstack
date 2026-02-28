@@ -44,15 +44,22 @@ type controllerServer struct {
 }
 
 // ── Metadata Keys ────────────────────────────────────────────────────────────
-// Stored in Cinder volume metadata to track CSI-managed state.
+// Metadata key suffixes stored in Cinder volume metadata. The full key is
+// built by metadataKey() using the configured prefix (default "csi").
 const (
-	// metaKeyAttachmentID stores the current reserved attachment ID.
-	metaKeyAttachmentID = "csi.attachment_id"
-	// metaKeyCleanupVolume controls DeleteVolume behavior:
-	// "true" = delete the Cinder volume (cleanup/error path)
-	// absent or "false" = leave volume available for Blueprint to create target VM
-	metaKeyCleanupVolume = "csi.cleanupVolume"
+	metaKeySuffixAttachmentID  = "attachment_id"
+	metaKeySuffixCleanupVolume = "cleanupVolume"
+	defaultMetadataPrefix      = "csi"
 )
+
+// metadataKey builds a Cinder metadata key from the configured prefix and a
+// suffix. If prefix is empty, the default "csi" prefix is used.
+func metadataKey(prefix, suffix string) string {
+	if prefix == "" {
+		prefix = defaultMetadataPrefix
+	}
+	return prefix + "." + suffix
+}
 
 // ── CreateVolume ─────────────────────────────────────────────────────────────
 
@@ -106,6 +113,15 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	volAZ := volParams["availability"]
 
 	cloud := cs.Cloud
+	vopts := cloud.GetVolumeOpts()
+
+	// Apply default volume type from driver.conf if not specified in
+	// StorageClass parameters.
+	if volType == "" {
+		volType = vopts.DefaultVolumeType
+	}
+
+	attachmentKey := metadataKey(vopts.MetadataPrefix, metaKeySuffixAttachmentID)
 
 	// ── 2. Idempotency check ─────────────────────────────────────────────
 	existingVols, err := cloud.GetVolumesByName(ctx, volName)
@@ -125,7 +141,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 		// Return existing volume — attachment_id should already be in metadata
 		volCtx := map[string]string{}
-		if attachID, ok := vol.Metadata[metaKeyAttachmentID]; ok {
+		if attachID, ok := vol.Metadata[attachmentKey]; ok {
 			volCtx["attachment_id"] = attachID
 		}
 
@@ -158,7 +174,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 
 	// ── 4. Wait for volume to be "available" ─────────────────────────────
-	err = cloud.WaitVolumeTargetStatus(ctx, vol.ID, []string{"available"})
+	err = cloud.WaitVolumeTargetStatus(ctx, vol.ID, []string{"available"}, vopts.CreateTimeout)
 	if err != nil {
 		klog.Errorf("CreateVolume: volume %s failed to become available: %v", vol.ID, err)
 		// Attempt cleanup
@@ -185,7 +201,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 	// ── 6. Store attachment_id in volume metadata ────────────────────────
 	err = cloud.SetVolumeMetadata(ctx, vol.ID, map[string]string{
-		metaKeyAttachmentID: attachmentID,
+		attachmentKey: attachmentID,
 	})
 	if err != nil {
 		klog.Errorf("CreateVolume: failed to set metadata on volume %s: %v", vol.ID, err)
@@ -248,9 +264,13 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		return nil, status.Errorf(codes.Internal, "DeleteVolume: failed to get volume %s: %v", volumeID, err)
 	}
 
+	vopts := cloud.GetVolumeOpts()
+	attachmentKey := metadataKey(vopts.MetadataPrefix, metaKeySuffixAttachmentID)
+	cleanupKey := metadataKey(vopts.MetadataPrefix, metaKeySuffixCleanupVolume)
+
 	// ── 2. Extract metadata ──────────────────────────────────────────────
-	attachmentID := vol.Metadata[metaKeyAttachmentID]
-	cleanupVolume := vol.Metadata[metaKeyCleanupVolume]
+	attachmentID := vol.Metadata[attachmentKey]
+	cleanupVolume := vol.Metadata[cleanupKey]
 
 	// ── 3. Resolve effective delete mode ─────────────────────────────────
 	// Per-volume metadata overrides the driver-level default.
@@ -260,7 +280,6 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		shouldDelete = (cleanupVolume == "true")
 	} else {
 		// Fall back to driver.conf delete-volume-mode (default: retain)
-		vopts := cloud.GetVolumeOpts()
 		shouldDelete = (vopts.DeleteVolumeMode == openstack.DeleteVolumeModeDelete)
 	}
 
@@ -292,8 +311,8 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		// Success path — leave volume available for Blueprint
 		// Remove CSI metadata so the volume is clean for target VM creation
 		err = cloud.DeleteVolumeMetadata(ctx, volumeID, []string{
-			metaKeyAttachmentID,
-			metaKeyCleanupVolume,
+			attachmentKey,
+			cleanupKey,
 		})
 		if err != nil {
 			klog.Errorf("DeleteVolume: failed to clean metadata on volume %s: %v", volumeID, err)
@@ -370,7 +389,9 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 			return nil, status.Errorf(codes.Internal,
 				"ControllerPublishVolume: failed to get volume %s: %v", volumeID, err)
 		}
-		attachmentID = vol.Metadata[metaKeyAttachmentID]
+		vopts := cloud.GetVolumeOpts()
+		attachmentKey := metadataKey(vopts.MetadataPrefix, metaKeySuffixAttachmentID)
+		attachmentID = vol.Metadata[attachmentKey]
 	}
 
 	if attachmentID == "" {
@@ -471,7 +492,9 @@ func (cs *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 			"ControllerUnpublishVolume: failed to get volume %s: %v", volumeID, err)
 	}
 
-	attachmentID := vol.Metadata[metaKeyAttachmentID]
+	vopts := cloud.GetVolumeOpts()
+	attachmentKey := metadataKey(vopts.MetadataPrefix, metaKeySuffixAttachmentID)
+	attachmentID := vol.Metadata[attachmentKey]
 
 	// ── 2. Delete current attachment ─────────────────────────────────────
 	if attachmentID != "" {
@@ -498,7 +521,7 @@ func (cs *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 
 	// ── 4. Update volume metadata ────────────────────────────────────────
 	err = cloud.SetVolumeMetadata(ctx, volumeID, map[string]string{
-		metaKeyAttachmentID: newAttachmentID,
+		attachmentKey: newAttachmentID,
 	})
 	if err != nil {
 		klog.Errorf("ControllerUnpublishVolume: failed to update metadata on volume %s: %v",
