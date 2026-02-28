@@ -69,20 +69,8 @@ func (ids *identityServer) GetPluginCapabilities(ctx context.Context, req *csi.G
 					},
 				},
 			},
-			{
-				Type: &csi.PluginCapability_VolumeExpansion_{
-					VolumeExpansion: &csi.PluginCapability_VolumeExpansion{
-						Type: csi.PluginCapability_VolumeExpansion_ONLINE,
-					},
-				},
-			},
-			{
-				Type: &csi.PluginCapability_VolumeExpansion_{
-					VolumeExpansion: &csi.PluginCapability_VolumeExpansion{
-						Type: csi.PluginCapability_VolumeExpansion_OFFLINE,
-					},
-				},
-			},
+			// TODO: Add VolumeExpansion (ONLINE/OFFLINE) when EXPAND_VOLUME
+			// is implemented in the controller service.
 		},
 	}, nil
 }

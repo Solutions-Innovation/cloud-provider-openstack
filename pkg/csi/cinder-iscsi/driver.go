@@ -85,13 +85,12 @@ func NewDriver(o *DriverOpts) *Driver {
 		})
 
 	// Controller capabilities for Cinder v3 attachment lifecycle
+	// Only advertise capabilities that are actually implemented.
+	// TODO: Add LIST_VOLUMES, EXPAND_VOLUME, CREATE_DELETE_SNAPSHOT when implemented.
 	d.AddControllerServiceCapabilities(
 		[]csi.ControllerServiceCapability_RPC_Type{
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 			csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
-			csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
-			csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
-			csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 		})
 
 	// Node capabilities for iSCSI staging (login/logout)
