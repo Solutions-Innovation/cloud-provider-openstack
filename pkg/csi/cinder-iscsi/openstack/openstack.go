@@ -282,63 +282,8 @@ func GetOpenStackProvider(cloudName string) (IOpenStackISCSI, error) {
 	return CreateOpenStackProvider(cloudName)
 }
 
-// ── Volume Operation Stubs (Phase 2) ─────────────────────────────────────────
-
-func (os *OpenStackISCSI) CreateVolume(ctx context.Context, opts *volumes.CreateOpts,
-	schedulerHints volumes.SchedulerHintOptsBuilder) (*volumes.Volume, error) {
-	return nil, fmt.Errorf("CreateVolume not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) DeleteVolume(ctx context.Context, volumeID string) error {
-	return fmt.Errorf("DeleteVolume not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) GetVolume(ctx context.Context, volumeID string) (*volumes.Volume, error) {
-	return nil, fmt.Errorf("GetVolume not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) GetVolumesByName(ctx context.Context, name string) ([]volumes.Volume, error) {
-	return nil, fmt.Errorf("GetVolumesByName not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) ExpandVolume(ctx context.Context, volumeID string, status string, newSize int) error {
-	return fmt.Errorf("ExpandVolume not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) WaitVolumeTargetStatus(ctx context.Context, volumeID string, tStatus []string) error {
-	return fmt.Errorf("WaitVolumeTargetStatus not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) SetVolumeMetadata(ctx context.Context, volumeID string, metadata map[string]string) error {
-	return fmt.Errorf("SetVolumeMetadata not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) DeleteVolumeMetadata(ctx context.Context, volumeID string, keys []string) error {
-	return fmt.Errorf("DeleteVolumeMetadata not implemented (Phase 2)")
-}
-
-// ── Attachment Operation Stubs (Phase 2) ─────────────────────────────────────
-
-func (os *OpenStackISCSI) CreateAttachment(ctx context.Context, volumeID string) (string, error) {
-	return "", fmt.Errorf("CreateAttachment not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) UpdateAttachmentConnector(ctx context.Context, attachmentID string,
-	connector *AttachmentConnector) (*ISCSIConnectionInfo, error) {
-	return nil, fmt.Errorf("UpdateAttachmentConnector not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) CompleteAttachment(ctx context.Context, attachmentID string) error {
-	return fmt.Errorf("CompleteAttachment not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) GetAttachment(ctx context.Context, attachmentID string) (*Attachment, error) {
-	return nil, fmt.Errorf("GetAttachment not implemented (Phase 2)")
-}
-
-func (os *OpenStackISCSI) DeleteAttachment(ctx context.Context, attachmentID string) error {
-	return fmt.Errorf("DeleteAttachment not implemented (Phase 2)")
-}
+// ── Volume and Attachment Operations ──────────────────────────────────────────
+// Implemented in openstack_volumes.go and openstack_attachments.go
 
 // ── Snapshot Operation Stubs (Phase 2) ───────────────────────────────────────
 
