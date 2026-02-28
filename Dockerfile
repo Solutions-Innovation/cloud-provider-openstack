@@ -146,6 +146,26 @@ LABEL name="cinder-csi-plugin" \
 CMD ["/bin/cinder-csi-plugin"]
 
 ##
+## cinder-iscsi-csi-plugin (development)
+##
+FROM ${DEBIAN_IMAGE} AS cinder-iscsi-csi-plugin
+
+RUN clean-install open-iscsi mount util-linux
+
+COPY --from=builder /build/cinder-iscsi-csi-plugin /bin/cinder-iscsi-csi-plugin
+COPY --from=certs /etc/ssl/certs /etc/ssl/certs
+
+LABEL name="cinder-iscsi-csi-plugin" \
+      license="Apache Version 2.0" \
+      maintainers="Kubernetes Authors" \
+      description="Cinder iSCSI CSI Plugin" \
+      distribution-scope="public" \
+      summary="Cinder iSCSI CSI Plugin for iSCSI-backed Cinder volumes" \
+      help="none"
+
+CMD ["/bin/cinder-iscsi-csi-plugin"]
+
+##
 ## k8s-keystone-auth
 ##
 FROM ${DISTROLESS_IMAGE} AS k8s-keystone-auth
