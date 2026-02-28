@@ -25,6 +25,7 @@ package openstack
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"time"
 
@@ -46,7 +47,10 @@ const (
 	// Backoff parameters for WaitVolumeTargetStatus
 	operationFinishInitDelay = 1 * time.Second
 	operationFinishFactor    = 1.1
-	operationFinishSteps     = 10
+	operationFinishMinSteps  = 10
+
+	// Default timeout when caller passes timeoutSeconds <= 0.
+	defaultWaitTimeoutSeconds = 300
 )
 
 var volumeErrorStates = [...]string{"error", "error_extending", "error_deleting"}
@@ -157,12 +161,29 @@ func (os *OpenStackISCSI) ExpandVolume(ctx context.Context, volumeID string, sta
 	return fmt.Errorf("volume %s cannot be resized when status is %s", volumeID, status)
 }
 
-// WaitVolumeTargetStatus polls until the volume reaches one of the target statuses.
-func (os *OpenStackISCSI) WaitVolumeTargetStatus(ctx context.Context, volumeID string, tStatus []string) error {
+// WaitVolumeTargetStatus polls until the volume reaches one of the target
+// statuses. timeoutSeconds controls the total wait time; if <= 0 the default
+// (300 s) is used. The number of exponential-backoff steps is computed from
+// the requested timeout so the backoff covers the full window.
+func (os *OpenStackISCSI) WaitVolumeTargetStatus(ctx context.Context, volumeID string, tStatus []string, timeoutSeconds int) error {
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = defaultWaitTimeoutSeconds
+	}
+
+	// Compute steps so the cumulative backoff covers the timeout.
+	// Total ≈ initDelay * (factor^steps - 1) / (factor - 1)
+	// Solving for steps: ceil(ln(timeout*(factor-1)/initDelay + 1) / ln(factor))
+	initSec := operationFinishInitDelay.Seconds()
+	n := math.Log(float64(timeoutSeconds)*(operationFinishFactor-1)/initSec+1) / math.Log(operationFinishFactor)
+	steps := int(math.Ceil(n))
+	if steps < operationFinishMinSteps {
+		steps = operationFinishMinSteps
+	}
+
 	backoff := wait.Backoff{
 		Duration: operationFinishInitDelay,
 		Factor:   operationFinishFactor,
-		Steps:    operationFinishSteps,
+		Steps:    steps,
 	}
 
 	waitErr := wait.ExponentialBackoff(backoff, func() (bool, error) {
@@ -184,7 +205,8 @@ func (os *OpenStackISCSI) WaitVolumeTargetStatus(ctx context.Context, volumeID s
 	})
 
 	if wait.Interrupted(waitErr) {
-		waitErr = fmt.Errorf("timeout waiting for volume %s to reach status %v", volumeID, tStatus)
+		waitErr = fmt.Errorf("timeout waiting for volume %s to reach status %v (waited %ds)",
+			volumeID, tStatus, timeoutSeconds)
 	}
 
 	return waitErr

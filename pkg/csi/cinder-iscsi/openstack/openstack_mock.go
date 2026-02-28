@@ -81,8 +81,8 @@ func (m *OpenStackISCSIMock) ExpandVolume(ctx context.Context, volumeID string, 
 	return ret.Error(0)
 }
 
-func (m *OpenStackISCSIMock) WaitVolumeTargetStatus(ctx context.Context, volumeID string, tStatus []string) error {
-	ret := m.Called(ctx, volumeID, tStatus)
+func (m *OpenStackISCSIMock) WaitVolumeTargetStatus(ctx context.Context, volumeID string, tStatus []string, timeoutSeconds int) error {
+	ret := m.Called(ctx, volumeID, tStatus, timeoutSeconds)
 	return ret.Error(0)
 }
 

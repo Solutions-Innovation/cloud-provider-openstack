@@ -59,7 +59,7 @@ type IOpenStackISCSI interface {
 	GetVolume(ctx context.Context, volumeID string) (*volumes.Volume, error)
 	GetVolumesByName(ctx context.Context, name string) ([]volumes.Volume, error)
 	ExpandVolume(ctx context.Context, volumeID string, status string, newSize int) error
-	WaitVolumeTargetStatus(ctx context.Context, volumeID string, tStatus []string) error
+	WaitVolumeTargetStatus(ctx context.Context, volumeID string, tStatus []string, timeoutSeconds int) error
 	SetVolumeMetadata(ctx context.Context, volumeID string, metadata map[string]string) error
 	DeleteVolumeMetadata(ctx context.Context, volumeID string, keys []string) error
 
