@@ -60,6 +60,13 @@
   - [9. Prerequisites](#9-prerequisites)
   - [10. Risks and Mitigations](#10-risks-and-mitigations)
   - [11. Future Work](#11-future-work)
+  - [Appendix A — iSCSI Initiator Configuration for Pure Storage](#appendix-a--iscsi-initiator-configuration-for-pure-storage)
+    - [A.1 Background — iSCSI Initiator Identity](#a1-background--iscsi-initiator-identity)
+    - [A.2 Backend Behavior — Auto-Register vs Pre-Register](#a2-backend-behavior--auto-register-vs-pre-register)
+    - [A.3 Pure Storage — Required Pre-Registration Steps](#a3-pure-storage--required-pre-registration-steps)
+    - [A.4 Automation with Ansible](#a4-automation-with-ansible)
+    - [A.5 Troubleshooting — IQN Not Registered](#a5-troubleshooting--iqn-not-registered)
+    - [A.6 RHOSO 18 Cinder Microversion Compatibility](#a6-rhoso-18-cinder-microversion-compatibility)
   - [12. References](#12-references)
 
 ---
