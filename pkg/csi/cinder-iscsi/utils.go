@@ -1,5 +1,13 @@
 /*
 Copyright 2017 The Kubernetes Authors.
+(original upstream copyright preserved)
+
+Copyright (c) 2024-2026 Wind River Systems, Inc.
+Wind River Migration Framework Team
+Modifications: Copied from pkg/csi/cinder/utils.go — removed cinder-specific constructors,
+replaced with iSCSI-specific constructors for the iSCSI-Cinder CSI driver.
+
+SPDX-License-Identifier: Apache-2.0
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,10 +21,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-// Copied from pkg/csi/cinder/utils.go — package-private types require a copy.
-// Adapted: removed cinder-specific constructors (NewNodeServer, NewControllerServer with
-// openstack.IOpenStack), replaced with iSCSI-specific constructors.
 
 package iscsi
 

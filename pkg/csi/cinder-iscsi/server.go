@@ -1,5 +1,12 @@
 /*
 Copyright 2017 The Kubernetes Authors.
+(original upstream copyright preserved)
+
+Copyright (c) 2024-2026 Wind River Systems, Inc.
+Wind River Migration Framework Team
+Modifications: Copied from pkg/csi/cinder/server.go — adapted for iSCSI-Cinder CSI driver package.
+
+SPDX-License-Identifier: Apache-2.0
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,8 +20,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-// Copied from pkg/csi/cinder/server.go — package-private types require a copy.
 
 package iscsi
 
