@@ -490,7 +490,7 @@ func TestControllerPublishVolume_Success(t *testing.T) {
 	ctx := context.Background()
 
 	connInfo := &openstack.ISCSIConnectionInfo{
-		DriverVolumeType: "iscsi",
+		DriverVolumeType: openstack.DriverVolumeTypeISCSI,
 		TargetPortal:     "69.167.149.97:3260",
 		TargetIQN:        "iqn.2010-10.org.openstack:volume-vol-123",
 		TargetLUN:        0,
@@ -523,7 +523,7 @@ func TestControllerPublishVolume_Success(t *testing.T) {
 	assert.Equal(t, "CHAP", resp.PublishContext["auth_method"])
 	assert.Equal(t, "user123", resp.PublishContext["auth_username"])
 	assert.Equal(t, "pass456", resp.PublishContext["auth_password"])
-	assert.Equal(t, "iscsi", resp.PublishContext["driver_volume_type"])
+	assert.Equal(t, openstack.DriverVolumeTypeISCSI, resp.PublishContext["driver_volume_type"])
 	mockCloud.AssertExpectations(t)
 }
 
@@ -543,7 +543,7 @@ func TestControllerPublishVolume_FallbackToMetadata(t *testing.T) {
 	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
 
 	connInfo := &openstack.ISCSIConnectionInfo{
-		DriverVolumeType: "iscsi",
+		DriverVolumeType: openstack.DriverVolumeTypeISCSI,
 		TargetPortal:     "10.0.0.1:3260",
 		TargetIQN:        "iqn.2010-10.org.openstack:volume-vol-123",
 		TargetLUN:        1,
@@ -770,7 +770,7 @@ func TestBuildPublishContext(t *testing.T) {
 		TargetPortal:     "10.0.0.1:3260",
 		TargetIQN:        "iqn.2010-10.org.openstack:volume-123",
 		TargetLUN:        2,
-		DriverVolumeType: "iscsi",
+		DriverVolumeType: openstack.DriverVolumeTypeISCSI,
 		AuthMethod:       "CHAP",
 		AuthUsername:     "user",
 		AuthPassword:     "pass",
@@ -781,7 +781,7 @@ func TestBuildPublishContext(t *testing.T) {
 	assert.Equal(t, "10.0.0.1:3260", ctx["target_portal"])
 	assert.Equal(t, "iqn.2010-10.org.openstack:volume-123", ctx["target_iqn"])
 	assert.Equal(t, "2", ctx["target_lun"])
-	assert.Equal(t, "iscsi", ctx["driver_volume_type"])
+	assert.Equal(t, openstack.DriverVolumeTypeISCSI, ctx["driver_volume_type"])
 	assert.Equal(t, "CHAP", ctx["auth_method"])
 	assert.Equal(t, "user", ctx["auth_username"])
 	assert.Equal(t, "pass", ctx["auth_password"])
@@ -792,7 +792,7 @@ func TestBuildPublishContext_NoCHAP(t *testing.T) {
 		TargetPortal:     "10.0.0.1:3260",
 		TargetIQN:        "iqn.2010-10.org.openstack:volume-123",
 		TargetLUN:        0,
-		DriverVolumeType: "iscsi",
+		DriverVolumeType: openstack.DriverVolumeTypeISCSI,
 	}
 
 	ctx := BuildPublishContext(connInfo)
@@ -804,7 +804,7 @@ func TestBuildPublishContext_NoCHAP(t *testing.T) {
 
 func TestValidateISCSIConnectionInfo_Valid(t *testing.T) {
 	connInfo := &openstack.ISCSIConnectionInfo{
-		DriverVolumeType: "iscsi",
+		DriverVolumeType: openstack.DriverVolumeTypeISCSI,
 		TargetPortal:     "10.0.0.1:3260",
 		TargetIQN:        "iqn.2010-10.org.openstack:volume-123",
 	}
@@ -824,7 +824,7 @@ func TestValidateISCSIConnectionInfo_WrongType(t *testing.T) {
 
 func TestValidateISCSIConnectionInfo_MissingPortal(t *testing.T) {
 	connInfo := &openstack.ISCSIConnectionInfo{
-		DriverVolumeType: "iscsi",
+		DriverVolumeType: openstack.DriverVolumeTypeISCSI,
 		TargetIQN:        "iqn.2010-10.org.openstack:volume-123",
 	}
 	err := ValidateISCSIConnectionInfo(connInfo)

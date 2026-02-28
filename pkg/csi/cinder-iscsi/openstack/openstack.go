@@ -85,6 +85,14 @@ type IOpenStackISCSI interface {
 
 // ── iSCSI Data Types ─────────────────────────────────────────────────────────
 
+// DriverVolumeTypeISCSI is the Cinder connection_info driver_volume_type value
+// returned by all iSCSI storage backends (LVM/tgtd, Pure Storage, etc.).
+// Defined by the Python os-brick library's ISCSIConnector — this string has
+// been stable since OpenStack Folsom (2012) and is part of the brick connector
+// protocol contract. Gophercloud does not define it (connection_info is
+// untyped map[string]any), so we own this constant.
+const DriverVolumeTypeISCSI = "iscsi"
+
 // ISCSIConnectionInfo from Cinder v3 attachment connection_info
 type ISCSIConnectionInfo struct {
 	DriverVolumeType string `json:"driver_volume_type"` // "iscsi"
