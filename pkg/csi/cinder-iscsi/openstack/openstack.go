@@ -144,7 +144,8 @@ type ISCSICinderConfig struct {
 	Volume VolumeOpts                  // from driver.conf [Volume]
 }
 
-// ISCSIOpts controls iSCSI initiator behavior in NodeStageVolume/NodeUnstageVolume.
+// ISCSIOpts controls iSCSI initiator behavior in NodeStageVolume/NodeUnstageVolume
+// and the connector fields sent to Cinder during ControllerPublishVolume.
 type ISCSIOpts struct {
 	EnableMultipath   bool   `gcfg:"enable-multipath"`    // Default: false
 	CHAPAuthEnabled   bool   `gcfg:"chap-auth-enabled"`   // Default: true
@@ -152,6 +153,8 @@ type ISCSIOpts struct {
 	DeviceWaitTimeout int    `gcfg:"device-wait-timeout"` // Default: 30 (seconds)
 	ISCSIInterface    string `gcfg:"iscsi-interface"`     // Default: "default"
 	StorageInterface  string `gcfg:"storage-interface"`   // Default: "" (primary IP)
+	Platform          string `gcfg:"platform"`            // Default: "x86_64"
+	OSType            string `gcfg:"os-type"`             // Default: "linux2"
 }
 
 // DeleteVolumeMode constants control the driver-level default for DeleteVolume.
