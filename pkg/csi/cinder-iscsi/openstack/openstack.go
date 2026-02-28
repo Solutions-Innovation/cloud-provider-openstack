@@ -91,7 +91,7 @@ type ISCSIConnectionInfo struct {
 	TargetIQN        string `json:"target_iqn"`         // "iqn.2010-10.org.openstack:volume-xxx"
 	TargetLUN        int    `json:"target_lun"`         // 0
 	AuthMethod       string `json:"auth_method"`        // "CHAP" or ""
-	AuthUsername     string `json:"auth_username"`       // CHAP username
+	AuthUsername     string `json:"auth_username"`      // CHAP username
 	AuthPassword     string `json:"auth_password"`      // CHAP password
 	VolumeID         string `json:"volume_id"`          // Cinder volume UUID
 	Encrypted        bool   `json:"encrypted"`          // false
@@ -119,10 +119,10 @@ type AttachmentConnector struct {
 
 // Attachment wraps Cinder v3 attachment response
 type Attachment struct {
-	ID             string              `json:"id"`
-	VolumeID       string              `json:"volume_id"`
-	Status         string              `json:"status"`
-	Instance       *string             `json:"instance"`
+	ID             string               `json:"id"`
+	VolumeID       string               `json:"volume_id"`
+	Status         string               `json:"status"`
+	Instance       *string              `json:"instance"`
 	ConnectionInfo *ISCSIConnectionInfo `json:"connection_info"`
 }
 
@@ -163,6 +163,26 @@ type VolumeOpts struct {
 
 // ── OpenStackISCSI Provider ──────────────────────────────────────────────────
 
+// ── Cinder Microversion Constants ────────────────────────────────────────────
+// Each constant documents *why* the microversion is required so the minimum
+// API contract is visible in one place.
+const (
+	// MvSelfServiceAttach is the minimum Cinder microversion for the
+	// self-service (no-Nova) v3 attachment API (create/update/delete).
+	MvSelfServiceAttach = "3.27"
+
+	// MvServerSideNameFilter enables server-side volume name filtering
+	// in GET /v3/volumes?name=...
+	MvServerSideNameFilter = "3.34"
+
+	// MvOnlineResize enables os-extend on in-use volumes.
+	MvOnlineResize = "3.42"
+
+	// MvAttachComplete enables the POST os-complete action that
+	// transitions an attachment from "attaching" → "attached".
+	MvAttachComplete = "3.44"
+)
+
 // OpenStackISCSI is the concrete implementation of IOpenStackISCSI.
 // Phase 1: struct + provider init only. Method bodies in Phase 2+.
 type OpenStackISCSI struct {
@@ -171,6 +191,20 @@ type OpenStackISCSI struct {
 	iscsiOpts    ISCSIOpts
 	volumeOpts   VolumeOpts
 	cinderCaps   *CinderCapabilities
+}
+
+// blockStorageClient returns a thread-safe copy of the block-storage
+// ServiceClient with the given microversion pinned. Each Gophercloud
+// ServiceClient is mutable (Microversion is a plain string field), so
+// concurrent RPCs that need different microversions must each get their
+// own copy via NewBlockStorageV3.
+func (os *OpenStackISCSI) blockStorageClient(microversion string) (*gophercloud.ServiceClient, error) {
+	c, err := gos.NewBlockStorageV3(os.blockstorage.ProviderClient, os.epOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create blockstorage client: %w", err)
+	}
+	c.Microversion = microversion
+	return c, nil
 }
 
 // ── Provider Initialization ──────────────────────────────────────────────────
