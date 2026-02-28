@@ -42,6 +42,7 @@ REGISTRY	?= registry.k8s.io/provider-os
 IMAGE_OS	?= linux
 IMAGE_NAMES	?= openstack-cloud-controller-manager \
 				cinder-csi-plugin \
+				cinder-iscsi-csi-plugin \
 				k8s-keystone-auth \
 				octavia-ingress-controller \
 				manila-csi-plugin \
@@ -51,6 +52,7 @@ ARCH		?= amd64
 ARCHS		?= amd64 arm arm64 ppc64le s390x
 BUILD_CMDS	?= openstack-cloud-controller-manager \
 				cinder-csi-plugin \
+				cinder-iscsi-csi-plugin \
 				k8s-keystone-auth \
 				octavia-ingress-controller \
 				manila-csi-plugin \
@@ -94,6 +96,9 @@ test-cinder-csi-sanity: work
 
 test-manila-csi-sanity: work
 	go test $(GIT_HOST)/$(BASE_DIR)/tests/sanity/manila
+
+test-cinder-iscsi-csi-sanity: work
+	go test $(GIT_HOST)/$(BASE_DIR)/tests/sanity/cinder-iscsi
 
 # kept for compatibility reasons.
 fmt: check
@@ -196,6 +201,7 @@ endif
 	CGO_ENABLED=0 gox -parallel=$(GOX_PARALLEL) -output="_dist/{{.OS}}-{{.Arch}}/{{.Dir}}" -osarch='$(TARGETS)' $(GOFLAGS) $(if $(TAGS),-tags '$(TAGS)',) -ldflags '$(GOX_LDFLAGS)' $(GIT_HOST)/$(BASE_DIR)/cmd/octavia-ingress-controller/
 	CGO_ENABLED=0 gox -parallel=$(GOX_PARALLEL) -output="_dist/{{.OS}}-{{.Arch}}/{{.Dir}}" -osarch='$(TARGETS)' $(GOFLAGS) $(if $(TAGS),-tags '$(TAGS)',) -ldflags '$(GOX_LDFLAGS)' $(GIT_HOST)/$(BASE_DIR)/cmd/manila-csi-plugin/
 	CGO_ENABLED=0 gox -parallel=$(GOX_PARALLEL) -output="_dist/{{.OS}}-{{.Arch}}/{{.Dir}}" -osarch='$(TARGETS)' $(GOFLAGS) $(if $(TAGS),-tags '$(TAGS)',) -ldflags '$(GOX_LDFLAGS)' $(GIT_HOST)/$(BASE_DIR)/cmd/magnum-auto-healer/
+	CGO_ENABLED=0 gox -parallel=$(GOX_PARALLEL) -output="_dist/{{.OS}}-{{.Arch}}/{{.Dir}}" -osarch='$(TARGETS)' $(GOFLAGS) $(if $(TAGS),-tags '$(TAGS)',) -ldflags '$(GOX_LDFLAGS)' $(GIT_HOST)/$(BASE_DIR)/cmd/cinder-iscsi-csi-plugin/
 
 .PHONY: dist
 dist: build-cross
