@@ -652,7 +652,41 @@ type VolumeOpts struct {
     DetachTimeout     int    `gcfg:"detach-timeout"`       // Default: 120 (seconds)
     DefaultVolumeType string `gcfg:"default-volume-type"`  // Optional
     MetadataPrefix    string `gcfg:"metadata-prefix"`      // Default: "csi"
+    DeleteVolumeMode  string `gcfg:"delete-volume-mode"`   // Default: "retain" — see below
 }
+```
+
+**`delete-volume-mode` configuration:**
+
+This option sets the **driver-level default** for what happens when a PVC is deleted
+(i.e., when the `external-provisioner` sidecar calls `DeleteVolume`). The migration
+operator can override this default on a per-volume basis by setting the
+`csi.cleanupVolume` metadata key on the Cinder volume.
+
+| Value | Behavior | Use Case |
+|-------|----------|----------|
+| `retain` (default) | Delete attachment + remove CSI metadata, but **leave the Cinder volume available** for Blueprint to create the target VM | Normal migration success path |
+| `delete` | Delete attachment + **delete the Cinder volume entirely** | Error/cleanup path, or non-migration workloads |
+
+**Precedence rules:**
+1. If `csi.cleanupVolume` metadata is set on the volume → use that value (`"true"` = delete)
+2. Otherwise → use `delete-volume-mode` from `driver.conf`
+3. If neither is set → default to `retain`
+
+This means:
+- **Migration operator** — does not need to set per-volume metadata in the success
+  path. The driver default of `retain` ensures volumes survive PVC deletion.
+- **Error handler** — sets `csi.cleanupVolume=true` on volumes that should be fully
+  cleaned up (e.g., failed migrations).
+- **Non-migration deployments** — set `delete-volume-mode = delete` in `driver.conf`
+  so the driver behaves like a standard CSI driver.
+
+**Example `driver.conf`:**
+```ini
+[Volume]
+create-timeout = 300
+detach-timeout = 120
+delete-volume-mode = retain
 ```
 
 **Comparison with NFS driver config:**
@@ -1179,7 +1213,10 @@ Input: volumeID, secrets
 │      → Backend: terminate_connection() → iSCSI target removed
 │      Volume status → "available"
 ├── 4. Check cleanup mode:
-│      IF cleanupVolume == "true":
+│      cleanupVolume = metadata["csi.cleanupVolume"]
+│      IF cleanupVolume is not set:
+│        → Use driver.conf delete-volume-mode (default: "retain")
+│      IF cleanupVolume == "true" OR delete-volume-mode == "delete":
 │        → cloud.DeleteVolume(volumeID)  (full cleanup)
 │      ELSE (default — migration success):
 │        → cloud.DeleteVolumeMetadata(volumeID, ["csi.attachment_id", "csi.cleanupVolume"])

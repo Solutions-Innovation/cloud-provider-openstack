@@ -244,6 +244,10 @@ func TestDeleteVolume_SuccessHandoff(t *testing.T) {
 	}, nil)
 
 	mockCloud.On("DeleteAttachment", ctx, "att-456").Return(nil)
+	// No csi.cleanupVolume metadata → falls back to driver config (retain)
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{
+		DeleteVolumeMode: openstack.DeleteVolumeModeRetain,
+	})
 	mockCloud.On("DeleteVolumeMetadata", ctx, "vol-123", []string{
 		"csi.attachment_id", "csi.cleanupVolume",
 	}).Return(nil)
@@ -305,6 +309,71 @@ func TestDeleteVolume_MissingVolumeID(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Nil(t, resp)
+}
+
+// TestDeleteVolume_DriverConfigDelete verifies that when no per-volume metadata
+// is set but driver.conf has delete-volume-mode = "delete", the volume is
+// fully deleted.
+func TestDeleteVolume_DriverConfigDelete(t *testing.T) {
+	cs, mockCloud := newTestControllerServer()
+	ctx := context.Background()
+
+	mockCloud.On("GetVolume", ctx, "vol-cfg").Return(&volumes.Volume{
+		ID:     "vol-cfg",
+		Status: "reserved",
+		Metadata: map[string]string{
+			"csi.attachment_id": "att-cfg",
+		},
+	}, nil)
+
+	mockCloud.On("DeleteAttachment", ctx, "att-cfg").Return(nil)
+	// No csi.cleanupVolume → falls back to driver config = delete
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{
+		DeleteVolumeMode: openstack.DeleteVolumeModeDelete,
+	})
+	mockCloud.On("DeleteVolume", ctx, "vol-cfg").Return(nil)
+
+	req := &csi.DeleteVolumeRequest{VolumeId: "vol-cfg"}
+	resp, err := cs.DeleteVolume(ctx, req)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+	mockCloud.AssertExpectations(t)
+	// Ensure DeleteVolumeMetadata was NOT called (volume was deleted)
+	mockCloud.AssertNotCalled(t, "DeleteVolumeMetadata")
+}
+
+// TestDeleteVolume_PerVolumeOverridesDriverConfig verifies that per-volume
+// metadata csi.cleanupVolume="false" overrides delete-volume-mode="delete".
+func TestDeleteVolume_PerVolumeOverridesDriverConfig(t *testing.T) {
+	cs, mockCloud := newTestControllerServer()
+	ctx := context.Background()
+
+	mockCloud.On("GetVolume", ctx, "vol-ovr").Return(&volumes.Volume{
+		ID:     "vol-ovr",
+		Status: "reserved",
+		Metadata: map[string]string{
+			"csi.attachment_id": "att-ovr",
+			"csi.cleanupVolume": "false", // per-volume says retain
+		},
+	}, nil)
+
+	mockCloud.On("DeleteAttachment", ctx, "att-ovr").Return(nil)
+	// Per-volume metadata is set → GetVolumeOpts should NOT be called
+	mockCloud.On("DeleteVolumeMetadata", ctx, "vol-ovr", []string{
+		"csi.attachment_id", "csi.cleanupVolume",
+	}).Return(nil)
+
+	req := &csi.DeleteVolumeRequest{VolumeId: "vol-ovr"}
+	resp, err := cs.DeleteVolume(ctx, req)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+	mockCloud.AssertExpectations(t)
+	// Ensure GetVolumeOpts was NOT called (per-volume metadata takes precedence)
+	mockCloud.AssertNotCalled(t, "GetVolumeOpts")
+	// Ensure volume was NOT deleted (retain mode via per-volume override)
+	mockCloud.AssertNotCalled(t, "DeleteVolume")
 }
 
 // ── ControllerPublishVolume Tests ────────────────────────────────────────────

@@ -154,12 +154,25 @@ type ISCSIOpts struct {
 	StorageInterface  string `gcfg:"storage-interface"`   // Default: "" (primary IP)
 }
 
+// DeleteVolumeMode constants control the driver-level default for DeleteVolume.
+const (
+	// DeleteVolumeModeRetain leaves the Cinder volume in "available" state
+	// after PVC deletion so Blueprint can create the target VM. This is the
+	// default for migration workloads.
+	DeleteVolumeModeRetain = "retain"
+
+	// DeleteVolumeModeDelete deletes the Cinder volume entirely on PVC
+	// deletion, like a standard CSI driver.
+	DeleteVolumeModeDelete = "delete"
+)
+
 // VolumeOpts controls Cinder volume lifecycle.
 type VolumeOpts struct {
 	CreateTimeout     int    `gcfg:"create-timeout"`      // Default: 300 (seconds)
 	DetachTimeout     int    `gcfg:"detach-timeout"`      // Default: 120 (seconds)
 	DefaultVolumeType string `gcfg:"default-volume-type"` // Optional
 	MetadataPrefix    string `gcfg:"metadata-prefix"`     // Default: "csi"
+	DeleteVolumeMode  string `gcfg:"delete-volume-mode"`  // Default: "retain"
 }
 
 // ── OpenStackISCSI Provider ──────────────────────────────────────────────────

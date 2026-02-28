@@ -208,18 +208,26 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 // ── DeleteVolume ─────────────────────────────────────────────────────────────
 
-// DeleteVolume handles PVC deletion. Behavior depends on the csi.cleanupVolume
-// metadata flag:
+// DeleteVolume handles PVC deletion. Behavior depends on the delete-volume-mode
+// driver configuration (default: "retain") and the per-volume csi.cleanupVolume
+// metadata override:
 //
-//   - cleanupVolume == "true": Delete the Cinder volume entirely (error/cleanup path)
-//   - cleanupVolume absent/false: Delete the attachment, remove CSI metadata, and
+// Precedence:
+//  1. Per-volume metadata csi.cleanupVolume ("true" = delete) takes priority
+//  2. Otherwise, driver.conf [Volume] delete-volume-mode is used
+//  3. If neither is set, default is "retain"
+//
+// Modes:
+//   - delete: Delete the Cinder volume entirely (error/cleanup path)
+//   - retain (default): Delete the attachment, remove CSI metadata, and
 //     leave the volume "available" for Blueprint to create the target VM (success path)
 //
 // Flow:
 //  1. Get volume from Cinder (not found → success, idempotent)
 //  2. Extract attachment_id and cleanupVolume from metadata
-//  3. Delete attachment if present
-//  4. Delete volume OR remove CSI metadata (based on cleanupVolume flag)
+//  3. Resolve effective delete mode (per-volume override > driver config > retain)
+//  4. Delete attachment if present
+//  5. Delete volume OR remove CSI metadata (based on resolved mode)
 func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	klog.V(4).Infof("DeleteVolume: called with args %+v", protosanitizer.StripSecrets(req))
 
@@ -244,7 +252,19 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	attachmentID := vol.Metadata[metaKeyAttachmentID]
 	cleanupVolume := vol.Metadata[metaKeyCleanupVolume]
 
-	// ── 3. Delete attachment if present ──────────────────────────────────
+	// ── 3. Resolve effective delete mode ─────────────────────────────────
+	// Per-volume metadata overrides the driver-level default.
+	shouldDelete := false
+	if cleanupVolume != "" {
+		// Explicit per-volume override
+		shouldDelete = (cleanupVolume == "true")
+	} else {
+		// Fall back to driver.conf delete-volume-mode (default: retain)
+		vopts := cloud.GetVolumeOpts()
+		shouldDelete = (vopts.DeleteVolumeMode == openstack.DeleteVolumeModeDelete)
+	}
+
+	// ── 4. Delete attachment if present ──────────────────────────────────
 	if attachmentID != "" {
 		err = cloud.DeleteAttachment(ctx, attachmentID)
 		if err != nil {
@@ -255,8 +275,8 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		klog.V(4).Infof("DeleteVolume: deleted attachment %s for volume %s", attachmentID, volumeID)
 	}
 
-	// ── 4. Cleanup or handoff ────────────────────────────────────────────
-	if cleanupVolume == "true" {
+	// ── 5. Cleanup or handoff ────────────────────────────────────────────
+	if shouldDelete {
 		// Full cleanup — delete the Cinder volume
 		err = cloud.DeleteVolume(ctx, volumeID)
 		if err != nil {
