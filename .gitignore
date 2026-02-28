@@ -159,3 +159,6 @@ zz_generated.openapi.go
 
 # local gopath
 .go
+
+# Markdown review customized style
+.crossnote/*.*
