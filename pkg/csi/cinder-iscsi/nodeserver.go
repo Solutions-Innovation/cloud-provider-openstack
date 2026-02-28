@@ -1,5 +1,8 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright (c) 2024-2026 Wind River Systems, Inc.
+Wind River Migration Framework Team
+
+SPDX-License-Identifier: Apache-2.0
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
