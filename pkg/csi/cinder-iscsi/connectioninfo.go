@@ -96,8 +96,9 @@ func BuildPublishContext(connInfo *openstack.ISCSIConnectionInfo) map[string]str
 // ValidateISCSIConnectionInfo checks that the essential iSCSI fields are
 // present in the connection info returned by Cinder.
 func ValidateISCSIConnectionInfo(connInfo *openstack.ISCSIConnectionInfo) error {
-	if connInfo.DriverVolumeType != "iscsi" {
-		return fmt.Errorf("unexpected driver_volume_type %q, expected 'iscsi'", connInfo.DriverVolumeType)
+	if connInfo.DriverVolumeType != openstack.DriverVolumeTypeISCSI {
+		return fmt.Errorf("unexpected driver_volume_type %q, expected %q",
+			connInfo.DriverVolumeType, openstack.DriverVolumeTypeISCSI)
 	}
 	if connInfo.TargetPortal == "" {
 		return fmt.Errorf("connection_info missing target_portal")
