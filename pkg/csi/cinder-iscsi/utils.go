@@ -79,9 +79,11 @@ func NewControllerServer(d *Driver, cloud openstack.IOpenStackISCSI) *controller
 }
 
 // NewIdentityServer creates a new iSCSI identity server.
-func NewIdentityServer(d *Driver) *identityServer {
+// cloud may be nil for node-only mode; SetupControllerService injects it later.
+func NewIdentityServer(d *Driver, cloud openstack.IOpenStackISCSI) *identityServer {
 	return &identityServer{
 		Driver: d,
+		cloud:  cloud,
 	}
 }
 

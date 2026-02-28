@@ -25,11 +25,14 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+	"k8s.io/cloud-provider-openstack/pkg/csi/cinder-iscsi/openstack"
 	"k8s.io/klog/v2"
 )
 
 type identityServer struct {
 	Driver *Driver
+	cloud  openstack.IOpenStackISCSI // nil for node-only mode
 	csi.UnimplementedIdentityServer
 }
 
@@ -51,10 +54,30 @@ func (ids *identityServer) GetPluginInfo(ctx context.Context, req *csi.GetPlugin
 }
 
 // Probe returns whether the iSCSI-Cinder CSI plugin is healthy.
-// Phase 1: returns ready unconditionally.
-// Phase 2+: controller checks Cinder capabilities; node checks iscsiadm/iscsid.
+// The livenessprobe sidecar calls this every ~10s. We check the cached
+// Cinder capabilities that were populated at startup by
+// DiscoverCinderCapabilities. Node-only mode (cloud==nil) is always ready.
+// Node-side iscsiadm/iscsid checks will be added in Phase 3.
 func (ids *identityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
-	return &csi.ProbeResponse{}, nil
+	// Node-only mode — no Cinder dependency
+	if ids.cloud == nil {
+		return &csi.ProbeResponse{Ready: &wrapperspb.BoolValue{Value: true}}, nil
+	}
+
+	// Controller mode — check cached Cinder capabilities
+	caps := ids.cloud.GetCinderCapabilities()
+	if caps == nil {
+		// Discovery hasn't completed yet (still initializing)
+		klog.V(3).Info("Probe: Cinder capabilities not yet discovered")
+		return &csi.ProbeResponse{Ready: &wrapperspb.BoolValue{Value: false}}, nil
+	}
+	if !caps.SupportsV327 {
+		// Should not happen (startup would have failed), but defensive
+		klog.Warning("Probe: Cinder does not support microversion 3.27")
+		return &csi.ProbeResponse{Ready: &wrapperspb.BoolValue{Value: false}}, nil
+	}
+
+	return &csi.ProbeResponse{Ready: &wrapperspb.BoolValue{Value: true}}, nil
 }
 
 // GetPluginCapabilities returns the capabilities of this CSI plugin.

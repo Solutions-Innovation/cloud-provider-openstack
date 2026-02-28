@@ -76,7 +76,8 @@ type IOpenStackISCSI interface {
 	DeleteSnapshot(ctx context.Context, snapID string) error
 	GetSnapshotByID(ctx context.Context, snapshotID string) (*snapshots.Snapshot, error)
 
-	// ── Configuration & Capabilities ────────────────────────────────────
+	// ── Discovery & Configuration ───────────────────────────────────────
+	DiscoverCinderCapabilities(ctx context.Context) (*CinderCapabilities, error)
 	GetISCSIOpts() ISCSIOpts
 	GetVolumeOpts() VolumeOpts
 	GetCinderCapabilities() *CinderCapabilities
@@ -303,6 +304,18 @@ func CreateOpenStackProvider(cloudName string) (IOpenStackISCSI, error) {
 		iscsiOpts:    cfg.ISCSI,
 		volumeOpts:   cfg.Volume,
 	}
+
+	// Probe Cinder microversions at startup. If the minimum required
+	// microversion (3.27 — self-service attachments) is not supported the
+	// driver cannot function, so we surface the error immediately.
+	// The cached CinderCapabilities are later read by Probe() to report
+	// readiness to the livenessprobe sidecar.
+	ctx := context.Background()
+	caps, err := instance.DiscoverCinderCapabilities(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("Cinder microversion probe failed: %w", err)
+	}
+	klog.Infof("Cinder capabilities: v3.27=%v v3.44=%v", caps.SupportsV327, caps.SupportsV344)
 
 	osInstance = instance
 	return instance, nil

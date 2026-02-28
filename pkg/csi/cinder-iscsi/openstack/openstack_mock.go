@@ -164,7 +164,18 @@ func (m *OpenStackISCSIMock) GetSnapshotByID(ctx context.Context, snapshotID str
 	return r0, ret.Error(1)
 }
 
-// ── Configuration & Capabilities ─────────────────────────────────────────────
+// ── Discovery & Configuration ────────────────────────────────────────────────
+
+func (m *OpenStackISCSIMock) DiscoverCinderCapabilities(ctx context.Context) (*CinderCapabilities, error) {
+	ret := m.Called(ctx)
+	var r0 *CinderCapabilities
+	if rf, ok := ret.Get(0).(func() *CinderCapabilities); ok {
+		r0 = rf()
+	} else if ret.Get(0) != nil {
+		r0 = ret.Get(0).(*CinderCapabilities)
+	}
+	return r0, ret.Error(1)
+}
 
 func (m *OpenStackISCSIMock) GetISCSIOpts() ISCSIOpts {
 	ret := m.Called()

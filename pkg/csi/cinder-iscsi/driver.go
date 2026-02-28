@@ -100,7 +100,9 @@ func NewDriver(o *DriverOpts) *Driver {
 			csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 		})
 
-	d.ids = NewIdentityServer(d)
+	// Identity server is created without a cloud reference.
+	// SetupControllerService will inject the cloud for Probe readiness checks.
+	d.ids = NewIdentityServer(d, nil)
 
 	return d
 }
@@ -156,9 +158,12 @@ func (d *Driver) GetVolumeCapabilityAccessModes() []*csi.VolumeCapability_Access
 }
 
 // SetupControllerService configures the controller service with an OpenStack cloud.
+// It also wires the cloud reference into the identity server so that Probe()
+// can report Cinder readiness to the livenessprobe sidecar.
 func (d *Driver) SetupControllerService(cloud openstack.IOpenStackISCSI) {
 	klog.Info("Providing controller service")
 	d.cs = NewControllerServer(d, cloud)
+	d.ids.cloud = cloud
 }
 
 // SetupNodeService configures the node service.
