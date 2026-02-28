@@ -54,6 +54,7 @@
       - [6.1.2 OpenStack → OpenStack (O2O) — NBD Receiver + virsh blockcopy](#612-openstack--openstack-o2o--nbd-receiver--virsh-blockcopy)
     - [6.2 Data Path Visualization](#62-data-path-visualization)
   - [7. Implementation Details](#7-implementation-details)
+    - [7.1 Driver Configuration Reference](#71-driver-configuration-reference)
   - [8. Network Architecture](#8-network-architecture)
     - [8.1 Network Topology](#81-network-topology)
     - [8.2 Network Requirements](#82-network-requirements)
@@ -1564,6 +1565,70 @@ Helm chart, StorageClass/PVC/CDI Pod specifications, and development phases — 
 the companion implementation design document:
 
 > **[iSCSI-Cinder CSI Implementation Design](iscsi-cinder-csi-implementation-design.md)**
+
+### 7.1 Driver Configuration Reference
+
+The iSCSI-Cinder CSI driver is configured via two files mounted into the controller
+and node DaemonSet pods:
+
+| File | Source | Kubernetes Object | Description |
+|------|--------|-------------------|-------------|
+| `cloud.conf` | OpenStack credentials | Secret (`csi-secret-cinderplugin-iscsi`) | Keystone auth — `[Global]` section with `auth-url`, `username`, `password`, etc. |
+| `driver.conf` | Driver behavior tuning | ConfigMap (`csi-configmap-cinder-iscsi`) | `[ISCSI]` and `[Volume]` sections — see below |
+
+#### `[ISCSI]` Section — iSCSI Initiator & Connector Options
+
+These options control the iSCSI initiator behavior on Node RPCs (`NodeStageVolume` /
+`NodeUnstageVolume`) and the connector fields sent to Cinder during
+`ControllerPublishVolume`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enable-multipath` | bool | `false` | Enable iSCSI multipath (DM-MPIO). When `true`, the connector advertises multipath support to Cinder and the Node RPCs use `multipathd`. |
+| `chap-auth-enabled` | bool | `true` | Whether to use CHAP authentication for iSCSI sessions. |
+| `login-timeout` | int | `30` | iSCSI login timeout in seconds (`iscsiadm --login --timeout`). |
+| `device-wait-timeout` | int | `30` | Time in seconds to wait for the block device to appear after `iscsiadm --login`. |
+| `iscsi-interface` | string | `"default"` | iSCSI interface to use (`iscsiadm -I`). |
+| `storage-interface` | string | `""` | Network interface name for the storage network. Empty = use the host's primary IP. |
+| `platform` | string | `"x86_64"` | Platform string sent in the Cinder attachment connector. |
+| `os-type` | string | `"linux2"` | OS type string sent in the Cinder attachment connector. |
+
+#### `[Volume]` Section — Cinder Volume Lifecycle Options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `create-timeout` | int | `300` | Seconds to wait for a new Cinder volume to reach `available` status. |
+| `detach-timeout` | int | `120` | Seconds to wait for attachment deletion to complete. |
+| `default-volume-type` | string | `""` | Cinder volume type to use if not specified in the StorageClass. |
+| `metadata-prefix` | string | `"csi"` | Prefix for CSI-managed Cinder volume metadata keys (e.g., `csi.attachment_id`). |
+| `delete-volume-mode` | string | `"retain"` | Driver-level default for `DeleteVolume` behavior. `retain` = leave volume available for Blueprint; `delete` = fully delete volume. Per-volume `csi.cleanupVolume` metadata overrides this. |
+
+#### Example `driver.conf`
+
+```ini
+[ISCSI]
+enable-multipath = false
+chap-auth-enabled = true
+login-timeout = 30
+device-wait-timeout = 30
+iscsi-interface = default
+storage-interface =
+platform = x86_64
+os-type = linux2
+
+[Volume]
+create-timeout = 300
+detach-timeout = 120
+delete-volume-mode = retain
+```
+
+> **Note:** The `delete-volume-mode` option uses a 3-tier precedence:
+> 1. Per-volume `csi.cleanupVolume` metadata (`"true"` = delete) — highest priority
+> 2. `delete-volume-mode` from `driver.conf`
+> 3. Built-in default: `retain`
+>
+> See [Implementation Design §6.2](iscsi-cinder-csi-implementation-design.md#62-iscsi-specific-config-structs)
+> for the full Go struct definitions and precedence rules.
 
 
 
