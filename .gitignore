@@ -162,3 +162,6 @@ zz_generated.openapi.go
 
 # GitHub skills (local only)
 .github/skills/
+
+# Markdown review customized style
+.crossnote/*.*
