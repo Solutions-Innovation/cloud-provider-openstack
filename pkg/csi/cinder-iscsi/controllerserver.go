@@ -379,13 +379,24 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 	}
 
 	// ── 3. Update attachment with connector ──────────────────────────────
+	iscsiOpts := cloud.GetISCSIOpts()
+
+	platform := iscsiOpts.Platform
+	if platform == "" {
+		platform = "x86_64"
+	}
+	osType := iscsiOpts.OSType
+	if osType == "" {
+		osType = "linux2"
+	}
+
 	connector := &openstack.AttachmentConnector{
 		Initiator: iqn,
 		IP:        ip,
 		Host:      host,
-		Multipath: false,
-		Platform:  "x86_64",
-		OSType:    "linux2",
+		Multipath: iscsiOpts.EnableMultipath,
+		Platform:  platform,
+		OSType:    osType,
 	}
 
 	connInfo, err := cloud.UpdateAttachmentConnector(ctx, attachmentID, connector)

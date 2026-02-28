@@ -392,6 +392,7 @@ func TestControllerPublishVolume_Success(t *testing.T) {
 		AuthPassword:     "pass456",
 	}
 
+	mockCloud.On("GetISCSIOpts").Return(openstack.ISCSIOpts{})
 	mockCloud.On("UpdateAttachmentConnector", ctx, "att-456",
 		mock.AnythingOfType("*openstack.AttachmentConnector")).Return(connInfo, nil)
 	mockCloud.On("CompleteAttachment", ctx, "att-456").Return(nil)
@@ -438,6 +439,7 @@ func TestControllerPublishVolume_FallbackToMetadata(t *testing.T) {
 		TargetLUN:        1,
 	}
 
+	mockCloud.On("GetISCSIOpts").Return(openstack.ISCSIOpts{})
 	mockCloud.On("UpdateAttachmentConnector", ctx, "att-789",
 		mock.AnythingOfType("*openstack.AttachmentConnector")).Return(connInfo, nil)
 	mockCloud.On("CompleteAttachment", ctx, "att-789").Return(nil)
