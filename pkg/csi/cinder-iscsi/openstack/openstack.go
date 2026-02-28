@@ -93,6 +93,18 @@ type IOpenStackISCSI interface {
 // untyped map[string]any), so we own this constant.
 const DriverVolumeTypeISCSI = "iscsi"
 
+// DefaultConnectorPlatform is the default value for the "platform" field in
+// the Cinder v3 attachment connector dict. It corresponds to Python's
+// platform.machine() on x86-64 Linux hosts. Nova/os-brick have passed this
+// value since the Cinder attachment API was introduced.
+const DefaultConnectorPlatform = "x86_64"
+
+// DefaultConnectorOSType is the default value for the "os_type" field in the
+// Cinder v3 attachment connector dict. It corresponds to Python 2's
+// sys.platform ("linux2"). Python 3 returns "linux", but Cinder backends
+// still accept both values. Gophercloud test fixtures also use "linux2".
+const DefaultConnectorOSType = "linux2"
+
 // ISCSIConnectionInfo from Cinder v3 attachment connection_info
 type ISCSIConnectionInfo struct {
 	DriverVolumeType string `json:"driver_volume_type"` // "iscsi"

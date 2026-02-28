@@ -404,11 +404,11 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 
 	platform := iscsiOpts.Platform
 	if platform == "" {
-		platform = "x86_64"
+		platform = openstack.DefaultConnectorPlatform
 	}
 	osType := iscsiOpts.OSType
 	if osType == "" {
-		osType = "linux2"
+		osType = openstack.DefaultConnectorOSType
 	}
 
 	connector := &openstack.AttachmentConnector{
