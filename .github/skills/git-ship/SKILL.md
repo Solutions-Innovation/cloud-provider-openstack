@@ -81,8 +81,17 @@ If the user approved pushing:
 1. Use `mcp_gitkraken_git_push` to push to the remote.
 2. Report success with the branch name and a one-line summary.
 
-If push fails (e.g., upstream rejected), report the error and suggest
-`git pull --rebase` before retrying.
+If push fails, diagnose the error:
+
+- **Upstream rejected (non-fast-forward):** suggest `git pull --rebase` before retrying.
+- **SSH authentication failure** (e.g., `Permission denied (publickey)`,
+  `Could not read from remote repository`): Run the following in the terminal to load
+  the SSH key, then retry the push:
+  ```bash
+  eval $(ssh-agent) && ssh-add ~/.ssh/wr56
+  ```
+  After the key is loaded, retry `mcp_gitkraken_git_push`. If it still fails, report
+  the error and stop.
 
 ## Edge cases
 
