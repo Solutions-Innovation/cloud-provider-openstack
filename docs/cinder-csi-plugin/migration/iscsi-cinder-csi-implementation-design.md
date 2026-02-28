@@ -237,8 +237,12 @@ func (cs *iscsiControllerServer) ControllerPublishVolume(...) {
     host, iqn, ip := parseNodeID(req.NodeId)
     attachmentID := getAttachmentID(req.VolumeContext, req.VolumeId)
     // Update Cinder v3 attachment with iSCSI initiator connector
+    iscsiOpts := cloud.GetISCSIOpts()
     connInfo, _ := cloud.UpdateAttachmentConnector(ctx, attachmentID, &AttachmentConnector{
-        Initiator: iqn, IP: ip, Host: host, Multipath: false,
+        Initiator: iqn, IP: ip, Host: host,
+        Multipath: iscsiOpts.EnableMultipath, // from driver.conf [ISCSI]
+        Platform:  defaultIfEmpty(iscsiOpts.Platform, "x86_64"),
+        OSType:    defaultIfEmpty(iscsiOpts.OSType, "linux2"),
     })
     // Return iSCSI target details in publish_context
     return &csi.ControllerPublishVolumeResponse{
@@ -637,6 +641,7 @@ type ISCSICinderConfig struct {
 }
 
 // ISCSIOpts controls iSCSI initiator behavior in NodeStageVolume/NodeUnstageVolume
+// and the connector fields sent to Cinder during ControllerPublishVolume.
 type ISCSIOpts struct {
     EnableMultipath   bool   `gcfg:"enable-multipath"`     // Default: false
     CHAPAuthEnabled   bool   `gcfg:"chap-auth-enabled"`    // Default: true
@@ -644,6 +649,8 @@ type ISCSIOpts struct {
     DeviceWaitTimeout int    `gcfg:"device-wait-timeout"`  // Default: 30 (seconds)
     ISCSIInterface    string `gcfg:"iscsi-interface"`      // Default: "default"
     StorageInterface  string `gcfg:"storage-interface"`    // Default: "" (primary IP)
+    Platform          string `gcfg:"platform"`             // Default: "x86_64"
+    OSType            string `gcfg:"os-type"`              // Default: "linux2"
 }
 
 // VolumeOpts controls Cinder volume lifecycle
@@ -683,6 +690,16 @@ This means:
 
 **Example `driver.conf`:**
 ```ini
+[ISCSI]
+enable-multipath = false
+chap-auth-enabled = true
+login-timeout = 30
+device-wait-timeout = 30
+iscsi-interface = default
+storage-interface =
+platform = x86_64
+os-type = linux2
+
 [Volume]
 create-timeout = 300
 detach-timeout = 120
@@ -694,7 +711,7 @@ delete-volume-mode = retain
 | NFS Driver Config                  | iSCSI Driver Config              | Notes                              |
 |------------------------------------|----------------------------------|------------------------------------|
 | `ShadowVMOpts` (FlavorID, ImageID, SubnetID, NetworkID, etc.) | *(removed — no Shadow VM)* | Zero compute resource config |
-| `NFSOpts` (MountOptions, NFSVersion, DefaultFsType) | `ISCSIOpts` (Multipath, CHAP, Timeouts, Interface) | Different host deps |
+| `NFSOpts` (MountOptions, NFSVersion, DefaultFsType) | `ISCSIOpts` (Multipath, CHAP, Timeouts, Interface, Platform, OSType) | Different host deps |
 | `VolumeOpts` (DefaultVolumeType, DefaultVolumeAZ) | `VolumeOpts` (CreateTimeout, DetachTimeout, DefaultVolumeType, MetadataPrefix) | Extended for attachment lifecycle |
 
 ### 6.3 Cinder v3 Attachment Lifecycle State Machine
