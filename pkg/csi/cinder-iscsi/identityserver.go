@@ -31,8 +31,9 @@ import (
 )
 
 type identityServer struct {
-	Driver *Driver
-	cloud  openstack.IOpenStackISCSI // nil for node-only mode
+	Driver    *Driver
+	cloud     openstack.IOpenStackISCSI // nil for node-only mode
+	iscsiInit ISCSIInitiator            // nil for controller-only mode; set by SetupNodeService
 	csi.UnimplementedIdentityServer
 }
 
@@ -56,11 +57,17 @@ func (ids *identityServer) GetPluginInfo(ctx context.Context, req *csi.GetPlugin
 // Probe returns whether the iSCSI-Cinder CSI plugin is healthy.
 // The livenessprobe sidecar calls this every ~10s. We check the cached
 // Cinder capabilities that were populated at startup by
-// DiscoverCinderCapabilities. Node-only mode (cloud==nil) is always ready.
-// Node-side iscsiadm/iscsid checks will be added in Phase 3.
+// DiscoverCinderCapabilities. For node-only mode (cloud==nil), we verify
+// that iscsiadm is reachable.
 func (ids *identityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
-	// Node-only mode — no Cinder dependency
+	// Node-only mode — verify iscsiadm availability
 	if ids.cloud == nil {
+		if ids.iscsiInit != nil {
+			if err := ids.iscsiInit.CheckIscsiadm(ctx); err != nil {
+				klog.V(3).Infof("Probe: iscsiadm check failed: %v", err)
+				return &csi.ProbeResponse{Ready: &wrapperspb.BoolValue{Value: false}}, nil
+			}
+		}
 		return &csi.ProbeResponse{Ready: &wrapperspb.BoolValue{Value: true}}, nil
 	}
 
