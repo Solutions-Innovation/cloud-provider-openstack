@@ -438,6 +438,71 @@ func TestNodePublishVolume_IdempotentAlreadyMounted(t *testing.T) {
 	mountMock.AssertExpectations(t)
 }
 
+func TestNodePublishVolume_RejectsMount(t *testing.T) {
+	ns := fakeNodeServer(&ISCSIInitiatorMock{}, &mountutil.MountMock{})
+	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:          "vol-001",
+		StagingTargetPath: "/tmp/staging",
+		TargetPath:        "/tmp/target",
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		},
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "filesystem (mount) volume mode is not supported")
+}
+
+func TestNodePublishVolume_BindMount(t *testing.T) {
+	iscsiMock := &ISCSIInitiatorMock{}
+	mountMock := &mountutil.MountMock{}
+	ns := fakeNodeServer(iscsiMock, mountMock)
+
+	// Set up staging dir with a device path file
+	stagingDir := t.TempDir()
+	targetDir := t.TempDir()
+	targetPath := filepath.Join(targetDir, "block-device")
+
+	// Create a real file to act as the block device (symlink target)
+	realDevice := filepath.Join(t.TempDir(), "sda")
+	assert.NoError(t, os.WriteFile(realDevice, []byte{}, 0640))
+
+	// Create a symlink that looks like a /dev/disk/by-path entry
+	deviceSymlink := filepath.Join(t.TempDir(), "ip-10.0.0.1:3260-iscsi-iqn.test-lun-0")
+	assert.NoError(t, os.Symlink(realDevice, deviceSymlink))
+
+	// Write the symlink path into the staging device-path file
+	assert.NoError(t, os.WriteFile(filepath.Join(stagingDir, devicePathFile), []byte(deviceSymlink), 0640))
+
+	// Mock: not yet mounted.
+	// Note: MakeFile() and Mounter() on MountMock are hardcoded stubs that
+	// bypass _m.Called(), so they cannot be mocked via On()/Return().
+	// MakeFile always returns nil; Mounter() returns a fresh FakeMounter.
+	mountMock.On("IsLikelyNotMountPointAttach", targetPath).Return(true, nil)
+
+	resp, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:          "vol-001",
+		StagingTargetPath: stagingDir,
+		TargetPath:        targetPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{
+				Block: &csi.VolumeCapability_BlockVolume{},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+	mountMock.AssertExpectations(t)
+}
+
 // ── NodeUnpublishVolume Tests ────────────────────────────────────────────────
 
 func TestNodeUnpublishVolume_MissingVolumeID(t *testing.T) {
