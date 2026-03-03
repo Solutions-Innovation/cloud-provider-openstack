@@ -62,11 +62,14 @@ func (ids *identityServer) GetPluginInfo(ctx context.Context, req *csi.GetPlugin
 func (ids *identityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
 	// Node-only mode — verify iscsiadm availability
 	if ids.cloud == nil {
-		if ids.iscsiInit != nil {
-			if err := ids.iscsiInit.CheckIscsiadm(ctx); err != nil {
-				klog.V(3).Infof("Probe: iscsiadm check failed: %v", err)
-				return &csi.ProbeResponse{Ready: &wrapperspb.BoolValue{Value: false}}, nil
-			}
+		if ids.iscsiInit == nil {
+			// SetupNodeService was never called — wiring bug.
+			klog.Warning("Probe: node-only mode but iSCSI initiator not configured (SetupNodeService not called)")
+			return &csi.ProbeResponse{Ready: &wrapperspb.BoolValue{Value: false}}, nil
+		}
+		if err := ids.iscsiInit.CheckIscsiadm(ctx); err != nil {
+			klog.V(3).Infof("Probe: iscsiadm check failed: %v", err)
+			return &csi.ProbeResponse{Ready: &wrapperspb.BoolValue{Value: false}}, nil
 		}
 		return &csi.ProbeResponse{Ready: &wrapperspb.BoolValue{Value: true}}, nil
 	}
