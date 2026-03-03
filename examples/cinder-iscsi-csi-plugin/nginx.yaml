@@ -1,0 +1,36 @@
+# Nginx pod with a filesystem PVC backed by the cinder-iscsi CSI driver.
+# This is a simple smoke test: create a volume, attach via iSCSI, mount as ext4.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-pvc-cinder-iscsi
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: csi-sc-cinder-iscsi
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-cinder-iscsi
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    imagePullPolicy: IfNotPresent
+    ports:
+    - containerPort: 80
+      protocol: TCP
+    volumeMounts:
+    - mountPath: /var/lib/www/html
+      name: csi-data-cinder-iscsi
+  volumes:
+  - name: csi-data-cinder-iscsi
+    persistentVolumeClaim:
+      claimName: csi-pvc-cinder-iscsi
+      readOnly: false
