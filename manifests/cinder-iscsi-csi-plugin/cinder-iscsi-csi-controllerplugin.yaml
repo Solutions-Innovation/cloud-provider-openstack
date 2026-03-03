@@ -66,7 +66,7 @@ spec:
             - mountPath: /var/lib/csi/sockets/pluginproxy/
               name: socket-dir
         - name: cinder-iscsi-csi-plugin
-          image: registry.k8s.io/provider-os/cinder-iscsi-csi-plugin:latest
+          image: ghcr.io/solutions-innovation/cinder-iscsi-csi-plugin:latest
           args:
             - /bin/cinder-iscsi-csi-plugin
             - "--endpoint=$(CSI_ENDPOINT)"
@@ -108,7 +108,7 @@ spec:
               readOnly: true
       volumes:
         - name: socket-dir
-          emptyDir:
+          emptyDir: {}
         - name: secret-cinderplugin
           secret:
             secretName: cinder-iscsi-cloud-config

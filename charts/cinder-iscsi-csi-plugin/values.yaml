@@ -52,7 +52,7 @@ csi:
     extraEnv: []
   plugin:
     image:
-      repository: registry.k8s.io/provider-os/cinder-iscsi-csi-plugin
+      repository: ghcr.io/solutions-innovation/cinder-iscsi-csi-plugin
       pullPolicy: IfNotPresent
       tag:  # defaults to .Chart.AppVersion
     volumes: []
