@@ -479,6 +479,18 @@ func TestNodePublishVolume_MissingTargetPath(t *testing.T) {
 	assert.Contains(t, err.Error(), "TargetPath must be provided")
 }
 
+func TestNodePublishVolume_MissingCapability(t *testing.T) {
+	ns := fakeNodeServer(&ISCSIInitiatorMock{}, &mountutil.MountMock{})
+	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:          "vol-001",
+		StagingTargetPath: "/tmp/staging",
+		TargetPath:        "/tmp/target",
+		// VolumeCapability intentionally nil
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "VolumeCapability must be provided")
+}
+
 func TestNodePublishVolume_IdempotentAlreadyMounted(t *testing.T) {
 	iscsiMock := &ISCSIInitiatorMock{}
 	mountMock := &mountutil.MountMock{}
@@ -499,6 +511,10 @@ func TestNodePublishVolume_IdempotentAlreadyMounted(t *testing.T) {
 		VolumeId:          "vol-001",
 		StagingTargetPath: stagingDir,
 		TargetPath:        targetPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
 	})
 
 	assert.NoError(t, err)
