@@ -14,74 +14,74 @@
 ## Table of Contents
 
 - [iSCSI-Backed Cinder CSI Plugin — Detailed Implementation Design](#iscsi-backed-cinder-csi-plugin--detailed-implementation-design)
-	- [Table of Contents](#table-of-contents)
-	- [1. Summary](#1-summary)
-		- [Conclusion](#conclusion)
-	- [2. Existing Cinder CSI Code Analysis](#2-existing-cinder-csi-code-analysis)
-		- [2.1 Package Layout](#21-package-layout)
-		- [2.2 driver.go — Driver Struct and Initialization](#22-drivergo--driver-struct-and-initialization)
-		- [2.3 controllerserver.go — Controller RPCs](#23-controllerservergo--controller-rpcs)
-		- [2.4 nodeserver.go — Node RPCs](#24-nodeservergo--node-rpcs)
-		- [2.5 identityserver.go — Identity RPCs](#25-identityservergo--identity-rpcs)
-		- [2.6 openstack/ — OpenStack API Layer](#26-openstack--openstack-api-layer)
-		- [2.7 server.go and utils.go — gRPC Infrastructure](#27-servergo-and-utilsgo--grpc-infrastructure)
-		- [2.8 cmd/cinder-csi-plugin/main.go — Binary Entry Point](#28-cmdcinder-csi-pluginmaingo--binary-entry-point)
-	- [3. Architectural Assessment: Extension vs. New Package](#3-architectural-assessment-extension-vs-new-package)
-		- [3.1 Why the Existing Code Cannot Be Extended](#31-why-the-existing-code-cannot-be-extended)
-		- [3.2 Why the NFS-Cinder Driver Cannot Be Extended Either](#32-why-the-nfs-cinder-driver-cannot-be-extended-either)
-		- [3.3 Reusable Components](#33-reusable-components)
-	- [4. Comparison with Manila and NFS-Cinder CSI Drivers](#4-comparison-with-manila-and-nfs-cinder-csi-drivers)
-	- [5. Proposed Folder Structure](#5-proposed-folder-structure)
-		- [5.1 New Directories and Files](#51-new-directories-and-files)
-		- [5.2 Files to Modify in Existing Tree](#52-files-to-modify-in-existing-tree)
-	- [6. Interface Design](#6-interface-design)
-		- [6.1 IOpenStackISCSI Interface](#61-iopenstackiscsi-interface)
-		- [6.2 iSCSI-Specific Config Structs](#62-iscsi-specific-config-structs)
-		- [6.3 Cinder v3 Attachment Lifecycle State Machine](#63-cinder-v3-attachment-lifecycle-state-machine)
-		- [6.4 Architecture Decision: Gophercloud SDK for Cinder v3 Attachments](#64-architecture-decision-gophercloud-sdk-for-cinder-v3-attachments)
-	- [7. Prerequisites and Runtime Validation](#7-prerequisites-and-runtime-validation)
-		- [7.1 Environment Prerequisites](#71-environment-prerequisites)
-		- [7.2 Startup Validation vs. Ongoing Validation](#72-startup-validation-vs-ongoing-validation)
-		- [7.3 Microversion Detection Strategy](#73-microversion-detection-strategy)
-	- [8. CSI RPC Implementation Map](#8-csi-rpc-implementation-map)
-		- [8.1 Identity Service](#81-identity-service)
-		- [8.2 Controller Service](#82-controller-service)
-			- [CreateVolume](#createvolume)
-			- [DeleteVolume](#deletevolume)
-			- [ControllerPublishVolume](#controllerpublishvolume)
-			- [ControllerUnpublishVolume](#controllerunpublishvolume)
-			- [ControllerExpandVolume](#controllerexpandvolume)
-		- [8.3 Node Service](#83-node-service)
-			- [NodeStageVolume](#nodestagevolume)
-			- [NodeUnstageVolume](#nodeunstagevolume)
-			- [NodePublishVolume](#nodepublishvolume)
-			- [NodeUnpublishVolume](#nodeunpublishvolume)
-			- [NodeGetInfo](#nodegetinfo)
-			- [NodeGetVolumeStats](#nodegetvolumestats)
-			- [NodeExpandVolume](#nodeexpandvolume)
-	- [9. K8S CSI Sidecar Architecture](#9-k8s-csi-sidecar-architecture)
-		- [9.1 Controller Deployment Sidecars](#91-controller-deployment-sidecars)
-		- [9.2 Node DaemonSet Sidecars](#92-node-daemonset-sidecars)
-		- [9.3 K8S Calling Chain Reference](#93-k8s-calling-chain-reference)
-	- [10. Build and Deployment](#10-build-and-deployment)
-		- [10.1 Makefile Changes](#101-makefile-changes)
-		- [10.2 Dockerfile Stage](#102-dockerfile-stage)
-			- [10.2.1 Development Phase — Debian-Based Image (Current)](#1021-development-phase--debian-based-image-current)
-			- [10.2.2 Production Phase — 3-Step Distroless Build (TODO)](#1022-production-phase--3-step-distroless-build-todo)
-		- [10.3 Kubernetes Manifests](#103-kubernetes-manifests)
-			- [`hostPID: true` — Security Implications and Alternatives](#hostpid-true--security-implications-and-alternatives)
-		- [10.4 StorageClass, PVC, and CDI Pod Specifications](#104-storageclass-pvc-and-cdi-pod-specifications)
-		- [10.5 Helm Chart](#105-helm-chart)
-		- [10.6 Metrics](#106-metrics)
-		- [10.7 Release Procedure Alignment](#107-release-procedure-alignment)
-	- [11. Development Phases](#11-development-phases)
-		- [Phase 1 — Scaffold and Interface](#phase-1--scaffold-and-interface)
-		- [Phase 2 — Controller Service (Core)](#phase-2--controller-service-core)
-		- [Phase 3 — Node Service (iSCSI Login/Logout)](#phase-3--node-service-iscsi-loginlogout)
-		- [Phase 4 — Integration and E2E](#phase-4--integration-and-e2e)
-		- [Phase 5 — CDI Multi-Phase Precopy](#phase-5--cdi-multi-phase-precopy)
-	- [Appendix A: Key Differences — Existing Cinder CSI vs NFS-Cinder CSI vs iSCSI-Cinder CSI](#appendix-a-key-differences--existing-cinder-csi-vs-nfs-cinder-csi-vs-iscsi-cinder-csi)
-	- [Appendix B: File-Level Reuse Decision Matrix](#appendix-b-file-level-reuse-decision-matrix)
+  - [Table of Contents](#table-of-contents)
+  - [1. Summary](#1-summary)
+    - [Conclusion](#conclusion)
+  - [2. Existing Cinder CSI Code Analysis](#2-existing-cinder-csi-code-analysis)
+    - [2.1 Package Layout](#21-package-layout)
+    - [2.2 driver.go — Driver Struct and Initialization](#22-drivergo--driver-struct-and-initialization)
+    - [2.3 controllerserver.go — Controller RPCs](#23-controllerservergo--controller-rpcs)
+    - [2.4 nodeserver.go — Node RPCs](#24-nodeservergo--node-rpcs)
+    - [2.5 identityserver.go — Identity RPCs](#25-identityservergo--identity-rpcs)
+    - [2.6 openstack/ — OpenStack API Layer](#26-openstack--openstack-api-layer)
+    - [2.7 server.go and utils.go — gRPC Infrastructure](#27-servergo-and-utilsgo--grpc-infrastructure)
+    - [2.8 cmd/cinder-csi-plugin/main.go — Binary Entry Point](#28-cmdcinder-csi-pluginmaingo--binary-entry-point)
+  - [3. Architectural Assessment: Extension vs. New Package](#3-architectural-assessment-extension-vs-new-package)
+    - [3.1 Why the Existing Code Cannot Be Extended](#31-why-the-existing-code-cannot-be-extended)
+    - [3.2 Why the NFS-Cinder Driver Cannot Be Extended Either](#32-why-the-nfs-cinder-driver-cannot-be-extended-either)
+    - [3.3 Reusable Components](#33-reusable-components)
+  - [4. Comparison with Manila and NFS-Cinder CSI Drivers](#4-comparison-with-manila-and-nfs-cinder-csi-drivers)
+  - [5. Proposed Folder Structure](#5-proposed-folder-structure)
+    - [5.1 New Directories and Files](#51-new-directories-and-files)
+    - [5.2 Files to Modify in Existing Tree](#52-files-to-modify-in-existing-tree)
+  - [6. Interface Design](#6-interface-design)
+    - [6.1 IOpenStackISCSI Interface](#61-iopenstackiscsi-interface)
+    - [6.2 iSCSI-Specific Config Structs](#62-iscsi-specific-config-structs)
+    - [6.3 Cinder v3 Attachment Lifecycle State Machine](#63-cinder-v3-attachment-lifecycle-state-machine)
+    - [6.4 Architecture Decision: Gophercloud SDK for Cinder v3 Attachments](#64-architecture-decision-gophercloud-sdk-for-cinder-v3-attachments)
+  - [7. Prerequisites and Runtime Validation](#7-prerequisites-and-runtime-validation)
+    - [7.1 Environment Prerequisites](#71-environment-prerequisites)
+    - [7.2 Startup Validation vs. Ongoing Validation](#72-startup-validation-vs-ongoing-validation)
+    - [7.3 Microversion Detection Strategy](#73-microversion-detection-strategy)
+  - [8. CSI RPC Implementation Map](#8-csi-rpc-implementation-map)
+    - [8.1 Identity Service](#81-identity-service)
+    - [8.2 Controller Service](#82-controller-service)
+      - [CreateVolume](#createvolume)
+      - [DeleteVolume](#deletevolume)
+      - [ControllerPublishVolume](#controllerpublishvolume)
+      - [ControllerUnpublishVolume](#controllerunpublishvolume)
+      - [ControllerExpandVolume](#controllerexpandvolume)
+    - [8.3 Node Service](#83-node-service)
+      - [NodeStageVolume](#nodestagevolume)
+      - [NodeUnstageVolume](#nodeunstagevolume)
+      - [NodePublishVolume](#nodepublishvolume)
+      - [NodeUnpublishVolume](#nodeunpublishvolume)
+      - [NodeGetInfo](#nodegetinfo)
+      - [NodeGetVolumeStats](#nodegetvolumestats)
+      - [NodeExpandVolume](#nodeexpandvolume)
+  - [9. K8S CSI Sidecar Architecture](#9-k8s-csi-sidecar-architecture)
+    - [9.1 Controller Deployment Sidecars](#91-controller-deployment-sidecars)
+    - [9.2 Node DaemonSet Sidecars](#92-node-daemonset-sidecars)
+    - [9.3 K8S Calling Chain Reference](#93-k8s-calling-chain-reference)
+  - [10. Build and Deployment](#10-build-and-deployment)
+    - [10.1 Makefile Changes](#101-makefile-changes)
+    - [10.2 Dockerfile Stage](#102-dockerfile-stage)
+      - [10.2.1 Development Phase — Debian-Based Image (Current)](#1021-development-phase--debian-based-image-current)
+      - [10.2.2 Production Phase — 3-Step Distroless Build (TODO)](#1022-production-phase--3-step-distroless-build-todo)
+    - [10.3 Kubernetes Manifests](#103-kubernetes-manifests)
+      - [`hostPID: true` — Security Implications and Alternatives](#hostpid-true--security-implications-and-alternatives)
+    - [10.4 StorageClass, PVC, and CDI Pod Specifications](#104-storageclass-pvc-and-cdi-pod-specifications)
+    - [10.5 Helm Chart](#105-helm-chart)
+    - [10.6 Metrics](#106-metrics)
+    - [10.7 Release Procedure Alignment](#107-release-procedure-alignment)
+  - [11. Development Phases](#11-development-phases)
+    - [Phase 1 — Scaffold and Interface](#phase-1--scaffold-and-interface)
+    - [Phase 2 — Controller Service (Core)](#phase-2--controller-service-core)
+    - [Phase 3 — Node Service (iSCSI Login/Logout)](#phase-3--node-service-iscsi-loginlogout)
+    - [Phase 4 — Integration](#phase-4--integration)
+    - [Phase 5 — CDI Multi-Phase Precopy](#phase-5--cdi-multi-phase-precopy)
+  - [Appendix A: Key Differences — Existing Cinder CSI vs NFS-Cinder CSI vs iSCSI-Cinder CSI](#appendix-a-key-differences--existing-cinder-csi-vs-nfs-cinder-csi-vs-iscsi-cinder-csi)
+  - [Appendix B: File-Level Reuse Decision Matrix](#appendix-b-file-level-reuse-decision-matrix)
 
 ---
 
@@ -2023,7 +2023,7 @@ with Cinder v3 attachment lifecycle.
 
 **Deliverable:** Full CSI driver — volumes can be provisioned and connected via iSCSI on pods.
 
-### Phase 4 — Integration and E2E
+### Phase 4 — Integration
 
 **Goal:** Deploy to real OpenStack (DevStack with LVM iSCSI), run CSI sanity and E2E tests.
 
@@ -2031,20 +2031,8 @@ with Cinder v3 attachment lifecycle.
 |------|----------------------------------------------------|--------------------------------------------|
 | 4.1  | Create Kubernetes manifests                        | `manifests/cinder-iscsi-csi-plugin/`          |
 | 4.2  | Create Helm chart                                  | `charts/cinder-iscsi-csi-plugin/`             |
-| 4.3  | CSI sanity tests                                   | `tests/sanity/cinder-iscsi/`                  |
-| 4.4  | E2E CI script + Ansible playbook                   | `tests/ci-csi-cinder-iscsi-e2e.sh`, `tests/playbooks/test-csi-cinder-iscsi-e2e.yaml` |
-| 4.5  | E2E test: provision → iSCSI login → read/write → delete | (within playbook)                       |
-| 4.6  | E2E test: attachment rotation (CDI stage simulation)| (within playbook)                            |
-| 4.7  | E2E test: CHAP authentication                      | (within playbook)                             |
-| 4.8  | Documentation                                      | `docs/cinder-csi-plugin/migration/`           |
 
-**E2E Testing Convention:** Same as NFS driver — Ansible playbooks orchestrated by bash
-scripts. The CI provisions a VM with DevStack (LVM iSCSI backend, `lvmdriver-1` volume
-type), installs k3s, deploys the CSI driver, and runs the tests. The iSCSI E2E tests
-additionally validate `iscsiadm` login/logout, CHAP authentication, and block device
-discovery via `/dev/disk/by-path/`.
-
-**Deliverable:** Production-ready iSCSI-Cinder CSI driver with tests and docs.
+**Deliverable:** Production-ready iSCSI-Cirnder CSI driver with tests and docs.
 
 ### Phase 5 — CDI Multi-Phase Precopy
 

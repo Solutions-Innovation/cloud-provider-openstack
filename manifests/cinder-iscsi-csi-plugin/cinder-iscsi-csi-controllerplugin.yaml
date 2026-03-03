@@ -1,0 +1,117 @@
+# This YAML file contains CSI Controller Plugin Sidecars
+# external-attacher, external-provisioner, liveness-probe
+
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: csi-cinder-iscsi-controllerplugin
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/part-of: wrc-migration
+    app.kubernetes.io/component: csi-controller
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: csi-cinder-iscsi-controllerplugin
+  template:
+    metadata:
+      labels:
+        app: csi-cinder-iscsi-controllerplugin
+        app.kubernetes.io/part-of: wrc-migration
+        app.kubernetes.io/component: csi-controller
+    spec:
+      serviceAccount: csi-cinder-iscsi-controller-sa
+      containers:
+        - name: csi-attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--timeout=3m"
+            - "--leader-election=true"
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--timeout=3m"
+            - "--leader-election=true"
+            - "--extra-create-metadata"
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          volumeMounts:
+            - mountPath: /var/lib/csi/sockets/pluginproxy/
+              name: socket-dir
+        - name: cinder-iscsi-csi-plugin
+          image: registry.k8s.io/provider-os/cinder-iscsi-csi-plugin:latest
+          args:
+            - /bin/cinder-iscsi-csi-plugin
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--cloud-config=$(CLOUD_CONFIG)"
+            - "--cloud-config=/etc/config/driver.conf"
+            - "--cluster=$(CLUSTER_NAME)"
+            - "--provide-node-service=false"
+            - "--v=1"
+          env:
+            - name: CSI_ENDPOINT
+              value: unix://csi/csi.sock
+            - name: CLOUD_CONFIG
+              value: /etc/config/cloud.conf
+            - name: CLUSTER_NAME
+              value: kubernetes
+          imagePullPolicy: "IfNotPresent"
+          ports:
+            - containerPort: 9808
+              name: healthz
+              protocol: TCP
+          livenessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 10
+            periodSeconds: 60
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: secret-cinderplugin
+              mountPath: /etc/config/cloud.conf
+              subPath: cloud.conf
+              readOnly: true
+            - name: driver-config
+              mountPath: /etc/config/driver.conf
+              subPath: driver.conf
+              readOnly: true
+      volumes:
+        - name: socket-dir
+          emptyDir:
+        - name: secret-cinderplugin
+          secret:
+            secretName: cinder-iscsi-cloud-config
+        - name: driver-config
+          configMap:
+            name: cinder-iscsi-driver-config
