@@ -28,7 +28,7 @@ spec:
       annotations:
         {{- include "cinder-iscsi-csi.controllerplugin.podAnnotations" . | nindent 8 }}
     spec:
-      serviceAccount: csi-cinder-iscsi-controller-sa
+      serviceAccount: {{ include "cinder-iscsi-csi.fullname" . }}-controller-sa
       securityContext:
         {{- toYaml .Values.csi.plugin.controllerPlugin.podSecurityContext | nindent 8 }}
       containers:
