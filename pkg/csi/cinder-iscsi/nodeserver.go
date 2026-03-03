@@ -137,13 +137,15 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	// ── Parse publish context ────────────────────────────────────────────
+	// Values sourced from ControllerPublishVolume → Cinder connection_info.
+	// Design doc §5.3.2 — example from validated Cinder LVM backend:
 	pubCtx := req.GetPublishContext()
-	portal := pubCtx[PublishContextTargetPortal]
-	iqn := pubCtx[PublishContextTargetIQN]
-	lunStr := pubCtx[PublishContextTargetLUN]
-	authMethod := pubCtx[PublishContextAuthMethod]
-	authUser := pubCtx[PublishContextAuthUsername]
-	authPass := pubCtx[PublishContextAuthPassword]
+	portal := pubCtx[PublishContextTargetPortal]   // e.g. "69.167.149.97:3260"
+	iqn := pubCtx[PublishContextTargetIQN]         // e.g. "iqn.2010-10.org.openstack:volume-bf39da68-..."
+	lunStr := pubCtx[PublishContextTargetLUN]      // e.g. "0"
+	authMethod := pubCtx[PublishContextAuthMethod] // e.g. "CHAP"
+	authUser := pubCtx[PublishContextAuthUsername] // e.g. "Hkh2UcACt9zoUxYjnz4U"
+	authPass := pubCtx[PublishContextAuthPassword] // e.g. "trtMa3STYUiMJT7K"
 
 	if portal == "" || iqn == "" || lunStr == "" {
 		return nil, status.Error(codes.InvalidArgument,
@@ -154,6 +156,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Errorf(codes.InvalidArgument, "invalid target_lun %q: %v", lunStr, err)
 	}
 
+	// e.g. "/dev/disk/by-path/ip-69.167.149.97:3260-iscsi-iqn.2010-10.org.openstack:volume-bf39da68-...-lun-0"
 	devicePath := BuildDevicePath(portal, iqn, lun)
 
 	// ── Idempotency: check if session already active + device exists ─────
@@ -173,11 +176,14 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	// ── iSCSI Discovery ──────────────────────────────────────────────────
+	// e.g. iscsiadm -m discovery -t sendtargets -p "69.167.149.97:3260"
 	if err := ns.ISCSI.Discovery(ctx, portal); err != nil {
 		return nil, status.Errorf(codes.Internal, "iSCSI discovery failed: %v", err)
 	}
 
 	// ── Set CHAP auth if required ────────────────────────────────────────
+	// e.g. iscsiadm -m node -T <iqn> -p <portal> --op update
+	//        -n node.session.auth.{authmethod,username,password}
 	if strings.EqualFold(authMethod, "CHAP") {
 		if authUser == "" || authPass == "" {
 			return nil, status.Error(codes.InvalidArgument,
@@ -189,11 +195,14 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	// ── iSCSI Login ──────────────────────────────────────────────────────
+	// e.g. iscsiadm -m node -T <iqn> -p "69.167.149.97:3260" --login
 	if err := ns.ISCSI.Login(ctx, iqn, portal); err != nil {
 		return nil, status.Errorf(codes.Internal, "iSCSI login failed: %v", err)
 	}
 
 	// ── Wait for block device ────────────────────────────────────────────
+	// Poll for devicePath (e.g. /dev/disk/by-path/ip-...-iscsi-...-lun-0)
+	// to appear. Kernel creates the symlink → /dev/sdc after iSCSI login.
 	if err := WaitForDevice(ctx, devicePath, ns.Opts.DeviceWaitTimeout); err != nil {
 		// Attempt cleanup on failure — mirror the Logout + DeleteNode
 		// sequence from NodeUnstageVolume to avoid stale iscsiadm state.
@@ -203,6 +212,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	// ── Store device path at staging target path ─────────────────────────
+	// e.g. write "/dev/disk/by-path/ip-...-lun-0" → <stagingPath>/devicepath
 	if err := ns.writeDevicePath(stagingPath, devicePath); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to write device path file: %v", err)
 	}
@@ -213,6 +223,15 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 // writeDevicePath ensures the staging directory exists and writes the device
 // path string to the devicepath file within it.
+//
+// Example (Cinder LVM backend, volume bf39da68-...):
+//
+//	stagingPath = "/var/lib/kubelet/plugins/kubernetes.io/csi/pv/pvc-xxx/globalmount"   (directory)
+//	devicePath  = "/dev/disk/by-path/ip-69.167.149.97:3260-iscsi-iqn.2010-10.org.openstack:volume-bf39da68-...-lun-0"
+//
+//	Result on disk:
+//	  /var/lib/kubelet/.../globalmount/          ← directory (created by MkdirAll)
+//	  /var/lib/kubelet/.../globalmount/devicepath ← regular file, contents: the devicePath string
 func (ns *nodeServer) writeDevicePath(stagingPath, devicePath string) error {
 	if err := os.MkdirAll(stagingPath, 0750); err != nil {
 		return fmt.Errorf("failed to create staging directory %s: %w", stagingPath, err)
@@ -330,6 +349,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	// ── Read device path from staging ────────────────────────────────────
+	// e.g. read <stagingPath>/devicepath → "/dev/disk/by-path/ip-69.167.149.97:3260-iscsi-iqn...-lun-0"
 	devicePath, err := ns.readDevicePath(stagingPath)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal,
@@ -337,6 +357,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	// ── Resolve symlink to real device path ──────────────────────────────
+	// e.g. /dev/disk/by-path/ip-...-iscsi-...-lun-0 → /dev/sdc
 	realDevicePath, err := filepath.EvalSymlinks(devicePath)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal,
@@ -344,12 +365,20 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	// ── Create the target file for block bind-mount ──────────────────────
+	// targetPath is the kubelet-managed host path where the block device will be exposed.
+	// e.g. targetPath = "/var/lib/kubelet/pods/<pod-uid>/volumeDevices/publish/<pv-name>"
+	// MakeFile creates an empty regular file at targetPath so the bind mount has a target.
 	if err := ns.Mounter.MakeFile(targetPath); err != nil {
 		return nil, status.Errorf(codes.Internal,
 			"failed to create target file %s: %v", targetPath, err)
 	}
 
 	// ── Bind mount device to target ──────────────────────────────────────
+	// e.g. mount --bind /dev/sdc /var/lib/kubelet/pods/<pod-uid>/volumeDevices/publish/<pv-name>
+	// Kubelet then bind-mounts targetPath into the container namespace at the pod spec's
+	// volumeDevices[].devicePath — the path the workload actually opens:
+	//   V2O (CDI importer): /dev/cdi-block-volume
+	//   O2O (NBD pipeline): /dev/nbd-block-volume
 	mounter := ns.Mounter.Mounter()
 	if err := mounter.Mount(realDevicePath, targetPath, "", []string{"bind"}); err != nil {
 		// Clean up created file on failure
@@ -390,6 +419,15 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 // NodeGetVolumeStats returns capacity statistics for the block device at the
 // given volume path.
+//
+// Example (10 GiB Cinder LVM volume):
+//
+//	req.VolumeId   = "bf39da68-f886-4733-8e21-d6099228429b"
+//	req.VolumePath = "/var/lib/kubelet/pods/<pod-uid>/volumeDevices/publish/<pv-name>"
+//	                 (the bind-mounted block device created by NodePublishVolume)
+//
+//	Response for block device:
+//	  Usage: [{ Total: 10737418240, Unit: BYTES }]
 func (ns *nodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	klog.V(4).Infof("NodeGetVolumeStats: volumeID=%s volumePath=%s", req.GetVolumeId(), req.GetVolumePath())
 
