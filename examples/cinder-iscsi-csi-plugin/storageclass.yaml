@@ -1,0 +1,17 @@
+# StorageClass for the cinder-iscsi CSI driver.
+# Uses the LVM iSCSI backend on the target OpenStack cloud.
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-sc-cinder-iscsi
+  labels:
+    app.kubernetes.io/part-of: wrc-migration
+provisioner: cinder-iscsi.csi.windriver.com
+parameters:
+  # Cinder volume type — must match an LVM iSCSI backend type in your cloud.
+  # Run `openstack volume type list` to see available types.
+  # type: lvmdriver-1
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

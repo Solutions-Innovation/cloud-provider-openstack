@@ -1,0 +1,38 @@
+# Raw block volume test using the cinder-iscsi CSI driver.
+# The volume is exposed as a block device (/dev/xvda) inside the pod,
+# rather than a mounted filesystem.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-pvc-cinder-iscsi-block
+spec:
+  accessModes:
+  - ReadWriteOnce
+  volumeMode: Block
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: csi-sc-cinder-iscsi
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-block-cinder-iscsi
+spec:
+  containers:
+  - name: test
+    image: nginx
+    imagePullPolicy: IfNotPresent
+    ports:
+    - containerPort: 80
+      protocol: TCP
+    volumeDevices:
+    - devicePath: /dev/xvda
+      name: csi-data-cinder-iscsi
+  volumes:
+  - name: csi-data-cinder-iscsi
+    persistentVolumeClaim:
+      claimName: csi-pvc-cinder-iscsi-block
+      readOnly: false
