@@ -751,10 +751,10 @@ func TestProbe_NodeOnlyMode_NoISCSIInit(t *testing.T) {
 	ids := &identityServer{
 		Driver:    fakeDriver(),
 		cloud:     nil,
-		iscsiInit: nil, // no iSCSI initiator wired (edge case)
+		iscsiInit: nil, // no iSCSI initiator wired — SetupNodeService not called
 	}
 
 	resp, err := ids.Probe(context.Background(), &csi.ProbeRequest{})
 	assert.NoError(t, err)
-	assert.True(t, resp.Ready.Value)
+	assert.False(t, resp.Ready.Value, "should report not-ready when iscsiInit is nil in node-only mode")
 }
