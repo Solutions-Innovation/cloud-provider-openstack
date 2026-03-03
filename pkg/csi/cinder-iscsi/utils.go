@@ -34,6 +34,7 @@ import (
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
 	"google.golang.org/grpc"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder-iscsi/openstack"
+	"k8s.io/cloud-provider-openstack/pkg/util/mount"
 	"k8s.io/klog/v2"
 )
 
@@ -88,9 +89,12 @@ func NewIdentityServer(d *Driver, cloud openstack.IOpenStackISCSI) *identityServ
 }
 
 // NewNodeServer creates a new iSCSI node server.
-func NewNodeServer(d *Driver) *nodeServer {
+func NewNodeServer(d *Driver, opts openstack.ISCSIOpts, iscsiInit ISCSIInitiator, mounter mount.IMount) *nodeServer {
 	return &nodeServer{
-		Driver: d,
+		Driver:  d,
+		Opts:    opts,
+		ISCSI:   iscsiInit,
+		Mounter: mounter,
 	}
 }
 

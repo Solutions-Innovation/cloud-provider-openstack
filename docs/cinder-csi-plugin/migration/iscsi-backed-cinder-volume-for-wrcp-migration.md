@@ -1689,12 +1689,18 @@ delete-volume-mode = retain
 
 ### 8.2 Network Requirements
 
-| Network Path | Protocol | Port | Purpose |
-|-------------|----------|------|---------|
-| WRCP Worker → iSCSI Target | iSCSI | **3260** | Block I/O data transfer (iscsiadm login + reads/writes) |
-| WRCP Worker → vCenter | HTTPS | 443 | VDDK data transfer (CDI importer) |
-| WRC Orchestrator → OpenStack API | HTTPS | 5000, 8776 | Keystone auth, Cinder volume/attachment API |
-| WRCP Worker → OpenStack Keystone | HTTPS | 5000 | Authentication (CSI controller) |
+| Requirement | Path | Purpose |
+|-------------|------|---------|
+| **WRCP/WRC ↔ Source Hypervisor** | Management network | vCenter / ESXi must be reachable from WRCP worker nodes for VDDK data transfer (`CDI importer` connects via HTTPS 443) |
+| **WRCP/WRC → iSCSI Storage Target** | Storage network | iSCSI target portal must be routable from WRCP/WRC worker hosts for `iscsiadm` login and block I/O (TCP 3260) |
+| **WRCP/WRC → Target OpenStack API** | Management network | Cinder API calls for volume provisioning & attachment lifecycle (Keystone 5000, Cinder 8776) |
+| **Firewall Rules** | TCP 3260 from WRCP/WRC worker nodes to iSCSI target portal(s) | Each worker establishes one TCP session per volume to the iSCSI target |
+
+**iSCSI Port Simplicity:**
+
+- Unlike the NFS driver (which requires a dynamic NBD port range for concurrent migrations), the iSCSI driver uses a **single well-known port (3260)** for all volume sessions.
+- Multiple concurrent migrations from the same worker share port 3260 — each migration opens an independent iSCSI session (differentiated by target IQN + LUN, not by port).
+- No dynamic port allocation or NodePort mapping is required.
 
 > **Note:** Unlike the NFS driver, there is **no Nova API dependency** (port 8774) since the iSCSI driver uses Cinder v3 attachments instead of Shadow VMs.
 

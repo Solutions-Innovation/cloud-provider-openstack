@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder-iscsi/openstack"
+	"k8s.io/cloud-provider-openstack/pkg/util/mount"
 	"k8s.io/cloud-provider-openstack/pkg/version"
 	"k8s.io/klog/v2"
 )
@@ -167,9 +168,25 @@ func (d *Driver) SetupControllerService(cloud openstack.IOpenStackISCSI) {
 }
 
 // SetupNodeService configures the node service.
-func (d *Driver) SetupNodeService() {
+// opts carries the [ISCSI] section from driver.conf.
+func (d *Driver) SetupNodeService(opts openstack.ISCSIOpts) {
 	klog.Info("Providing node service")
-	d.ns = NewNodeServer(d)
+
+	// Apply defaults for zero-valued timeout fields
+	if opts.LoginTimeout <= 0 {
+		opts.LoginTimeout = 30
+	}
+	if opts.DeviceWaitTimeout <= 0 {
+		opts.DeviceWaitTimeout = 30
+	}
+
+	iscsiInit := NewISCSIInitiator(opts.LoginTimeout)
+	mounter := mount.GetMountProvider()
+
+	d.ns = NewNodeServer(d, opts, iscsiInit, mounter)
+
+	// Wire ISCSIInitiator into the identity server for node-mode Probe() health checks
+	d.ids.iscsiInit = iscsiInit
 }
 
 // Run starts the gRPC server and blocks until stopped.

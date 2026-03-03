@@ -101,7 +101,15 @@ func handle() {
 	}
 
 	if provideNodeService {
-		d.SetupNodeService()
+		// Load ISCSI opts from driver.conf (same cloud-config files).
+		// In node-only mode cloud-config may contain only driver.conf;
+		// GetConfigFromFiles is tolerant of missing [Global] sections.
+		cfg, err := openstack.GetConfigFromFiles(cloudConfig)
+		if err != nil {
+			klog.Warningf("Could not parse driver config for ISCSI opts: %v (using defaults)", err)
+			cfg = openstack.ISCSICinderConfig{}
+		}
+		d.SetupNodeService(cfg.ISCSI)
 	}
 
 	d.Run()
