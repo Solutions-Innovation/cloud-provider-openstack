@@ -1,0 +1,12 @@
+{{- if and .Values.driverConfig.enabled .Values.driverConfig.create }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.driverConfig.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cinder-iscsi-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-config
+data:
+  {{- toYaml .Values.driverConfig.data | nindent 2 }}
+{{- end }}

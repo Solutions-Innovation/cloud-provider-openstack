@@ -1,0 +1,152 @@
+extraLabels: {}
+
+nameOverride: ""
+fullnameOverride: ""
+timeout: 3m
+
+csi:
+  attacher:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-attacher
+      tag: v4.7.0
+      pullPolicy: IfNotPresent
+    resources: {}
+    extraArgs: {}
+    extraEnv: []
+  provisioner:
+    topology: "false"
+    image:
+      repository: registry.k8s.io/sig-storage/csi-provisioner
+      tag: v5.1.0
+      pullPolicy: IfNotPresent
+    resources: {}
+    extraArgs: {}
+    extraEnv: []
+  livenessprobe:
+    image:
+      repository: registry.k8s.io/sig-storage/livenessprobe
+      tag: v2.14.0
+      pullPolicy: IfNotPresent
+    failureThreshold: 5
+    initialDelaySeconds: 10
+    timeoutSeconds: 10
+    periodSeconds: 60
+    resources: {}
+    extraArgs: {}
+    extraEnv: []
+  nodeDriverRegistrar:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
+      tag: v2.12.0
+      pullPolicy: IfNotPresent
+    resources: {}
+    extraArgs: {}
+    extraEnv: []
+  plugin:
+    image:
+      repository: registry.k8s.io/provider-os/cinder-iscsi-csi-plugin
+      pullPolicy: IfNotPresent
+      tag:  # defaults to .Chart.AppVersion
+    volumes: []
+    volumeMounts: []
+    nodePlugin:
+      dnsPolicy: ClusterFirstWithHostNet
+      hostPID: true
+      podAnnotations: {}
+      podLabels: {}
+      podSecurityContext: {}
+      securityContext: {}
+      affinity: {}
+      nodeSelector: {}
+      tolerations:
+        - operator: Exists
+      kubeletDir: /var/lib/kubelet
+      extraArgs: {}
+    controllerPlugin:
+      replicas: 1
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 0
+          maxSurge: 1
+      podAnnotations: {}
+      podLabels: {}
+      podSecurityContext: {}
+      securityContext: {}
+      affinity: {}
+      nodeSelector: {}
+      tolerations: []
+      extraArgs: {}
+    resources: {}
+    httpEndpoint:
+      enabled: false
+      port: 8080
+    extraArgs: {}
+    extraEnv: []
+
+# Log verbosity level.
+logVerbosityLevel: 2
+
+# Secret for OpenStack cloud credentials (cloud.conf).
+# Options:
+# 1) Create from values: set enabled=true, create=true, provide data below
+# 2) Use existing secret: set enabled=true, create=false, set name
+# 3) Mount from host: set enabled=false, hostMount=true
+# 4) Inject via agent: set enabled=false, hostMount=false
+secret:
+  enabled: false
+  hostMount: true
+  create: false
+  filename: cloud.conf
+#  name: cinder-iscsi-csi-cloud-config
+#  data:
+#    cloud.conf: |-
+#      [Global]
+#      auth-url=http://openstack-control-plane
+#      user-id=user-id
+#      password=password
+#      trust-id=trust-id
+#      region=RegionOne
+#      ca-file=/etc/cacert/ca-bundle.crt
+
+# ConfigMap for iSCSI driver configuration (driver.conf).
+# Contains no credentials — managed independently from the Secret.
+driverConfig:
+  enabled: true
+  create: true
+  name: cinder-iscsi-driver-config
+  data:
+    driver.conf: |-
+      [ISCSI]
+      enable-multipath = false
+      chap-auth-enabled = true
+      login-timeout = 30
+      device-wait-timeout = 30
+      iscsi-interface = default
+      storage-interface =
+      platform = x86_64
+      os-type = linux2
+
+      [Volume]
+      create-timeout = 300
+      detach-timeout = 120
+      delete-volume-mode = retain
+
+storageClass:
+  enabled: true
+  name: cinder-iscsi-migration
+  isDefault: false
+  reclaimPolicy: Delete
+  volumeBindingMode: Immediate
+  parameters:
+    type: pure-iscsi
+    availability: nova
+
+# Cluster identifier — appended to volume metadata.
+clusterID: "kubernetes"
+
+priorityClassName: ""
+
+imagePullSecrets: []
+
+commonAnnotations: {}

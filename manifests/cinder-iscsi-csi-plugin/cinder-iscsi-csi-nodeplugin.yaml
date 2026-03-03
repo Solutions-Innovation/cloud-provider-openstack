@@ -1,0 +1,142 @@
+# This YAML file contains driver-registrar & csi driver nodeplugin API objects,
+# which are necessary to run csi nodeplugin for cinder-iscsi.
+
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: csi-cinder-iscsi-nodeplugin
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/part-of: wrc-migration
+    app.kubernetes.io/component: csi-node
+spec:
+  selector:
+    matchLabels:
+      app: csi-cinder-iscsi-nodeplugin
+  template:
+    metadata:
+      labels:
+        app: csi-cinder-iscsi-nodeplugin
+        app.kubernetes.io/part-of: wrc-migration
+        app.kubernetes.io/component: csi-node
+    spec:
+      tolerations:
+        - operator: Exists
+      serviceAccount: csi-cinder-iscsi-node-sa
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: DRIVER_REG_SOCK_PATH
+              value: /var/lib/kubelet/plugins/cinder-iscsi.csi.windriver.com/csi.sock
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
+          args:
+            - --csi-address=/csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: cinder-iscsi-csi-plugin
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          image: registry.k8s.io/provider-os/cinder-iscsi-csi-plugin:latest
+          args:
+            - /bin/cinder-iscsi-csi-plugin
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--cloud-config=/etc/config/driver.conf"
+            - "--provide-controller-service=false"
+            - "--v=1"
+          env:
+            - name: CSI_ENDPOINT
+              value: unix://csi/csi.sock
+          imagePullPolicy: "IfNotPresent"
+          ports:
+            - containerPort: 9808
+              name: healthz
+              protocol: TCP
+          livenessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: "Bidirectional"
+            - name: pods-probe-dir
+              mountPath: /dev
+              mountPropagation: "HostToContainer"
+            - name: iscsi-config
+              mountPath: /etc/iscsi
+            - name: iscsi-lib
+              mountPath: /var/lib/iscsi
+            - name: iscsi-run-lock
+              mountPath: /run/lock/iscsi
+            - name: sys-dir
+              mountPath: /sys
+              readOnly: true
+            - name: driver-config
+              mountPath: /etc/config/driver.conf
+              subPath: driver.conf
+              readOnly: true
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/cinder-iscsi.csi.windriver.com
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+        - name: pods-probe-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: iscsi-config
+          hostPath:
+            path: /etc/iscsi
+            type: Directory
+        - name: iscsi-lib
+          hostPath:
+            path: /var/lib/iscsi
+            type: Directory
+        - name: iscsi-run-lock
+          hostPath:
+            path: /run/lock/iscsi
+            type: DirectoryOrCreate
+        - name: sys-dir
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: driver-config
+          configMap:
+            name: cinder-iscsi-driver-config

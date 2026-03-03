@@ -1,0 +1,9 @@
+apiVersion: v1
+appVersion: v1.35.0
+description: iSCSI-backed Cinder CSI Chart for OpenStack (WRC Migration)
+name: openstack-cinder-iscsi-csi
+version: 2.35.0
+home: https://github.com/kubernetes/cloud-provider-openstack
+icon: https://github.com/kubernetes/kubernetes/blob/master/logo/logo.png
+maintainers:
+  - name: wrc-migration-team

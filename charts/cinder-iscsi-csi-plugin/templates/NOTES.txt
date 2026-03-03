@@ -1,0 +1,31 @@
+iSCSI-backed Cinder CSI plugin has been installed.
+
+{{- if .Values.storageClass.enabled }}
+StorageClass "{{ .Values.storageClass.name }}" has been created with:
+  provisioner: cinder-iscsi.csi.windriver.com
+  reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+  volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+
+Use this StorageClass for iSCSI-backed block PVCs:
+
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: my-iscsi-pvc
+  spec:
+    accessModes:
+      - ReadWriteOnce
+    volumeMode: Block
+    resources:
+      requests:
+        storage: 10Gi
+    storageClassName: {{ .Values.storageClass.name }}
+{{- end }}
+
+{{- if .Values.driverConfig.enabled }}
+
+Driver configuration (driver.conf) is managed via ConfigMap "{{ .Values.driverConfig.name }}".
+{{- end }}
+
+NOTE: This driver provides raw block volumes only (volumeMode: Block).
+      Filesystem volumes are not supported.
