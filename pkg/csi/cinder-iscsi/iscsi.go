@@ -263,7 +263,7 @@ func WaitForDevice(ctx context.Context, devicePath string, timeoutSeconds int) e
 	}
 
 	if timeoutSeconds <= 0 {
-		timeoutSeconds = 30
+		timeoutSeconds = defaultTimeoutSeconds
 	}
 	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
 	ticker := time.NewTicker(1 * time.Second)

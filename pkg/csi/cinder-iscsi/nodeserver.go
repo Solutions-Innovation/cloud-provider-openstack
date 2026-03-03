@@ -21,6 +21,7 @@ package iscsi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -224,6 +225,8 @@ func (ns *nodeServer) writeDevicePath(stagingPath, devicePath string) error {
 }
 
 // readDevicePath reads the device path string from the staging directory.
+// The underlying error is wrapped with %w so callers can inspect it with
+// errors.Is(err, os.ErrNotExist) to distinguish "never staged" from read failures.
 func (ns *nodeServer) readDevicePath(stagingPath string) (string, error) {
 	dpFile := filepath.Join(stagingPath, devicePathFile)
 	data, err := os.ReadFile(dpFile)
@@ -250,17 +253,14 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	}
 
 	// ── Read device info from staging path ───────────────────────────────
-	dpFile := filepath.Join(stagingPath, devicePathFile)
-	devicePathBytes, err := os.ReadFile(dpFile)
+	devicePath, err := ns.readDevicePath(stagingPath)
 	if err != nil {
-		// If the file doesn't exist, the volume was never staged or already unstaged
-		if os.IsNotExist(err) {
-			klog.V(2).Infof("NodeUnstageVolume: device path file %s does not exist for volume %s (idempotent)", dpFile, volumeID)
+		if errors.Is(err, os.ErrNotExist) {
+			klog.V(2).Infof("NodeUnstageVolume: device path file does not exist for volume %s (idempotent)", volumeID)
 			return &csi.NodeUnstageVolumeResponse{}, nil
 		}
 		return nil, status.Errorf(codes.Internal, "failed to read device path: %v", err)
 	}
-	devicePath := strings.TrimSpace(string(devicePathBytes))
 
 	// ── Parse portal + IQN from device path ──────────────────────────────
 	portal, iqn, _, err := ParseDevicePath(devicePath)
@@ -279,6 +279,7 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	}
 
 	// ── Cleanup staging directory ────────────────────────────────────────
+	dpFile := filepath.Join(stagingPath, devicePathFile)
 	if err := os.Remove(dpFile); err != nil && !os.IsNotExist(err) {
 		klog.Warningf("NodeUnstageVolume: failed to remove %s: %v", dpFile, err)
 	}

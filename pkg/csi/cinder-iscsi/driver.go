@@ -34,6 +34,10 @@ import (
 const (
 	driverName  = "cinder-iscsi.csi.windriver.com"
 	topologyKey = "topology." + driverName + "/zone"
+
+	// defaultTimeoutSeconds is the default timeout for iSCSI login and
+	// device wait operations when no explicit value is configured.
+	defaultTimeoutSeconds = 30
 )
 
 var (
@@ -174,10 +178,10 @@ func (d *Driver) SetupNodeService(opts openstack.ISCSIOpts) {
 
 	// Apply defaults for zero-valued timeout fields
 	if opts.LoginTimeout <= 0 {
-		opts.LoginTimeout = 30
+		opts.LoginTimeout = defaultTimeoutSeconds
 	}
 	if opts.DeviceWaitTimeout <= 0 {
-		opts.DeviceWaitTimeout = 30
+		opts.DeviceWaitTimeout = defaultTimeoutSeconds
 	}
 
 	iscsiInit := NewISCSIInitiator(opts.LoginTimeout)
