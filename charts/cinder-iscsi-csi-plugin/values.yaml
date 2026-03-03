@@ -97,16 +97,22 @@ logVerbosityLevel: 2
 
 # Secret for OpenStack cloud credentials (cloud.conf).
 # Options:
-# 1) Create from values: set enabled=true, create=true, provide data below
-# 2) Use existing secret: set enabled=true, create=false, set name
+# 1) Use existing secret (default): set enabled=true, create=false, set name
+# 2) Create from values: set enabled=true, create=true, provide data below
 # 3) Mount from host: set enabled=false, hostMount=true
 # 4) Inject via agent: set enabled=false, hostMount=false
+#
+# Default: enabled=true expects a pre-existing Secret named
+# "cinder-iscsi-csi-cloud-config" in the release namespace.
+# Create it before install:
+#   kubectl create secret generic cinder-iscsi-csi-cloud-config \
+#     --from-file=cloud.conf=/path/to/cloud.conf -n kube-system
 secret:
-  enabled: false
-  hostMount: true
+  enabled: true
+  hostMount: false
   create: false
   filename: cloud.conf
-#  name: cinder-iscsi-csi-cloud-config
+  name: cinder-iscsi-csi-cloud-config
 #  data:
 #    cloud.conf: |-
 #      [Global]
