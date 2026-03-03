@@ -212,12 +212,17 @@ func TestNodeStageVolume_IdempotentSessionActive(t *testing.T) {
 	stagingDir := t.TempDir()
 	portal := "10.0.0.1:3260"
 	iqn := "iqn.2010-10.org.openstack:volume-vol-001"
+
+	// Override devicePathPrefix to avoid writing to the real /dev/disk/by-path/.
+	origPrefix := devicePathPrefix
+	devicePathPrefix = t.TempDir()
+	t.Cleanup(func() { devicePathPrefix = origPrefix })
+
 	devicePath := BuildDevicePath(portal, iqn, 1)
 
 	// Create the device path so os.Stat succeeds for the idempotency check
 	assert.NoError(t, os.MkdirAll(filepath.Dir(devicePath), 0755))
 	assert.NoError(t, os.WriteFile(devicePath, []byte("x"), 0644))
-	defer os.RemoveAll("/dev/disk/by-path")
 
 	// Mock: session is active
 	iscsiMock.On("IsSessionActive", mock.Anything, iqn, portal).Return(true, nil)
@@ -248,12 +253,17 @@ func TestNodeStageVolume_Success(t *testing.T) {
 	stagingDir := t.TempDir()
 	portal := "10.0.0.1:3260"
 	iqn := "iqn.2010-10.org.openstack:volume-vol-001"
+
+	// Override devicePathPrefix to avoid writing to the real /dev/disk/by-path/.
+	origPrefix := devicePathPrefix
+	devicePathPrefix = t.TempDir()
+	t.Cleanup(func() { devicePathPrefix = origPrefix })
+
 	devicePath := BuildDevicePath(portal, iqn, 1)
 
 	// Create the device file so WaitForDevice succeeds
 	assert.NoError(t, os.MkdirAll(filepath.Dir(devicePath), 0755))
 	assert.NoError(t, os.WriteFile(devicePath, []byte("x"), 0644))
-	defer os.RemoveAll("/dev/disk/by-path")
 
 	// Mock expectations
 	iscsiMock.On("IsSessionActive", mock.Anything, iqn, portal).Return(false, nil)
@@ -286,12 +296,17 @@ func TestNodeStageVolume_WithCHAP(t *testing.T) {
 	stagingDir := t.TempDir()
 	portal := "10.0.0.1:3260"
 	iqn := "iqn.2010-10.org.openstack:volume-vol-001"
+
+	// Override devicePathPrefix to avoid writing to the real /dev/disk/by-path/.
+	origPrefix := devicePathPrefix
+	devicePathPrefix = t.TempDir()
+	t.Cleanup(func() { devicePathPrefix = origPrefix })
+
 	devicePath := BuildDevicePath(portal, iqn, 1)
 
 	// Create the device file so WaitForDevice succeeds
 	assert.NoError(t, os.MkdirAll(filepath.Dir(devicePath), 0755))
 	assert.NoError(t, os.WriteFile(devicePath, []byte("x"), 0644))
-	defer os.RemoveAll("/dev/disk/by-path")
 
 	iscsiMock.On("IsSessionActive", mock.Anything, iqn, portal).Return(false, nil)
 	iscsiMock.On("Discovery", mock.Anything, portal).Return(nil)
