@@ -350,6 +350,36 @@ func TestNodeStageVolume_CHAPMissingCredentials(t *testing.T) {
 	assert.Contains(t, err.Error(), "auth_username or auth_password missing")
 }
 
+func TestNodeStageVolume_WaitForDeviceTimeout(t *testing.T) {
+	iscsiMock := &ISCSIInitiatorMock{}
+	mountMock := &mountutil.MountMock{}
+	ns := fakeNodeServer(iscsiMock, mountMock)
+	ns.Opts.DeviceWaitTimeout = 1 // 1 second — device file never created
+
+	portal := "10.0.0.1:3260"
+	iqn := "iqn.2010-10.org.openstack:volume-vol-001"
+
+	iscsiMock.On("IsSessionActive", mock.Anything, iqn, portal).Return(false, nil)
+	iscsiMock.On("Discovery", mock.Anything, portal).Return(nil)
+	iscsiMock.On("Login", mock.Anything, iqn, portal).Return(nil)
+	// Cleanup calls after WaitForDevice failure
+	iscsiMock.On("Logout", mock.Anything, iqn, portal).Return(nil)
+	iscsiMock.On("DeleteNode", mock.Anything, iqn, portal).Return(nil)
+
+	_, err := ns.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-001",
+		StagingTargetPath: t.TempDir(),
+		VolumeCapability:  blockCapability(),
+		PublishContext:    stagePublishContext(),
+	})
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "did not appear")
+	// Verify cleanup: both Logout and DeleteNode were called
+	iscsiMock.AssertCalled(t, "Logout", mock.Anything, iqn, portal)
+	iscsiMock.AssertCalled(t, "DeleteNode", mock.Anything, iqn, portal)
+}
+
 // ── NodeUnstageVolume Tests ──────────────────────────────────────────────────
 
 func TestNodeUnstageVolume_MissingVolumeID(t *testing.T) {
@@ -401,6 +431,29 @@ func TestNodeUnstageVolume_Success(t *testing.T) {
 	_, statErr := os.Stat(filepath.Join(stagingDir, devicePathFile))
 	assert.True(t, os.IsNotExist(statErr))
 
+	iscsiMock.AssertExpectations(t)
+}
+
+func TestNodeUnstageVolume_LogoutFails(t *testing.T) {
+	iscsiMock := &ISCSIInitiatorMock{}
+	ns := fakeNodeServer(iscsiMock, &mountutil.MountMock{})
+
+	stagingDir := t.TempDir()
+	portal := "10.0.0.1:3260"
+	iqn := "iqn.2010-10.org.openstack:volume-vol-001"
+	devicePath := BuildDevicePath(portal, iqn, 1)
+
+	assert.NoError(t, os.WriteFile(filepath.Join(stagingDir, devicePathFile), []byte(devicePath), 0640))
+
+	iscsiMock.On("Logout", mock.Anything, iqn, portal).Return(fmt.Errorf("iscsiadm: session not found"))
+
+	_, err := ns.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+		VolumeId:          "vol-001",
+		StagingTargetPath: stagingDir,
+	})
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "iSCSI logout failed")
 	iscsiMock.AssertExpectations(t)
 }
 
