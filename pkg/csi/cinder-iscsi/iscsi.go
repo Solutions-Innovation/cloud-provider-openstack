@@ -215,7 +215,9 @@ func (i *iscsiadmInitiator) CheckIscsiadm(ctx context.Context) error {
 // ── Device Path Helpers ──────────────────────────────────────────────────────
 
 // devicePathPrefix is the Linux by-path directory where iSCSI device symlinks appear.
-const devicePathPrefix = "/dev/disk/by-path"
+// This is a var (not const) so tests can override it with t.TempDir() to avoid
+// writing to the real /dev/disk/by-path/ directory on the host.
+var devicePathPrefix = "/dev/disk/by-path"
 
 // BuildDevicePath constructs the expected /dev/disk/by-path/ symlink for an
 // iSCSI target. The format is defined by the Linux kernel iSCSI transport:
@@ -230,8 +232,10 @@ func BuildDevicePath(portal, iqn string, lun int) string {
 // the literal substring "-iscsi-", the first group would greedily consume part
 // of the IQN. This is safe because real IQNs (RFC 3720) use the format
 // "iqn.yyyy-mm.reverse-domain:identifier" and never contain "-iscsi-".
+// This regex uses a hardcoded prefix (not the var) because ParseDevicePath
+// operates on stored strings, not the filesystem.
 var devicePathRe = regexp.MustCompile(
-	`^` + regexp.QuoteMeta(devicePathPrefix) + `/ip-(.+)-iscsi-(.+)-lun-(\d+)$`,
+	`^/dev/disk/by-path/ip-(.+)-iscsi-(.+)-lun-(\d+)$`,
 )
 
 // ParseDevicePath is the inverse of BuildDevicePath. It extracts the portal,
