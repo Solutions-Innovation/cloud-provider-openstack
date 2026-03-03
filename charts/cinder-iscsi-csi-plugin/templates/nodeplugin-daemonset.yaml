@@ -117,13 +117,13 @@ spec:
               name: healthz
               protocol: TCP
           livenessProbe:
-            failureThreshold: {{ .Values.csi.livenessprobe.failureThreshold }}
+            failureThreshold: {{ .Values.csi.livenessprobe.node.failureThreshold | default .Values.csi.livenessprobe.failureThreshold }}
             httpGet:
               path: /healthz
               port: healthz
-            initialDelaySeconds: {{ .Values.csi.livenessprobe.initialDelaySeconds }}
-            timeoutSeconds: {{ .Values.csi.livenessprobe.timeoutSeconds }}
-            periodSeconds: {{ .Values.csi.livenessprobe.periodSeconds }}
+            initialDelaySeconds: {{ .Values.csi.livenessprobe.node.initialDelaySeconds | default .Values.csi.livenessprobe.initialDelaySeconds }}
+            timeoutSeconds: {{ .Values.csi.livenessprobe.node.timeoutSeconds | default .Values.csi.livenessprobe.timeoutSeconds }}
+            periodSeconds: {{ .Values.csi.livenessprobe.node.periodSeconds | default .Values.csi.livenessprobe.periodSeconds }}
           volumeMounts:
             - name: socket-dir
               mountPath: /csi

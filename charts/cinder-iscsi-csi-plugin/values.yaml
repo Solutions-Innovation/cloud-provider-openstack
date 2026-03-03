@@ -31,6 +31,14 @@ csi:
     initialDelaySeconds: 10
     timeoutSeconds: 10
     periodSeconds: 60
+    # Node-specific overrides — node plugins need faster failure detection
+    # than controller plugins. These override the shared values above for
+    # the node DaemonSet only.
+    node:
+      failureThreshold: 5
+      initialDelaySeconds: 10
+      timeoutSeconds: 3
+      periodSeconds: 10
     resources: {}
     extraArgs: {}
     extraEnv: []
