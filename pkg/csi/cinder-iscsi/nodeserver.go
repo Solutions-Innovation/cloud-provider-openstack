@@ -313,7 +313,10 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 	// ── Block-only enforcement ───────────────────────────────────────────
 	volCap := req.GetVolumeCapability()
-	if volCap != nil && volCap.GetMount() != nil {
+	if volCap == nil {
+		return nil, status.Error(codes.InvalidArgument, "VolumeCapability must be provided")
+	}
+	if volCap.GetMount() != nil {
 		return nil, status.Error(codes.InvalidArgument,
 			"cinder-iscsi.csi.windriver.com: filesystem (mount) volume mode is not supported; "+
 				"this driver only supports volumeMode: Block for migration workloads")
