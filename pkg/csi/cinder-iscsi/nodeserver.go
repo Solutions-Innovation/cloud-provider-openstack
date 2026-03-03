@@ -308,6 +308,14 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Error(codes.InvalidArgument, "TargetPath must be provided")
 	}
 
+	// ── Block-only enforcement ───────────────────────────────────────────
+	volCap := req.GetVolumeCapability()
+	if volCap != nil && volCap.GetMount() != nil {
+		return nil, status.Error(codes.InvalidArgument,
+			"cinder-iscsi.csi.windriver.com: filesystem (mount) volume mode is not supported; "+
+				"this driver only supports volumeMode: Block for migration workloads")
+	}
+
 	// ── Idempotency: check if already bind-mounted ───────────────────────
 	notMounted, err := ns.Mounter.IsLikelyNotMountPointAttach(targetPath)
 	if err == nil && !notMounted {
