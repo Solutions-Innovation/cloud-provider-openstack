@@ -194,8 +194,10 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 	// ── Wait for block device ────────────────────────────────────────────
 	if err := WaitForDevice(ctx, devicePath, ns.Opts.DeviceWaitTimeout); err != nil {
-		// Attempt cleanup on failure
+		// Attempt cleanup on failure — mirror the Logout + DeleteNode
+		// sequence from NodeUnstageVolume to avoid stale iscsiadm state.
 		_ = ns.ISCSI.Logout(ctx, iqn, portal)
+		_ = ns.ISCSI.DeleteNode(ctx, iqn, portal)
 		return nil, status.Errorf(codes.Internal, "device %s did not appear: %v", devicePath, err)
 	}
 
