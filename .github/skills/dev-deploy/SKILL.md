@@ -20,6 +20,34 @@ Activate this skill when the user says any of:
 Do NOT activate for local-only builds (use `/inner-loop` instead) or for
 production releases.
 
+## Namespace handling rule
+
+**Consumer objects** (PVCs, Pods, test workloads, etc.) — namespace-scoped
+resources that are NOT part of the CSI driver infrastructure — MUST be applied
+to the **`default` namespace**, not `kube-system`. If a specific use case
+requires `kube-system` for a consumer object, **ask the user for consent**
+before proceeding.
+
+**Driver infrastructure** (Deployments, DaemonSets, ServiceAccounts, Secrets,
+RBAC for the CSI controller/node plugins) defaults to **`kube-system`**. Before
+deploying driver infrastructure, **notify the user** that manifests will be
+applied to `kube-system` and **ask for consent**.
+
+Examples:
+- PVC, Pod, nginx test → `default` namespace (no flag needed, or `-n default`)
+- StorageClass, CSIDriver → cluster-scoped (no namespace)
+- Controller Deployment, Node DaemonSet, RBAC, Secret → `kube-system` (ask consent)
+
+## Path handling rule
+
+**ALWAYS use `$HOME` instead of `~`** in all shell commands and file paths.
+The tilde `~` is a shell expansion that does NOT work reliably in all contexts
+(e.g., `kubectl --kubeconfig=~/.kube/config` fails because kubectl does not
+expand `~`). Use `$HOME/.kube/config-staging` everywhere.
+
+When the user provides a path containing `~`, silently replace it with `$HOME`
+before using it in any command.
+
 ## Workflow
 
 ### Step 1: Gather environment (interactive)
@@ -50,10 +78,12 @@ single call (max 4):
 - Header: `Kubeconfig`
 - Question: `Path to staging kubeconfig? Leave empty to generate one.`
 - Options:
-  - `~/.kube/config-staging` (recommended)
+  - `$HOME/.kube/config-staging` (recommended)
   - `Use current KUBECONFIG`
 - If the user provides an existing path AND the file exists, skip generation.
 - If empty or file does not exist, proceed to kubeconfig generation (Step 2).
+- **Important:** If the user provides a path with `~`, replace it with `$HOME`
+  before using in any command (see Path handling rule above).
 
 **Question 4 — K8s API server** (only if generating kubeconfig, freeform):
 - Header: `API Server`
@@ -65,13 +95,47 @@ single call (max 4):
 
 If Step 1 determined a kubeconfig needs to be generated:
 
-1. **Ask for the ServiceAccount token** using `ask_questions`:
-   - Header: `SA Token`
-   - Question: `Paste the ServiceAccount token for the staging cluster.
-     To create one: kubectl -n kube-system create token admin --duration=87600h`
-   - Freeform input, no options.
+1. **Ask how to obtain a token** using `ask_questions`:
+   - Header: `Token`
+   - Question: `How would you like to authenticate to the staging cluster?`
+   - Options:
+     - `I have a token ready — let me paste it` (recommended)
+     - `Create a new ServiceAccount + token for me`
+   - allowFreeformInput: true
 
-2. **Write the kubeconfig file** to the path from Step 1 using `run_in_terminal`:
+2. **If "Create a new ServiceAccount + token":**
+
+   This requires an **existing** kubeconfig with cluster-admin access (e.g.,
+   the default `~/.kube/config` or `admin.conf` from the cluster). Ask:
+
+   - Header: `Admin KC`
+   - Question: `Path to an existing admin kubeconfig that can reach the cluster?
+     (e.g., ~/.kube/config, /etc/kubernetes/admin.conf)`
+   - allowFreeformInput: true
+
+   Then create a dedicated ServiceAccount and long-lived token:
+   ```bash
+   export KUBECONFIG=<admin_kubeconfig_path>
+   kubectl -n kube-system create serviceaccount csi-deployer --dry-run=client -o yaml | kubectl apply -f -
+   kubectl create clusterrolebinding csi-deployer-admin \
+     --clusterrole=cluster-admin \
+     --serviceaccount=kube-system:csi-deployer \
+     --dry-run=client -o yaml | kubectl apply -f -
+   SA_TOKEN=$(kubectl -n kube-system create token csi-deployer --duration=87600h)
+   echo "Token created successfully"
+   ```
+
+   If any command fails, report the error and stop.
+   Capture `SA_TOKEN` from the output and use it in the kubeconfig below.
+
+3. **If "I have a token ready":**
+   - Ask for the token using `ask_questions`:
+     - Header: `SA Token`
+     - Question: `Paste the ServiceAccount token for the staging cluster.`
+     - Freeform input, no options.
+   - Set `SA_TOKEN` to the pasted value.
+
+4. **Write the kubeconfig file** to the path from Step 1 using `run_in_terminal`:
 
 ```yaml
 apiVersion: v1
@@ -94,13 +158,14 @@ users:
     token: <SA_TOKEN>
 ```
 
-Use `cat <<'EOF' > <kubeconfig_path>` to write it. Set permissions:
-`chmod 600 <kubeconfig_path>`.
+Use `cat <<'EOF' > <kubeconfig_path>` to write it (ensure `$HOME` is used,
+not `~`). Set permissions: `chmod 600 <kubeconfig_path>`.
 
-3. **Validate connectivity**:
+5. **Validate connectivity**:
 ```bash
-kubectl --kubeconfig=<path> get nodes
+kubectl --kubeconfig=$HOME/.kube/config-staging get nodes
 ```
+**Use `$HOME` not `~`** — kubectl does not expand tilde.
 If this fails, report the error and **stop** — do not proceed with deploy.
 
 ### Step 3: Build plugin image (if "Build image" selected)
@@ -177,16 +242,28 @@ Use `replace_string_in_file` to make these changes. Match on the existing
 
 ### Step 6: Deploy to cluster (if "Deploy to cluster" selected)
 
-Set `KUBECONFIG=<path>` for all kubectl commands in this step.
+Set `KUBECONFIG=$HOME/.kube/config-staging` (or the user's chosen path with
+`$HOME` instead of `~`) for all kubectl commands in this step.
+
+**Before applying**, notify the user and ask for consent using `ask_questions`:
+- Header: `Namespace`
+- Question: `CSI driver infrastructure (controller, node, RBAC, secret) will be
+  deployed to kube-system. Consumer objects (PVCs, test pods) will use the
+  default namespace. Proceed?`
+- Options:
+  - `Yes, deploy driver to kube-system` (recommended)
+  - `Let me choose a different namespace`
+- If the user chooses a different namespace, use that for all driver manifests.
 
 Apply manifests in order:
 ```bash
-export KUBECONFIG=<path>
+export KUBECONFIG=$HOME/.kube/config-staging
 kubectl apply -f examples/cinder-iscsi-csi-plugin/plugin/secret.yaml
 kubectl apply -f examples/cinder-iscsi-csi-plugin/plugin/csi-driver.yaml
 kubectl apply -f examples/cinder-iscsi-csi-plugin/plugin/rbac.yaml
 kubectl apply -f examples/cinder-iscsi-csi-plugin/plugin/controller.yaml
 kubectl apply -f examples/cinder-iscsi-csi-plugin/plugin/node.yaml
+kubectl apply -f examples/cinder-iscsi-csi-plugin/storageclass.yaml
 ```
 
 If any `kubectl apply` fails, report the error and **stop**.
@@ -198,13 +275,19 @@ sleep 5
 
 ### Step 7: Verify deployment (if "Verify deployment" selected)
 
-Set `KUBECONFIG=<path>` for all kubectl commands.
+Set `KUBECONFIG=$HOME/.kube/config-staging` for all kubectl commands.
 
 Run these checks in sequence:
 
 1. **CSIDriver registration**:
 ```bash
 kubectl get csidriver cinder-iscsi.csi.windriver.com
+```
+If not found, report and stop.
+
+1b. **StorageClass**:
+```bash
+kubectl get sc csi-sc-cinder-iscsi
 ```
 If not found, report and stop.
 
@@ -244,7 +327,8 @@ After reporting the summary, include this teardown reference:
 
 ```
 To remove the plugin from the staging cluster:
-  export KUBECONFIG=<path>
+  export KUBECONFIG=$HOME/.kube/config-staging
+  kubectl delete -f examples/cinder-iscsi-csi-plugin/storageclass.yaml
   kubectl delete -f examples/cinder-iscsi-csi-plugin/plugin/
 ```
 
@@ -281,7 +365,7 @@ Collect logs (Step 7.5) and report. Common causes:
 |----------|--------|---------|
 | `REGISTRY_REPO` | Step 1 prompt | `docker.io/michaelbi/cinder-iscsi-csi-plugin` |
 | `TAG` | Step 1 prompt | `latest` or `a1b2c3d` |
-| `KUBECONFIG_PATH` | Step 1 prompt | `~/.kube/config-staging` |
+| `KUBECONFIG_PATH` | Step 1 prompt | `$HOME/.kube/config-staging` |
 | `API_SERVER_URL` | Step 1 prompt | `https://69.167.148.57:6443` |
 | `SA_TOKEN` | Step 2 prompt | `eyJhbG...` |
 
@@ -293,5 +377,8 @@ Collect logs (Step 7.5) and report. Common causes:
 - **ALWAYS validate kubeconfig connectivity** before deploying.
 - **ALWAYS check Docker auth** before pushing — prompt only if needed.
 - **ALWAYS report a clear summary** at the end with pod status + image in use.
+- **ALWAYS apply consumer objects** (PVCs, Pods, test workloads) to the `default`
+  namespace. If `kube-system` is needed for a consumer object, ask user consent.
+- **ALWAYS ask consent** before deploying driver infrastructure to `kube-system`.
 - If any step fails, **stop and report** — do not silently skip.
 - Revert manifest image changes if deploy was not selected (to avoid dirty git state).

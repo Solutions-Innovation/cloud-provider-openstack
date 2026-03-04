@@ -128,7 +128,7 @@ spec:
             - name: socket-dir
               mountPath: /csi
             - name: kubelet-dir
-              mountPath: {{ .Values.csi.plugin.nodePlugin.kubeletDir }}/pods
+              mountPath: {{ .Values.csi.plugin.nodePlugin.kubeletDir }}
               mountPropagation: "Bidirectional"
             - name: pods-probe-dir
               mountPath: /dev
@@ -163,7 +163,7 @@ spec:
             type: Directory
         - name: kubelet-dir
           hostPath:
-            path: {{ .Values.csi.plugin.nodePlugin.kubeletDir }}/pods
+            path: {{ .Values.csi.plugin.nodePlugin.kubeletDir }}
             type: Directory
         - name: pods-probe-dir
           hostPath:
