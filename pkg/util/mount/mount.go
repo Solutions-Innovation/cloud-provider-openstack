@@ -246,14 +246,26 @@ func (m *Mount) MakeDir(pathname string) error {
 	return nil
 }
 
-// MakeFile creates an empty file
+// MakeFile creates an empty file at pathname suitable for a block device
+// bind-mount target. If the path already exists as a directory (as kubelet
+// may create for volumeDevices publish paths), the directory is removed
+// first so a regular file can be created.
 func (m *Mount) MakeFile(pathname string) error {
+	info, err := os.Stat(pathname)
+	if err == nil && info.IsDir() {
+		// Kubelet created a directory; replace with a file for block bind-mount.
+		if err := os.Remove(pathname); err != nil {
+			return fmt.Errorf("failed to remove directory at %s: %w", pathname, err)
+		}
+	}
 	f, err := os.OpenFile(pathname, os.O_CREATE, os.FileMode(0644))
-	defer func() { _ = f.Close() }()
 	if err != nil {
 		if !os.IsExist(err) {
 			return err
 		}
+	}
+	if f != nil {
+		_ = f.Close()
 	}
 	return nil
 }

@@ -37,6 +37,19 @@ import (
 
 // ── Cinder v3 Attachment Operations ──────────────────────────────────────────
 
+// reservedAttachmentCreateOpts builds the POST /v3/attachments request body
+// with only volume_uuid (omitting instance_uuid entirely). The upstream
+// Gophercloud CreateOpts serialises InstanceUUID as `"instance_uuid":""` when
+// the field is empty, which Cinder rejects with HTTP 400 because an empty
+// string is not a valid UUID.
+type reservedAttachmentCreateOpts struct {
+	VolumeUUID string `json:"volume_uuid"`
+}
+
+func (o reservedAttachmentCreateOpts) ToAttachmentCreateMap() (map[string]any, error) {
+	return gophercloud.BuildRequestBody(o, "attachment")
+}
+
 // CreateAttachment creates a reserved Cinder v3 attachment with no connector
 // and no instance UUID. This "locks" the volume in status "reserved" without
 // consuming any compute resources (unlike Nova attach or Shadow VM).
@@ -49,9 +62,8 @@ func (os *OpenStackISCSI) CreateAttachment(ctx context.Context, volumeID string)
 		return "", err
 	}
 
-	opts := attachments.CreateOpts{
+	opts := reservedAttachmentCreateOpts{
 		VolumeUUID: volumeID,
-		// No InstanceUUID, no Connector — creates a "reserved" attachment
 	}
 
 	mc := metrics.NewMetricContext("attachment", "create")

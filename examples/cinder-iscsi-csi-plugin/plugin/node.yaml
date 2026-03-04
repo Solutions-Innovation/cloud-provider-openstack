@@ -59,17 +59,17 @@ spec:
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: ghcr.io/solutions-innovation/cinder-iscsi-csi-plugin:latest
+          image: docker.io/michaelbi/cinder-iscsi-csi-plugin:latest
           args:
             - /bin/cinder-iscsi-csi-plugin
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--cloud-config=/etc/config/driver.conf"
             - "--provide-controller-service=false"
-            - "--v=1"
+            - "--v=5"
           env:
             - name: CSI_ENDPOINT
               value: unix://csi/csi.sock
-          imagePullPolicy: "IfNotPresent"
+          imagePullPolicy: "Always"
           ports:
             - containerPort: 9808
               name: healthz
@@ -86,7 +86,7 @@ spec:
             - name: socket-dir
               mountPath: /csi
             - name: kubelet-dir
-              mountPath: /var/lib/kubelet/pods
+              mountPath: /var/lib/kubelet
               mountPropagation: "Bidirectional"
             - name: pods-probe-dir
               mountPath: /dev
@@ -115,7 +115,7 @@ spec:
             type: Directory
         - name: kubelet-dir
           hostPath:
-            path: /var/lib/kubelet/pods
+            path: /var/lib/kubelet
             type: Directory
         - name: pods-probe-dir
           hostPath:

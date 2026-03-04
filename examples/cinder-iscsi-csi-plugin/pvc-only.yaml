@@ -1,0 +1,23 @@
+# PVC-only validation for the cinder-iscsi CSI driver.
+# Creates a PVC without a consuming pod — tests that the StorageClass,
+# CSI controller, and Cinder iSCSI backend can provision a volume.
+#
+# volumeMode MUST be Block — this driver only supports raw block volumes.
+# With volumeBindingMode: Immediate, the PVC should transition to Bound
+# without needing a pod. If it stays Pending, check:
+#   - controller plugin logs
+#   - cloud.conf / driver.conf credentials
+#   - Cinder volume type availability
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-pvc-validate-iscsi
+spec:
+  accessModes:
+  - ReadWriteOnce
+  volumeMode: Block
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: csi-sc-cinder-iscsi

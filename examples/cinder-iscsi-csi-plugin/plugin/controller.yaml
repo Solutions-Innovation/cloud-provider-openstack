@@ -66,7 +66,7 @@ spec:
             - mountPath: /var/lib/csi/sockets/pluginproxy/
               name: socket-dir
         - name: cinder-iscsi-csi-plugin
-          image: ghcr.io/solutions-innovation/cinder-iscsi-csi-plugin:latest
+          image: docker.io/michaelbi/cinder-iscsi-csi-plugin:latest
           args:
             - /bin/cinder-iscsi-csi-plugin
             - "--endpoint=$(CSI_ENDPOINT)"
@@ -74,7 +74,7 @@ spec:
             - "--cloud-config=/etc/config/driver.conf"
             - "--cluster=$(CLUSTER_NAME)"
             - "--provide-node-service=false"
-            - "--v=1"
+            - "--v=5"
           env:
             - name: CSI_ENDPOINT
               value: unix://csi/csi.sock
@@ -82,7 +82,7 @@ spec:
               value: /etc/config/cloud.conf
             - name: CLUSTER_NAME
               value: kubernetes
-          imagePullPolicy: "IfNotPresent"
+          imagePullPolicy: "Always"
           ports:
             - containerPort: 9808
               name: healthz

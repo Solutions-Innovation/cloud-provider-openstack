@@ -1,5 +1,8 @@
 # StorageClass for the cinder-iscsi CSI driver.
 # Uses the LVM iSCSI backend on the target OpenStack cloud.
+# volumeBindingMode must be Immediate (not WaitForFirstConsumer) because
+# CDI multi-phase migration creates intermediate PVCs that are not directly
+# consumed by a scheduled pod — Immediate ensures they are provisioned right away.
 
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -13,5 +16,5 @@ parameters:
   # Run `openstack volume type list` to see available types.
   # type: lvmdriver-1
 reclaimPolicy: Delete
-volumeBindingMode: WaitForFirstConsumer
+volumeBindingMode: Immediate
 allowVolumeExpansion: true
