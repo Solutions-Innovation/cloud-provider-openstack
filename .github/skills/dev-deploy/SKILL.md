@@ -273,6 +273,45 @@ After all applies succeed, wait briefly for pods to start:
 sleep 5
 ```
 
+### Step 6b: CDI StorageProfile patch (if CDI is present)
+
+After deploying the driver and StorageClass, check if CDI is installed and offer
+to apply the StorageProfile patch so DataVolumes default to `volumeMode: Block`.
+
+1. **Detect CDI:**
+```bash
+kubectl --kubeconfig=$HOME/.kube/config-staging get crd storageprofiles.cdi.kubevirt.io 2>/dev/null
+```
+
+2. **If CDI is NOT detected**, skip this step silently.
+
+3. **If CDI IS detected**, check the current StorageProfile:
+```bash
+kubectl --kubeconfig=$HOME/.kube/config-staging get storageprofile csi-sc-cinder-iscsi -o jsonpath='{.spec.claimPropertySets}' 2>/dev/null
+```
+
+4. **If `claimPropertySets` is already configured** (non-empty output), skip — already patched.
+
+5. **If `claimPropertySets` is empty**, ask using `ask_questions`:
+   - Header: `CDI Patch`
+   - Question: `CDI is installed but the StorageProfile for csi-sc-cinder-iscsi has no
+     claimPropertySets — DataVolumes will default to volumeMode: Filesystem, which this
+     block-only driver rejects. Apply the StorageProfile patch (volumeMode: Block)?`
+   - Options:
+     - `Yes, patch StorageProfile` (recommended)
+     - `No, skip`
+
+6. **If user confirms**, apply the patch:
+```bash
+kubectl --kubeconfig=$HOME/.kube/config-staging apply -f manifests/cinder-iscsi-csi-plugin/cdi-storageprofile-patch.yaml
+```
+
+7. **Verify:**
+```bash
+kubectl --kubeconfig=$HOME/.kube/config-staging get storageprofile csi-sc-cinder-iscsi -o yaml
+```
+Confirm `spec.claimPropertySets` shows `volumeMode: Block`.
+
 ### Step 7: Verify deployment (if "Verify deployment" selected)
 
 Set `KUBECONFIG=$HOME/.kube/config-staging` for all kubectl commands.

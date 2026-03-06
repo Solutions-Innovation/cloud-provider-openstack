@@ -326,14 +326,14 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 
 // ── ControllerPublishVolume ──────────────────────────────────────────────────
 
-// ControllerPublishVolume updates the reserved Cinder attachment with the
-// node's initiator connector (IQN, IP, host). This triggers Cinder to call
-// the backend's initialize_connection(), creating an iSCSI target for this
-// specific initiator.
+// ControllerPublishVolume attaches a Cinder volume to a node by creating (if
+// needed) and updating a Cinder attachment with the node's initiator connector
+// (IQN, IP, host). This triggers Cinder to call the backend's
+// initialize_connection(), creating an iSCSI target for this specific initiator.
 //
 // Flow:
 //  1. Parse node identity (hostname;iqn;ip)
-//  2. Get attachment_id from volume context or volume metadata
+//  2. Get attachment_id from metadata/volumeContext, or create a new one
 //  3. Update attachment with initiator connector
 //  4. Optionally complete attachment (microversion >= 3.44)
 //  5. Validate driver_volume_type == "iscsi"
@@ -372,32 +372,55 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 	}
 	klog.V(4).Infof("ControllerPublishVolume: node=%s iqn=%s ip=%s", host, iqn, ip)
 
-	// ── 2. Get attachment_id ─────────────────────────────────────────────
+	// ── 2. Get or create attachment ───────────────────────────────────────
+	// Read attachment_id from Cinder volume metadata first (source of truth).
+	// If not present (e.g., after ControllerUnpublishVolume cleared it, or
+	// on first publish after re-scheduling), create a new reserved attachment.
+	// Fall back to PV volumeContext only as last resort.
 	attachmentID := ""
-	if volCtx := req.GetVolumeContext(); volCtx != nil {
-		attachmentID = volCtx["attachment_id"]
-	}
-
-	// Fall back to volume metadata if not in volume context
-	if attachmentID == "" {
-		vol, err := cloud.GetVolume(ctx, volumeID)
-		if err != nil {
-			if cpoerrors.IsNotFound(err) {
-				return nil, status.Errorf(codes.NotFound,
-					"ControllerPublishVolume: volume %s not found", volumeID)
-			}
-			return nil, status.Errorf(codes.Internal,
-				"ControllerPublishVolume: failed to get volume %s: %v", volumeID, err)
+	vol, err := cloud.GetVolume(ctx, volumeID)
+	if err != nil {
+		if cpoerrors.IsNotFound(err) {
+			return nil, status.Errorf(codes.NotFound,
+				"ControllerPublishVolume: volume %s not found", volumeID)
 		}
-		vopts := cloud.GetVolumeOpts()
-		attachmentKey := metadataKey(vopts.MetadataPrefix, metaKeySuffixAttachmentID)
-		attachmentID = vol.Metadata[attachmentKey]
+		return nil, status.Errorf(codes.Internal,
+			"ControllerPublishVolume: failed to get volume %s: %v", volumeID, err)
+	}
+	vopts := cloud.GetVolumeOpts()
+	attachmentKey := metadataKey(vopts.MetadataPrefix, metaKeySuffixAttachmentID)
+	attachmentID = vol.Metadata[attachmentKey]
+
+	// Fall back to volume context only if metadata has no attachment_id
+	// (e.g., metadata write failed during CreateVolume)
+	if attachmentID == "" {
+		if volCtx := req.GetVolumeContext(); volCtx != nil {
+			attachmentID = volCtx["attachment_id"]
+		}
 	}
 
+	// No attachment exists — create one on-demand.
+	// This happens when ControllerUnpublishVolume has previously cleaned up
+	// the attachment (volume is Available), and a new pod is mounting the PVC
+	// (e.g., next CDI phase, or rescheduled workload).
 	if attachmentID == "" {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"ControllerPublishVolume: no attachment_id found for volume %s — was CreateVolume called?", volumeID)
+		klog.V(2).Infof("ControllerPublishVolume: no attachment found for volume %s, creating one", volumeID)
+		newAttachmentID, createErr := cloud.CreateAttachment(ctx, volumeID)
+		if createErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"ControllerPublishVolume: failed to create attachment for volume %s: %v", volumeID, createErr)
+		}
+		// Persist in Cinder metadata so ControllerUnpublishVolume can find it
+		metaErr := cloud.SetVolumeMetadata(ctx, volumeID, map[string]string{
+			attachmentKey: newAttachmentID,
+		})
+		if metaErr != nil {
+			klog.Warningf("ControllerPublishVolume: failed to persist attachment_id in metadata: %v", metaErr)
+		}
+		attachmentID = newAttachmentID
 	}
+
+	klog.V(4).Infof("ControllerPublishVolume: using attachment %s for volume %s", attachmentID, volumeID)
 
 	// ── 3. Update attachment with connector ──────────────────────────────
 	iscsiOpts := cloud.GetISCSIOpts()
@@ -455,22 +478,21 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 
 // ── ControllerUnpublishVolume ────────────────────────────────────────────────
 
-// ControllerUnpublishVolume deletes the current Cinder attachment and creates
-// a new reserved attachment (attachment rotation). This is critical for the CDI
-// multi-phase precopy workflow — when a CDI stage pod completes, the attachment
-// is rotated so the next stage can update the connector with a potentially
-// different worker's IQN.
+// ControllerUnpublishVolume deletes the current Cinder attachment and clears
+// the attachment_id metadata. After this call, the Cinder volume returns to
+// "available" state — ready for another ControllerPublishVolume or for direct
+// use by OpenStack (e.g., Nova boot-from-volume).
 //
-// This is NOT a no-op (unlike the NFS driver). iSCSI targets are per-initiator.
+// This is NOT a no-op (unlike the NFS driver). iSCSI targets are per-initiator,
+// so the attachment must be deleted to trigger terminate_connection and remove
+// the iSCSI target.
 //
 // Flow:
 //  1. Get current attachment_id from volume metadata
 //  2. Delete current attachment (triggers terminate_connection → iSCSI target removed)
-//  3. Create new reserved attachment (volume locked again)
-//  4. Update volume metadata with new attachment_id
+//  3. Clear attachment_id from volume metadata
 //
-// Idempotency: If the old attachment is already deleted, skip step 2.
-// If a reserved attachment already exists, reuse it.
+// Idempotency: If the old attachment is already deleted, succeed.
 func (cs *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
 	klog.V(4).Infof("ControllerUnpublishVolume: called with args %+v", protosanitizer.StripSecrets(req))
 
@@ -510,27 +532,16 @@ func (cs *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 		klog.V(3).Infof("ControllerUnpublishVolume: no attachment_id in metadata for volume %s, skipping delete", volumeID)
 	}
 
-	// ── 3. Create new reserved attachment ────────────────────────────────
-	newAttachmentID, err := cloud.CreateAttachment(ctx, volumeID)
+	// ── 3. Clear attachment_id from metadata ─────────────────────────────
+	err = cloud.DeleteVolumeMetadata(ctx, volumeID, []string{attachmentKey})
 	if err != nil {
-		klog.Errorf("ControllerUnpublishVolume: failed to create new attachment for volume %s: %v",
+		klog.Errorf("ControllerUnpublishVolume: failed to clear metadata on volume %s: %v",
 			volumeID, err)
-		return nil, status.Errorf(codes.Internal,
-			"ControllerUnpublishVolume: failed to create new attachment: %v", err)
+		// Non-fatal — attachment is deleted, volume is available
 	}
 
-	// ── 4. Update volume metadata ────────────────────────────────────────
-	err = cloud.SetVolumeMetadata(ctx, volumeID, map[string]string{
-		attachmentKey: newAttachmentID,
-	})
-	if err != nil {
-		klog.Errorf("ControllerUnpublishVolume: failed to update metadata on volume %s: %v",
-			volumeID, err)
-		// Non-fatal — the new attachment exists, just metadata is stale
-	}
-
-	klog.V(2).Infof("ControllerUnpublishVolume: rotated attachment for volume %s: %s → %s",
-		volumeID, attachmentID, newAttachmentID)
+	klog.V(2).Infof("ControllerUnpublishVolume: detached volume %s (attachment %s deleted, volume now available)",
+		volumeID, attachmentID)
 
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
