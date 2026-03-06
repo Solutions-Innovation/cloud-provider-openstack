@@ -199,6 +199,7 @@ remaining migration configuration. Batch into max 3 questions.
 and use the pre-built e2e defaults from `assets/e2e-iscsi-defaults.yaml`.
 
 ```bash
+rm -f /tmp/migration-inputs.yaml
 cp .github/skills/cloudify-migration/assets/e2e-iscsi-defaults.yaml /tmp/migration-inputs.yaml
 ```
 Then skip to Step 6 (create deployment).
@@ -223,8 +224,15 @@ Then skip to Step 6 (create deployment).
 
 **Question 3 — Deployment ID** (freeform):
 - Header: `Deploy ID`
-- Question: `Deployment ID? (Leave empty to auto-generate as <src_vm_name>-<blueprint_id>)`
+- Question: `Deployment ID? (Leave empty to auto-generate)`
 - allowFreeformInput: true
+
+**Deployment naming convention:**
+Auto-generated IDs use the format `<src_vm_name>-<blueprint_id>-<suffix>` where
+`<suffix>` is a random 5-character lowercase alphabetic string (a-z only, no
+numbers). Examples: `fedora-bios-warm-migration-vdfee`,
+`warm-test-cold-migration-qzxhk`. This avoids collisions with previous
+deployments using the same VM and blueprint.
 
 ### Step 4: Confirm and set profile
 

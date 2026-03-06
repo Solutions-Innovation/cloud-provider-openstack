@@ -333,8 +333,9 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 //
 // Flow:
 //  1. Parse node identity (hostname;iqn;ip)
-//  2. Get attachment_id from metadata/volumeContext, or create a new one
+//  2. Get attachment_id from Cinder metadata, or create a new one
 //  3. Update attachment with initiator connector
+//     - If the attachment is gone (404), create a new one and retry
 //  4. Optionally complete attachment (microversion >= 3.44)
 //  5. Validate driver_volume_type == "iscsi"
 //
@@ -391,18 +392,11 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 	attachmentKey := metadataKey(vopts.MetadataPrefix, metaKeySuffixAttachmentID)
 	attachmentID = vol.Metadata[attachmentKey]
 
-	// Fall back to volume context only if metadata has no attachment_id
-	// (e.g., metadata write failed during CreateVolume)
-	if attachmentID == "" {
-		if volCtx := req.GetVolumeContext(); volCtx != nil {
-			attachmentID = volCtx["attachment_id"]
-		}
-	}
-
-	// No attachment exists — create one on-demand.
-	// This happens when ControllerUnpublishVolume has previously cleaned up
-	// the attachment (volume is Available), and a new pod is mounting the PVC
-	// (e.g., next CDI phase, or rescheduled workload).
+	// No attachment in metadata — create one on-demand.
+	// This happens after ControllerUnpublishVolume clears the metadata, or on
+	// first publish of a volume that lost its metadata. Do NOT fall back to
+	// PV volumeContext — it may contain a stale attachment_id from CreateVolume
+	// that was already deleted by ControllerUnpublishVolume.
 	if attachmentID == "" {
 		klog.V(2).Infof("ControllerPublishVolume: no attachment found for volume %s, creating one", volumeID)
 		newAttachmentID, createErr := cloud.CreateAttachment(ctx, volumeID)
@@ -444,6 +438,24 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 	}
 
 	connInfo, err := cloud.UpdateAttachmentConnector(ctx, attachmentID, connector)
+	// If the attachment was deleted externally (e.g., stale metadata), create
+	// a fresh one and retry the update once.
+	if err != nil && cpoerrors.IsNotFound(err) {
+		klog.Warningf("ControllerPublishVolume: attachment %s not found (deleted externally?), creating new one", attachmentID)
+		newAttachmentID, createErr := cloud.CreateAttachment(ctx, volumeID)
+		if createErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"ControllerPublishVolume: failed to create replacement attachment for volume %s: %v", volumeID, createErr)
+		}
+		metaErr := cloud.SetVolumeMetadata(ctx, volumeID, map[string]string{
+			attachmentKey: newAttachmentID,
+		})
+		if metaErr != nil {
+			klog.Warningf("ControllerPublishVolume: failed to persist replacement attachment_id in metadata: %v", metaErr)
+		}
+		attachmentID = newAttachmentID
+		connInfo, err = cloud.UpdateAttachmentConnector(ctx, attachmentID, connector)
+	}
 	if err != nil {
 		klog.Errorf("ControllerPublishVolume: failed to update connector on attachment %s: %v",
 			attachmentID, err)
