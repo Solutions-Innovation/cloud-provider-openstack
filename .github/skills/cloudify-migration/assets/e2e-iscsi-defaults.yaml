@@ -1,0 +1,65 @@
+# Cinder iSCSI CSI Plugin — e2e Test Defaults for Cloudify Migration
+#
+# These are the known-good defaults for running V2O migration e2e tests
+# against the iSCSI-Cinder CSI plugin on conductor57.
+#
+# When the user selects defaults or says "go ahead", use these values
+# instead of prompting for each parameter.
+#
+# Target: OpenStack (69.167.149.97) with iSCSI-Cinder CSI StorageClass
+
+src_vm_name: "fedora-bios"
+
+dst_vm_settings:
+  vm_name:
+    get_input: src_vm_name
+  vm_zone_id: ""
+  disk_bus: virtio
+  vm_flavor_id: m1.medium
+  vm_network-id: shared
+  vm_4_fixip: ""
+  vm_keyname: fedora-key
+
+warm_migration_parameters:
+  precopy_period: "600"
+
+vmware_vcenter_config:
+  govc_url: "https://69.167.148.53"
+  govc_username: "administrator@vsphere.local"
+  govc_password_secret_ref: vcenter_password
+
+openstack_settings:
+  openstack_auth_url: "http://69.167.149.97/identity"
+  openstack_ep_ip: "69.167.149.97"
+  openstack_auth_type: password
+  openstack_password: openstack_keys_97
+  openstack_region_name: "RegionOne"
+
+kubernetes_master_endpoint: "https://192.168.206.1:6443"
+
+kubernetes_client_config:
+  configuration:
+    api_options:
+      host:
+        get_input: kubernetes_master_endpoint
+      api_key:
+        get_secret: kubernetes_admin_token
+      debug: false
+      verify_ssl: false
+
+cdi_settings:
+  vddk_credential-secret-ref: vddk-credentials
+  storage_size: "50Gi"
+  storage_class: "csi-sc-cinder-iscsi"
+  enable_resize: "false"
+  via_service_account: vi-admin
+  enable_preallocate: "false"
+  enable_efi: "true"
+  runtime_env: openstack
+  enable_debug: "false"
+  container: "registry.local:9001/public/fedora-libguestfs:v2.41.8"
+  mode: vmware
+  timeout_image_prepare: "1800"
+  enable_boot_from_volume: "true"
+
+validate_status: "True"

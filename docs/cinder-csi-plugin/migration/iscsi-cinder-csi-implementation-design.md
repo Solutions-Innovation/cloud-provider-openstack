@@ -1867,6 +1867,64 @@ The CSI RPC flow triggered by this pod:
 4. Pod runs CDI data transfer
 5. Pod exits → `NodeUnpublishVolume` → `NodeUnstageVolume` (iscsiadm logout) → `ControllerUnpublishVolume` (attachment rotation)
 
+#### 10.4.1 CDI StorageProfile Configuration (Required)
+
+> **Problem:** KubeVirt CDI auto-creates a `StorageProfile` per `StorageClass` and
+> populates `claimPropertySets` (accessModes, volumeMode) only for provisioners
+> listed in its hardcoded `CapabilitiesByProvisionerKey` map. The upstream Cinder
+> CSI driver (`cinder.csi.openstack.org`) is in this map with
+> `createRWOBlockAndFilesystemCapabilities()`, and `rook-ceph.rbd.csi.ceph.com`
+> is listed with `createRbdCapabilities()` — so both get auto-populated profiles.
+>
+> Our custom provisioner `cinder-iscsi.csi.windriver.com` is **not** in CDI's map.
+> CDI creates the StorageProfile with `spec: {}` and no `status.claimPropertySets`.
+> Without explicit `claimPropertySets`, CDI defaults DataVolume PVCs to
+> `volumeMode: Filesystem`. Since this driver rejects Filesystem mode at every
+> CSI RPC (§6 Block-Only Volume Mode Enforcement), PVCs remain Pending.
+
+**Current fix:** Patch the `StorageProfile` to declare `volumeMode: Block`:
+
+```yaml
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: StorageProfile
+metadata:
+  name: csi-sc-cinder-iscsi    # must match StorageClass name
+spec:
+  claimPropertySets:
+    - accessModes:
+        - ReadWriteOnce
+      volumeMode: Block
+```
+
+This is applied via:
+- **Manifest:** `manifests/cinder-iscsi-csi-plugin/cdi-storageprofile-patch.yaml`
+- **Helm chart:** `templates/storageprofile.yaml` (controlled by `storageProfile.enabled`
+  in `values.yaml`, default: `true`)
+
+**CDI priority chain** (from CDI docs): User-defined `spec` on StorageProfile has
+priority 3, overriding CDI's built-in defaults (priority 4). This is the
+CDI-intended mechanism for unknown provisioners.
+
+> **TODO (Upstream):** Submit a PR to
+> [kubevirt/containerized-data-importer](https://github.com/kubevirt/containerized-data-importer)
+> adding `cinder-iscsi.csi.windriver.com` to `CapabilitiesByProvisionerKey` in
+> [`pkg/storagecapabilities/storagecapabilities.go`](https://github.com/kubevirt/containerized-data-importer/blob/main/pkg/storagecapabilities/storagecapabilities.go).
+> The entry should be:
+> ```go
+> "cinder-iscsi.csi.windriver.com": {{rwo, block}},
+> ```
+> This would make CDI auto-populate the StorageProfile for our driver, eliminating
+> the need for the manual patch. If upstream acceptance is not feasible, maintain
+> an internal CDI fork with this entry.
+>
+> **CDI code references for verification:**
+> - Known provisioners map: [`CapabilitiesByProvisionerKey`](https://github.com/kubevirt/containerized-data-importer/blob/main/pkg/storagecapabilities/storagecapabilities.go) — search for `CapabilitiesByProvisionerKey`
+> - Existing OpenStack Cinder entry: `"cinder.csi.openstack.org": createRWOBlockAndFilesystemCapabilities()`
+> - Existing Ceph RBD entry: `"rook-ceph.rbd.csi.ceph.com": createRbdCapabilities()`
+> - `GetCapabilities()` function: looks up provisioner key → returns capabilities or empty
+> - StorageProfile reconciler uses `GetCapabilities()` to auto-fill `status.claimPropertySets`
+> - StorageProfile CRD docs: [`doc/storageprofile.md`](https://github.com/kubevirt/containerized-data-importer/blob/main/doc/storageprofile.md)
+
 ### 10.5 Helm Chart
 
 A new Helm chart `charts/cinder-iscsi-csi-plugin/` follows the existing chart pattern:

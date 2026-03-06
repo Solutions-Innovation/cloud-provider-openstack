@@ -156,6 +156,28 @@ storageClass:
     type: pure-iscsi
     availability: nova
 
+# CDI StorageProfile patch.
+# KubeVirt CDI auto-creates a StorageProfile per StorageClass but only
+# populates claimPropertySets for known provisioners. Our custom provisioner
+# (cinder-iscsi.csi.windriver.com) is not in CDI's built-in map, so without
+# this patch CDI defaults DataVolume PVCs to volumeMode: Filesystem — which
+# this block-only driver rejects.
+#
+# Enable this when CDI is installed on the cluster and DataVolumes will
+# target this StorageClass (e.g., V2O/O2O migration workflows).
+#
+# The storageProfile name is automatically set to match storageClass.name.
+#
+# TODO: Upstream PR to kubevirt/containerized-data-importer to add
+# cinder-iscsi.csi.windriver.com to CapabilitiesByProvisionerKey.
+# Once merged and deployed, this patch becomes unnecessary.
+storageProfile:
+  enabled: true
+  claimPropertySets:
+    - accessModes:
+        - ReadWriteOnce
+      volumeMode: Block
+
 # Cluster identifier — appended to volume metadata.
 clusterID: "kubernetes"
 
