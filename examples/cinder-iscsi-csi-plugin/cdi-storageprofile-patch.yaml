@@ -1,0 +1,47 @@
+# CDI StorageProfile patch for the cinder-iscsi CSI driver.
+#
+# KubeVirt CDI auto-creates a StorageProfile per StorageClass, but only
+# populates claimPropertySets for provisioners in its hardcoded
+# CapabilitiesByProvisionerKey map (storagecapabilities.go). Our custom
+# provisioner (cinder-iscsi.csi.windriver.com) is not in that map, so
+# the StorageProfile is created with empty spec: {} — causing CDI to
+# default DataVolume PVCs to volumeMode: Filesystem.
+#
+# This driver ONLY supports volumeMode: Block (raw block device for
+# migration workloads). Without this patch, any CDI DataVolume targeting
+# the iSCSI StorageClass will create a Filesystem PVC, which the driver
+# rejects — leaving the PVC in Pending state.
+#
+# Apply AFTER the StorageClass has been created and CDI has reconciled
+# the auto-generated StorageProfile:
+#
+#   kubectl apply -f cdi-storageprofile-patch.yaml
+#
+# To verify:
+#   kubectl get storageprofile <storageclass-name> -o yaml
+#   # status.claimPropertySets should show volumeMode: Block
+#
+# TODO: Submit upstream PR to kubevirt/containerized-data-importer to add
+# cinder-iscsi.csi.windriver.com to CapabilitiesByProvisionerKey in
+# pkg/storagecapabilities/storagecapabilities.go — or maintain an
+# internal CDI fork with the entry. See design doc §10.4.1.
+#
+# References:
+#   CDI StorageProfile docs:
+#     https://github.com/kubevirt/containerized-data-importer/blob/main/doc/storageprofile.md
+#   CDI known provisioners map:
+#     https://github.com/kubevirt/containerized-data-importer/blob/main/pkg/storagecapabilities/storagecapabilities.go
+#   Existing OpenStack Cinder entry in CDI:
+#     "cinder.csi.openstack.org": createRWOBlockAndFilesystemCapabilities()
+---
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: StorageProfile
+metadata:
+  # Name must match the StorageClass name exactly.
+  # CDI auto-creates the StorageProfile with this name.
+  name: csi-sc-cinder-iscsi
+spec:
+  claimPropertySets:
+    - accessModes:
+        - ReadWriteOnce
+      volumeMode: Block

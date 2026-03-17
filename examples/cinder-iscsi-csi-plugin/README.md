@@ -3,6 +3,9 @@
 These examples demonstrate how to test the **cinder-iscsi CSI plugin** against
 an OpenStack cloud with LVM iSCSI backing storage.
 
+The driver supports **raw block volumes only**. Use `volumeMode: Block` and
+`volumeDevices`; do not present these examples as a filesystem mount workflow.
+
 ## Prerequisites
 
 1. A running Kubernetes cluster with the cinder-iscsi CSI plugin deployed
@@ -33,6 +36,9 @@ kubectl apply -f plugin/
 
 ## Quick Start
 
+For a presenter-oriented demo flow with validation steps, use
+`demo-walkthrough.md` in this folder.
+
 ```bash
 # 1. Deploy the secret and driver config (update cloud.conf with your credentials)
 kubectl apply -f secret.yaml
@@ -40,17 +46,13 @@ kubectl apply -f secret.yaml
 # 2. Create the StorageClass
 kubectl apply -f storageclass.yaml
 
-# 3. Test with nginx (filesystem volume)
-kubectl apply -f nginx.yaml
-
-# 4. Test with a raw block volume
+# 3. Test with a raw block volume
 kubectl apply -f block/block.yaml
 ```
 
 ## Cleanup
 
 ```bash
-kubectl delete -f nginx.yaml
 kubectl delete -f block/block.yaml
 kubectl delete -f storageclass.yaml
 kubectl delete -f secret.yaml
@@ -63,5 +65,6 @@ kubectl delete -f secret.yaml
 | `plugin/` | All manifests to deploy the CSI plugin (secret, driver, RBAC, controller, node) |
 | `secret.yaml` | Secret (cloud.conf) and ConfigMap (driver.conf) for dev target |
 | `storageclass.yaml` | StorageClass using the cinder-iscsi CSI driver |
-| `nginx.yaml` | Nginx pod with a filesystem PVC |
+| `demo-walkthrough.md` | Presenter-focused runbook for demonstrating provisioning, raw block attachment, and iSCSI validation |
+| `nginx.yaml` | Pod example that still uses a raw block PVC via `volumeDevices` |
 | `block/block.yaml` | Pod with a raw block volume device |

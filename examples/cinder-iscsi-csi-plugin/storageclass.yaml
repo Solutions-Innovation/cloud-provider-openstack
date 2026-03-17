@@ -14,7 +14,7 @@ provisioner: cinder-iscsi.csi.windriver.com
 parameters:
   # Cinder volume type — must match an LVM iSCSI backend type in your cloud.
   # Run `openstack volume type list` to see available types.
-  # type: lvmdriver-1
+  type: lvmdriver-1
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
 allowVolumeExpansion: true
