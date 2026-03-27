@@ -166,3 +166,6 @@ zz_generated.openapi.go
 
 # Markdown review customized style
 .crossnote/*.*
+
+# wndrvr github agent
+.github/agents	

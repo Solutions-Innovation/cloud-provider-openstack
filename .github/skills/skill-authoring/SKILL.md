@@ -30,6 +30,7 @@ the `SKILL.md` in each directory. This repo currently has these skills:
 
 | Skill | Purpose |
 |-------|---------|
+| `cinder-iscsi-helm-release` | Helm package, deploy & sanity-test iSCSI Cinder CSI |
 | `cloudify-migration` | V2O migration e2e via Cloudify CLI |
 | `dev-deploy` | Build, push, deploy CSI plugin to staging |
 | `doc-align` | Align documentation with code changes |
@@ -47,8 +48,10 @@ Update this table when adding or removing skills.
 Every skill is a directory with at minimum a `SKILL.md` file:
 
 ```
+
 skill-name/
-└── SKILL.md          # Required — frontmatter + instructions
+└── SKILL.md # Required — frontmatter + instructions
+
 ```
 
 ### Optional directories
@@ -56,12 +59,14 @@ skill-name/
 Add these only when needed. Keep file references **one level deep** from SKILL.md.
 
 ```
+
 skill-name/
 ├── SKILL.md
-├── references/       # Docs loaded on demand (REFERENCE.md, domain files, etc.)
-├── scripts/          # Executable code the agent can run (Python, Bash, etc.)
-└── assets/           # Static resources (templates, configs, schemas, data files)
-```
+├── references/ # Docs loaded on demand (REFERENCE.md, domain files, etc.)
+├── scripts/ # Executable code the agent can run (Python, Bash, etc.)
+└── assets/ # Static resources (templates, configs, schemas, data files)
+
+````
 
 **`references/`** — Additional documentation the agent reads when it needs
 deeper context. Keep individual files focused; agents load these on demand so
@@ -98,26 +103,28 @@ description: >
   that help agents identify relevant tasks.
 license: Apache-2.0
 ---
-```
+````
 
 #### Field rules
 
-| Field | Required | Constraints |
-|-------|----------|------------|
-| `name` | **Yes** | 1–64 chars. Lowercase `a-z`, digits `0-9`, hyphens `-` only. Must not start/end with `-`. No consecutive `--`. **Must match parent directory name.** |
-| `description` | **Yes** | 1–1024 chars. Describe what the skill does AND when to use it. Include keywords for agent matching. |
-| `license` | No | License name or ref to bundled file. Use `Apache-2.0` for this repo. |
-| `compatibility` | No | 1–500 chars. Only if the skill has environment requirements. |
-| `metadata` | No | Key-value map for additional properties. |
-| `allowed-tools` | No | Space-delimited pre-approved tool list. Experimental. |
+| Field           | Required | Constraints                                                                                                                                          |
+| --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`          | **Yes**  | 1–64 chars. Lowercase `a-z`, digits `0-9`, hyphens `-` only. Must not start/end with `-`. No consecutive `--`. **Must match parent directory name.** |
+| `description`   | **Yes**  | 1–1024 chars. Describe what the skill does AND when to use it. Include keywords for agent matching.                                                  |
+| `license`       | No       | License name or ref to bundled file. Use `Apache-2.0` for this repo.                                                                                 |
+| `compatibility` | No       | 1–500 chars. Only if the skill has environment requirements.                                                                                         |
+| `metadata`      | No       | Key-value map for additional properties.                                                                                                             |
+| `allowed-tools` | No       | Space-delimited pre-approved tool list. Experimental.                                                                                                |
 
 **Name validation examples:**
+
 - `pdf-processing` — valid
 - `PDF-Processing` — **invalid** (uppercase)
 - `-pdf` — **invalid** (starts with hyphen)
 - `pdf--processing` — **invalid** (consecutive hyphens)
 
 **Description quality:**
+
 - Good: `"Extracts text and tables from PDF files, fills PDF forms, and merges multiple PDFs. Use when working with PDF documents or when the user mentions PDFs, forms, or document extraction."`
 - Poor: `"Helps with PDFs."`
 
@@ -127,6 +134,7 @@ The Markdown body after frontmatter contains skill instructions. No format
 restrictions — write whatever helps agents perform the task effectively.
 
 **Recommended sections:**
+
 1. **When to activate** — trigger phrases and exclusions
 2. **Environment setup** — prerequisites, CLI tools, env vars
 3. **Workflow / Steps** — step-by-step instructions
@@ -150,11 +158,11 @@ Layer 3 — Resources (on demand)
 
 ### Size limits
 
-| Layer | Recommended limit | Action if exceeded |
-|-------|-------------------|-------------------|
-| SKILL.md body | **< 500 lines** | Extract reference material to `references/` |
-| Individual reference file | < 300 lines | Split into focused subtopics |
-| Description field | ≤ 1024 chars | Shorten — it's for matching, not full docs |
+| Layer                     | Recommended limit | Action if exceeded                          |
+| ------------------------- | ----------------- | ------------------------------------------- |
+| SKILL.md body             | **< 500 lines**   | Extract reference material to `references/` |
+| Individual reference file | < 300 lines       | Split into focused subtopics                |
+| Description field         | ≤ 1024 chars      | Shorten — it's for matching, not full docs  |
 
 ### How to reference files
 
@@ -170,6 +178,7 @@ Use the pre-built config from [assets/defaults.yaml](assets/defaults.yaml).
 ```
 
 **Rules:**
+
 - Keep references **one level deep** from SKILL.md — avoid deeply nested chains
 - Use a **References table** in SKILL.md to catalog all referenced files with
   a "When to read" column so the agent knows when to load each file
@@ -179,11 +188,11 @@ Example references table:
 ```markdown
 ## References
 
-| File | Content | When to read |
-|------|---------|-------------|
+| File                                                     | Content                  | When to read                     |
+| -------------------------------------------------------- | ------------------------ | -------------------------------- |
 | [references/architecture.md](references/architecture.md) | System design, data flow | Understanding codebase structure |
-| [references/monitoring.md](references/monitoring.md) | CLI commands, debugging | Troubleshooting failures |
-| [assets/defaults.yaml](assets/defaults.yaml) | Pre-built config | Fast-path setup |
+| [references/monitoring.md](references/monitoring.md)     | CLI commands, debugging  | Troubleshooting failures         |
+| [assets/defaults.yaml](assets/defaults.yaml)             | Pre-built config         | Fast-path setup                  |
 ```
 
 ## Creating a new skill — step by step
@@ -191,6 +200,7 @@ Example references table:
 ### 1. Choose a name
 
 Pick a lowercase, hyphenated name that describes the skill's domain:
+
 - `my-new-skill` — valid
 - Must match the directory name exactly
 
@@ -270,4 +280,7 @@ When creating or reviewing a skill, verify:
 - **NEVER nest file references** — keep them one level deep from SKILL.md
 - **NEVER put large code blocks, templates, or lookup tables inline** in SKILL.md if they push it over 300 lines — extract to references or assets
 - **NEVER create empty optional directories** — only add `references/`, `scripts/`, `assets/` when there is content to put in them
+
+```
+
 ```
