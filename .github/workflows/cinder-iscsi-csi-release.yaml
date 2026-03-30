@@ -9,7 +9,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: solutions-innovation/cinder-csi
+  IMAGE_NAME: solutions-innovation/cinder-iscsi-csi-plugin
   HELM_CHART_DIR: charts/cinder-iscsi-csi-plugin
   HELM_OCI_REPO: oci://ghcr.io/solutions-innovation/charts
 
@@ -150,14 +150,15 @@ jobs:
           echo "--- Updated Chart.yaml ---"
           cat ${{ env.HELM_CHART_DIR }}/Chart.yaml
 
-      - name: Update values.yaml image reference
+      - name: Update values.yaml image tag for this build
         run: |
           APP_VERSION="${{ steps.chart_version.outputs.app_version }}"
           # Set the default tag in values.yaml so the packaged chart is self-contained
-          sed -i "s|repository: ghcr.io/solutions-innovation/cinder-iscsi-csi-plugin|repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|" \
-            ${{ env.HELM_CHART_DIR }}/values.yaml
           sed -i "s|tag:.*# defaults to .Chart.AppVersion|tag: \"${APP_VERSION}\"  # defaults to .Chart.AppVersion|" \
             ${{ env.HELM_CHART_DIR }}/values.yaml
+
+          echo "--- Updated values.yaml image section ---"
+          grep -A3 'repository:' ${{ env.HELM_CHART_DIR }}/values.yaml | head -5
 
       - name: Lint Helm chart
         run: helm lint ${{ env.HELM_CHART_DIR }}
