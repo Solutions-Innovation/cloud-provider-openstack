@@ -40,9 +40,9 @@ jobs:
         id: version
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/wndrvr_v* ]]; then
-            # Tag push: strip the 'wndrvr_' prefix → v1.0.0
-            RAW_TAG="${GITHUB_REF#refs/tags/wndrvr_}"
-            echo "version=${RAW_TAG}" >> "$GITHUB_OUTPUT"
+            # Tag push: use full tag name as image tag (e.g. wndrvr_v1.0.0)
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            echo "version=${TAG_NAME}" >> "$GITHUB_OUTPUT"
             echo "is_tag=true" >> "$GITHUB_OUTPUT"
           else
             # Branch push: use short SHA
@@ -77,8 +77,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # On tag push: v1.0.0 + latest
-            type=match,pattern=wndrvr_(v.*),group=1,enable=${{ steps.version.outputs.is_tag }}
+            # On tag push: wndrvr_v1.0.0 + latest
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.is_tag }}
             type=raw,value=latest,enable=${{ steps.version.outputs.is_tag }}
             # On branch push: dev-<sha> + branch name slug
             type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.is_tag == 'false' }}
@@ -123,10 +123,11 @@ jobs:
         id: chart_version
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/wndrvr_v* ]]; then
-            RAW_TAG="${GITHUB_REF#refs/tags/wndrvr_}"       # v1.0.0
-            SEMVER="${RAW_TAG#v}"                             # 1.0.0
+            TAG_NAME="${GITHUB_REF#refs/tags/}"               # wndrvr_v1.0.0
+            RAW_TAG="${GITHUB_REF#refs/tags/wndrvr_}"         # v1.0.0
+            SEMVER="${RAW_TAG#v}"                               # 1.0.0
             echo "chart_version=${SEMVER}" >> "$GITHUB_OUTPUT"
-            echo "app_version=${RAW_TAG}" >> "$GITHUB_OUTPUT"
+            echo "app_version=${TAG_NAME}" >> "$GITHUB_OUTPUT"  # wndrvr_v1.0.0
           else
             SHA_SHORT=$(git rev-parse --short HEAD)
             echo "chart_version=0.0.0-dev.${SHA_SHORT}" >> "$GITHUB_OUTPUT"
