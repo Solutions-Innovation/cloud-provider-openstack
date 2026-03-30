@@ -168,4 +168,4 @@ zz_generated.openapi.go
 .crossnote/*.*
 
 # wndrvr github agent
-.github/agents	
+.github/agents
