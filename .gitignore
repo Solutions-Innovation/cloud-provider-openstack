@@ -166,4 +166,5 @@ zz_generated.openapi.go
 
 # wndrvr github skills and agent
 .github/skills
-.github/agents	
+
+.github/agents
