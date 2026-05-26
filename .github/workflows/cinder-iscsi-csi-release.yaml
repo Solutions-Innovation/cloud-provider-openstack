@@ -167,6 +167,9 @@ jobs:
       - name: Lint Helm chart
         run: helm lint ${{ env.HELM_CHART_DIR }}
 
+      - name: Verify Helm chart compatibility renders
+        run: bash hack/verify-cinder-iscsi-chart.sh
+
       - name: Package Helm chart
         id: package
         run: |

@@ -1,0 +1,8 @@
+cacert:
+  enabled: false
+
+csi:
+  plugin:
+    image:
+      repository: docker.io/michaelbi/cinder-iscsi-csi-plugin
+      tag: a12cfb84

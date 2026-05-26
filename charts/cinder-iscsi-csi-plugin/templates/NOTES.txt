@@ -1,3 +1,4 @@
+{{- $cacert := include "cinder-iscsi-csi.cacert" . | fromYaml -}}
 iSCSI-backed Cinder CSI plugin has been installed.
 
 {{- if .Values.storageClass.enabled }}
@@ -27,19 +28,19 @@ Use this StorageClass for iSCSI-backed block PVCs:
 Driver configuration (driver.conf) is managed via ConfigMap "{{ .Values.driverConfig.name }}".
 {{- end }}
 
-{{- if .Values.cacert.enabled }}
+{{- if $cacert.enabled }}
 
 CA certificate bundle mounting is enabled for the CSI controller plugin:
-  source: {{ .Values.cacert.source }}
-  mountPath: {{ .Values.cacert.mountPath }}
-{{- if eq .Values.cacert.source "hostPath" }}
-  hostPath: {{ .Values.cacert.hostPath.path }}
+  source: {{ $cacert.source }}
+  mountPath: {{ $cacert.mountPath }}
+{{- if eq $cacert.source "hostPath" }}
+  hostPath: {{ $cacert.hostPath.path }}
 
 The CA bundle must already exist on every node where the CSI controller pod may run,
 or the controller pod must be pinned to a node where it exists. Helm only mounts the
 directory; it does not create or install certificates on the host.
-{{- else if eq .Values.cacert.source "secret" }}
-  secret: {{ .Values.cacert.secret.name }}
+{{- else if eq $cacert.source "secret" }}
+  secret: {{ $cacert.secret.name }}
 
 Create the CA Secret before installing or upgrading this chart.
 {{- end }}
@@ -47,17 +48,17 @@ Create the CA Secret before installing or upgrading this chart.
 Make sure cloud.conf references the mounted CA file, for example:
 
   [Global]
-  ca-file={{ .Values.cacert.mountPath }}/{{ .Values.cacert.filename }}
+  ca-file={{ $cacert.mountPath }}/{{ $cacert.filename }}
 
-{{- if eq .Values.cacert.source "hostPath" }}
+{{- if eq $cacert.source "hostPath" }}
 For hostPath mode, validate the host CA bundle and endpoint trust before install:
 
-  ls -ld {{ .Values.cacert.hostPath.path }}
-  ls -l {{ .Values.cacert.hostPath.path }}/{{ .Values.cacert.filename }}
+  ls -ld {{ $cacert.hostPath.path }}
+  ls -l {{ $cacert.hostPath.path }}/{{ $cacert.filename }}
   openssl s_client \
     -connect <keystone-host>:443 \
     -servername <keystone-host> \
-    -CAfile {{ .Values.cacert.hostPath.path }}/{{ .Values.cacert.filename }} \
+    -CAfile {{ $cacert.hostPath.path }}/{{ $cacert.filename }} \
     -verify_return_error </dev/null
 
 Expected success:

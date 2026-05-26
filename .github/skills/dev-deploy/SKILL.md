@@ -179,20 +179,31 @@ make build-local-image-cinder-iscsi-csi-plugin
    `toolchain`, `undefined:` on newer stdlib), activate the **go-version-fix**
    skill, then retry the build.
 
-3. If build fails for other reasons, report the error and stop.
+3. If build fails with a Docker socket permission error (`permission denied`
+  while connecting to `/var/run/docker.sock`), ask the user whether to retry
+  the Docker-backed commands with `sudo`. If the user provides or enables
+  elevated access, rerun the build with `sudo` and continue using the same
+  privilege level for later Docker commands (`docker images`, `docker tag`,
+  `docker push`, `docker inspect`).
 
-4. After successful build, find the local image name:
+4. If build fails for other reasons, report the error and stop.
+
+5. After successful build, find the exact local image name that was built:
 ```bash
-docker images | grep cinder-iscsi-csi-plugin | head -5
+docker images --format '{{.Repository}}:{{.Tag}}' | grep '^registry.k8s.io/provider-os/cinder-iscsi-csi-plugin:' | head -5
 ```
 
-5. Tag the image for the target registry:
+Choose the newest tag from the current build output (for example
+`registry.k8s.io/provider-os/cinder-iscsi-csi-plugin:v1.35.0-48-ga12cfb84-dirty`).
+
+6. Tag the image for the target registry:
 ```bash
-docker tag registry.k8s.io/provider-os/cinder-iscsi-csi-plugin:latest <REGISTRY_REPO>:<TAG>
+docker tag <LOCAL_IMAGE_FROM_BUILD> <REGISTRY_REPO>:<TAG>
 ```
 
-**Note:** The Makefile builds with registry `registry.k8s.io/provider-os` by default.
-The tag step re-tags to the user's chosen registry.
+**Note:** The Makefile builds with repository `registry.k8s.io/provider-os` by
+default, but the tag is versioned rather than always `latest`. Reuse the exact
+source image discovered in the previous step.
 
 ### Step 4: Push image (if "Push image" selected)
 
@@ -203,6 +214,12 @@ cat ~/.docker/config.json 2>/dev/null | grep -q '<registry_domain>'
 Where `<registry_domain>` is extracted from `REGISTRY_REPO` (e.g., `docker.io`,
 `ghcr.io`).
 
+If you are using `sudo` for Docker because of socket permissions, check the
+root Docker config instead:
+```bash
+sudo test -f /root/.docker/config.json && sudo grep -q '<registry_domain>' /root/.docker/config.json
+```
+
 2. **If not authenticated**, prompt the user:
    - Use `ask_questions` with freeform:
      - Header: `Docker Auth`
@@ -211,6 +228,9 @@ Where `<registry_domain>` is extracted from `REGISTRY_REPO` (e.g., `docker.io`,
        Then confirm when done.`
      - Options: `Done, I logged in` / `Skip push`
    - If user skips, skip this step entirely.
+
+   If Docker commands are running under `sudo`, tell the user to log in with:
+   `sudo docker login <registry_domain>`.
 
 3. **Push the image**:
 ```bash
@@ -255,7 +275,29 @@ Set `KUBECONFIG=$HOME/.kube/config-staging` (or the user's chosen path with
   - `Let me choose a different namespace`
 - If the user chooses a different namespace, use that for all driver manifests.
 
-Apply manifests in order:
+Before applying the example manifests, detect whether the cluster already has a
+cinder-iSCSI deployment for the same driver name:
+```bash
+kubectl get csidriver cinder-iscsi.csi.windriver.com
+kubectl get deploy,daemonset -A | grep -i 'cinder-iscsi'
+```
+
+If the cluster already has controller/node workloads for this driver but under
+different names (for example a Helm-managed release such as
+`openstack-cinder-iscsi-csi-controllerplugin` and
+`openstack-cinder-iscsi-csi-nodeplugin`), **do not apply** the example
+`controller.yaml` and `node.yaml` manifests. That would create a second driver
+workload set for the same `CSIDriver` and can conflict.
+
+In that case, update the existing workloads in place instead:
+```bash
+kubectl -n kube-system set image deployment/<existing-controller-name> cinder-iscsi-csi-plugin=<REGISTRY_REPO>:<TAG>
+kubectl -n kube-system set image daemonset/<existing-node-name> cinder-iscsi-csi-plugin=<REGISTRY_REPO>:<TAG>
+kubectl -n kube-system rollout status deployment/<existing-controller-name> --timeout=180s
+kubectl -n kube-system rollout status daemonset/<existing-node-name> --timeout=300s
+```
+
+If no existing cinder-iSCSI workloads are present, apply manifests in order:
 ```bash
 export KUBECONFIG=$HOME/.kube/config-staging
 kubectl apply -f examples/cinder-iscsi-csi-plugin/plugin/secret.yaml
@@ -267,11 +309,6 @@ kubectl apply -f examples/cinder-iscsi-csi-plugin/storageclass.yaml
 ```
 
 If any `kubectl apply` fails, report the error and **stop**.
-
-After all applies succeed, wait briefly for pods to start:
-```bash
-sleep 5
-```
 
 ### Step 6b: CDI StorageProfile patch (if CDI is present)
 
@@ -332,26 +369,26 @@ If not found, report and stop.
 
 2. **Controller pod status**:
 ```bash
-kubectl get pods -n kube-system -l app=csi-cinder-iscsi-controllerplugin -o wide
+kubectl get pods -n kube-system -l app=csi-cinder-iscsi-controllerplugin -o wide || kubectl get pods -n kube-system -l component=controllerplugin,app=openstack-cinder-iscsi-csi -o wide
 ```
 
 3. **Node pod status**:
 ```bash
-kubectl get pods -n kube-system -l app=csi-cinder-iscsi-nodeplugin -o wide
+kubectl get pods -n kube-system -l app=csi-cinder-iscsi-nodeplugin -o wide || kubectl get pods -n kube-system -l component=nodeplugin,app=openstack-cinder-iscsi-csi -o wide
 ```
 
 4. **Wait for pods** (up to 90 seconds):
 ```bash
-kubectl wait --for=condition=Ready pod -n kube-system -l app=csi-cinder-iscsi-controllerplugin --timeout=90s
-kubectl wait --for=condition=Ready pod -n kube-system -l app=csi-cinder-iscsi-nodeplugin --timeout=90s
+kubectl wait --for=condition=Ready pod -n kube-system -l app=csi-cinder-iscsi-controllerplugin --timeout=90s || kubectl wait --for=condition=Ready pod -n kube-system -l component=controllerplugin,app=openstack-cinder-iscsi-csi --timeout=90s
+kubectl wait --for=condition=Ready pod -n kube-system -l app=csi-cinder-iscsi-nodeplugin --timeout=90s || kubectl wait --for=condition=Ready pod -n kube-system -l component=nodeplugin,app=openstack-cinder-iscsi-csi --timeout=90s
 ```
 
 5. **If pods are NOT ready after timeout**, collect diagnostics:
 ```bash
-kubectl describe pod -n kube-system -l app=csi-cinder-iscsi-controllerplugin | tail -30
-kubectl logs -n kube-system -l app=csi-cinder-iscsi-controllerplugin -c cinder-iscsi-csi-plugin --tail=30
-kubectl describe pod -n kube-system -l app=csi-cinder-iscsi-nodeplugin | tail -30
-kubectl logs -n kube-system -l app=csi-cinder-iscsi-nodeplugin -c cinder-iscsi-csi-plugin --tail=30
+kubectl describe pod -n kube-system -l app=csi-cinder-iscsi-controllerplugin | tail -30 || kubectl describe pod -n kube-system -l component=controllerplugin,app=openstack-cinder-iscsi-csi | tail -30
+kubectl logs -n kube-system -l app=csi-cinder-iscsi-controllerplugin -c cinder-iscsi-csi-plugin --tail=30 || kubectl logs -n kube-system -l component=controllerplugin,app=openstack-cinder-iscsi-csi -c cinder-iscsi-csi-plugin --tail=30
+kubectl describe pod -n kube-system -l app=csi-cinder-iscsi-nodeplugin | tail -30 || kubectl describe pod -n kube-system -l component=nodeplugin,app=openstack-cinder-iscsi-csi | tail -30
+kubectl logs -n kube-system -l app=csi-cinder-iscsi-nodeplugin -c cinder-iscsi-csi-plugin --tail=30 || kubectl logs -n kube-system -l component=nodeplugin,app=openstack-cinder-iscsi-csi -c cinder-iscsi-csi-plugin --tail=30
 ```
 
 6. **Report summary**:
@@ -378,6 +415,19 @@ Activate `go-version-fix` skill (use `gvm` to switch), then retry the build.
 
 ### Build fails — other error
 Report the error output and stop. Let the user fix and re-run.
+
+### Docker socket permission denied
+If Docker-backed commands fail with `permission denied` on
+`/var/run/docker.sock`, ask whether to retry with `sudo`. If the user agrees,
+rerun the Docker commands (`make build-local-image-cinder-iscsi-csi-plugin`
+if it shells out to Docker, `docker images`, `docker tag`, `docker push`,
+`docker inspect`) with `sudo` consistently for the rest of the workflow.
+
+### Existing cinder-iSCSI deployment already present
+If the cluster already has a cinder-iSCSI controller and node deployment for
+`cinder-iscsi.csi.windriver.com`, do an in-place image update of the existing
+workloads instead of applying the example workload manifests. This avoids
+conflicts from running two driver stacks for the same `CSIDriver` name.
 
 ### Docker push fails — auth error
 Prompt the user to run `docker login` manually, then retry once.

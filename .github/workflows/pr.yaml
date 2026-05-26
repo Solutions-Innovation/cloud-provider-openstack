@@ -30,3 +30,6 @@ jobs:
 
       - name: Run chart-testing (lint)
         run: ct lint --target-branch ${GITHUB_BASE_REF}
+
+      - name: Verify cinder-iscsi chart compatibility renders
+        run: bash hack/verify-cinder-iscsi-chart.sh

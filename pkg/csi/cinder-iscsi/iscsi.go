@@ -44,6 +44,11 @@ type ISCSIInitiator interface {
 	//   iscsiadm -m discovery -t sendtargets -p <portal>
 	Discovery(ctx context.Context, portal string) error
 
+	// CreateOrUpdateNode ensures the iscsiadm node DB entry exists for the
+	// supplied target IQN and portal.
+	//   iscsiadm -m node -T <iqn> -p <portal> --op new
+	CreateOrUpdateNode(ctx context.Context, iqn, portal string) error
+
 	// SetCHAPAuth configures CHAP credentials on an iscsiadm node entry.
 	//   iscsiadm -m node -T <iqn> -p <portal> --op update -n node.session.auth.authmethod -v CHAP
 	//   iscsiadm -m node -T <iqn> -p <portal> --op update -n node.session.auth.username  -v <username>
@@ -96,6 +101,36 @@ func (i *iscsiadmInitiator) Discovery(ctx context.Context, portal string) error 
 		return fmt.Errorf("iscsiadm discovery failed (portal=%s): %w, output: %s", portal, err, string(out))
 	}
 	klog.V(5).Infof("iscsiadm discovery output: %s", string(out))
+	return nil
+}
+
+func (i *iscsiadmInitiator) CreateOrUpdateNode(ctx context.Context, iqn, portal string) error {
+	// Pre-check whether the node record already exists. iscsiadm reports a
+	// missing record with exit code 21 (ISCSI_ERR_NO_OBJS_FOUND) and the
+	// stderr marker "No records found" — the same contract relied on by
+	// DeleteNode and IsSessionActive elsewhere in this file. Using the
+	// query path lets us avoid interpreting the brittle "already exists"
+	// stderr emitted by `--op new` on a duplicate (exit code 6 there is
+	// shared with genuine ISCSI_ERR_INVAL failures, so it is not
+	// distinguishing on its own).
+	checkArgs := []string{"-m", "node", "-T", iqn, "-p", portal}
+	out, err := i.exec.CommandContext(ctx, "iscsiadm", checkArgs...).CombinedOutput()
+	if err == nil {
+		klog.V(3).Infof("iscsiadm node record already exists for iqn=%s portal=%s (idempotent)", iqn, portal)
+		return nil
+	}
+	if !strings.Contains(string(out), "No records found") {
+		return fmt.Errorf("iscsiadm node query failed (iqn=%s portal=%s): %w, output: %s",
+			iqn, portal, err, string(out))
+	}
+
+	// Record absent — create it. Any failure here is a real error.
+	createArgs := []string{"-m", "node", "-T", iqn, "-p", portal, "--op", "new"}
+	klog.V(4).Infof("iscsiadm create node: iqn=%s portal=%s", iqn, portal)
+	if out, err := i.exec.CommandContext(ctx, "iscsiadm", createArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("iscsiadm create node failed (iqn=%s portal=%s): %w, output: %s",
+			iqn, portal, err, string(out))
+	}
 	return nil
 }
 

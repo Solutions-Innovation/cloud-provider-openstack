@@ -120,3 +120,12 @@ Create unified annotations for cinder-iscsi-csi components
 {{- toYaml .Values.csi.plugin.nodePlugin.podAnnotations }}
 {{- end }}
 {{- end -}}
+
+{{/*
+Build a backward-compatible cacert values object so upgrades from older
+releases that never had .Values.cacert do not fail template rendering.
+*/}}
+{{- define "cinder-iscsi-csi.cacert" -}}
+{{- $defaults := dict "enabled" false "source" "hostPath" "mountPath" "/etc/ssl/certs" "filename" "ca-certificates.crt" "hostPath" (dict "path" "/etc/ssl/certs" "type" "Directory") "secret" (dict "name" "cinder-iscsi-ca-cert" "optional" false) -}}
+{{- toYaml (mergeOverwrite $defaults (.Values.cacert | default dict)) -}}
+{{- end -}}
