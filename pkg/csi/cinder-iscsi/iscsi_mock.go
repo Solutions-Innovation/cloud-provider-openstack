@@ -37,6 +37,11 @@ func (m *ISCSIInitiatorMock) Discovery(ctx context.Context, portal string) error
 	return args.Error(0)
 }
 
+func (m *ISCSIInitiatorMock) CreateOrUpdateNode(ctx context.Context, iqn, portal string) error {
+	args := m.Called(ctx, iqn, portal)
+	return args.Error(0)
+}
+
 func (m *ISCSIInitiatorMock) SetCHAPAuth(ctx context.Context, iqn, portal, username, password string) error {
 	args := m.Called(ctx, iqn, portal, username, password)
 	return args.Error(0)

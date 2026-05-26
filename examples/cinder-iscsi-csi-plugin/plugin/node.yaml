@@ -54,12 +54,12 @@ spec:
             - name: socket-dir
               mountPath: /csi
         - name: cinder-iscsi-csi-plugin
+          image: docker.io/michaelbi/cinder-iscsi-csi-plugin:a12cfb84
           securityContext:
             privileged: true
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: docker.io/michaelbi/cinder-iscsi-csi-plugin:latest
           args:
             - /bin/cinder-iscsi-csi-plugin
             - "--endpoint=$(CSI_ENDPOINT)"

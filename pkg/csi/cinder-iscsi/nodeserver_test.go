@@ -21,6 +21,7 @@ package iscsi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,6 +32,8 @@ import (
 	"github.com/stretchr/testify/mock"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder-iscsi/openstack"
 	mountutil "k8s.io/cloud-provider-openstack/pkg/util/mount"
+	utilsexec "k8s.io/utils/exec"
+	testingexec "k8s.io/utils/exec/testing"
 )
 
 // ── Test Helpers ──────────────────────────────────────────────────────────────
@@ -242,6 +245,10 @@ func TestNodeStageVolume_IdempotentSessionActive(t *testing.T) {
 	assert.NoError(t, readErr)
 	assert.Equal(t, devicePath, string(data))
 
+	iscsiMock.AssertNotCalled(t, "Discovery", mock.Anything, portal)
+	iscsiMock.AssertNotCalled(t, "CreateOrUpdateNode", mock.Anything, iqn, portal)
+	iscsiMock.AssertNotCalled(t, "SetCHAPAuth", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	iscsiMock.AssertNotCalled(t, "Login", mock.Anything, iqn, portal)
 	iscsiMock.AssertExpectations(t)
 }
 
@@ -267,7 +274,7 @@ func TestNodeStageVolume_Success(t *testing.T) {
 
 	// Mock expectations
 	iscsiMock.On("IsSessionActive", mock.Anything, iqn, portal).Return(false, nil)
-	iscsiMock.On("Discovery", mock.Anything, portal).Return(nil)
+	iscsiMock.On("CreateOrUpdateNode", mock.Anything, iqn, portal).Return(nil)
 	iscsiMock.On("Login", mock.Anything, iqn, portal).Return(nil)
 
 	resp, err := ns.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
@@ -285,6 +292,41 @@ func TestNodeStageVolume_Success(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, devicePath, string(data))
 
+	iscsiMock.AssertNotCalled(t, "Discovery", mock.Anything, portal)
+	iscsiMock.AssertExpectations(t)
+}
+
+func TestNodeStageVolume_NodeRecordAlreadyExists(t *testing.T) {
+	iscsiMock := &ISCSIInitiatorMock{}
+	mountMock := &mountutil.MountMock{}
+	ns := fakeNodeServer(iscsiMock, mountMock)
+
+	stagingDir := t.TempDir()
+	portal := "10.0.0.1:3260"
+	iqn := "iqn.2010-10.org.openstack:volume-vol-001"
+
+	origPrefix := devicePathPrefix
+	devicePathPrefix = t.TempDir()
+	t.Cleanup(func() { devicePathPrefix = origPrefix })
+
+	devicePath := BuildDevicePath(portal, iqn, 1)
+	assert.NoError(t, os.MkdirAll(filepath.Dir(devicePath), 0755))
+	assert.NoError(t, os.WriteFile(devicePath, []byte("x"), 0644))
+
+	iscsiMock.On("IsSessionActive", mock.Anything, iqn, portal).Return(false, nil)
+	iscsiMock.On("CreateOrUpdateNode", mock.Anything, iqn, portal).Return(nil)
+	iscsiMock.On("Login", mock.Anything, iqn, portal).Return(nil)
+
+	resp, err := ns.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-001",
+		StagingTargetPath: stagingDir,
+		VolumeCapability:  blockCapability(),
+		PublishContext:    stagePublishContext(),
+	})
+
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+	iscsiMock.AssertNotCalled(t, "Discovery", mock.Anything, portal)
 	iscsiMock.AssertExpectations(t)
 }
 
@@ -309,7 +351,7 @@ func TestNodeStageVolume_WithCHAP(t *testing.T) {
 	assert.NoError(t, os.WriteFile(devicePath, []byte("x"), 0644))
 
 	iscsiMock.On("IsSessionActive", mock.Anything, iqn, portal).Return(false, nil)
-	iscsiMock.On("Discovery", mock.Anything, portal).Return(nil)
+	iscsiMock.On("CreateOrUpdateNode", mock.Anything, iqn, portal).Return(nil)
 	iscsiMock.On("SetCHAPAuth", mock.Anything, iqn, portal, "user1", "secret1").Return(nil)
 	iscsiMock.On("Login", mock.Anything, iqn, portal).Return(nil)
 
@@ -322,6 +364,7 @@ func TestNodeStageVolume_WithCHAP(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
+	iscsiMock.AssertNotCalled(t, "Discovery", mock.Anything, portal)
 	iscsiMock.AssertExpectations(t)
 }
 
@@ -331,7 +374,7 @@ func TestNodeStageVolume_CHAPMissingCredentials(t *testing.T) {
 	ns := fakeNodeServer(iscsiMock, mountMock)
 
 	iscsiMock.On("IsSessionActive", mock.Anything, mock.Anything, mock.Anything).Return(false, nil)
-	iscsiMock.On("Discovery", mock.Anything, mock.Anything).Return(nil)
+	iscsiMock.On("CreateOrUpdateNode", mock.Anything, "iqn.test", "10.0.0.1:3260").Return(nil)
 
 	_, err := ns.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-001",
@@ -348,6 +391,7 @@ func TestNodeStageVolume_CHAPMissingCredentials(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "auth_username or auth_password missing")
+	iscsiMock.AssertNotCalled(t, "Discovery", mock.Anything, mock.Anything)
 }
 
 func TestNodeStageVolume_WaitForDeviceTimeout(t *testing.T) {
@@ -360,7 +404,7 @@ func TestNodeStageVolume_WaitForDeviceTimeout(t *testing.T) {
 	iqn := "iqn.2010-10.org.openstack:volume-vol-001"
 
 	iscsiMock.On("IsSessionActive", mock.Anything, iqn, portal).Return(false, nil)
-	iscsiMock.On("Discovery", mock.Anything, portal).Return(nil)
+	iscsiMock.On("CreateOrUpdateNode", mock.Anything, iqn, portal).Return(nil)
 	iscsiMock.On("Login", mock.Anything, iqn, portal).Return(nil)
 	// Cleanup calls after WaitForDevice failure
 	iscsiMock.On("Logout", mock.Anything, iqn, portal).Return(nil)
@@ -742,6 +786,93 @@ func TestBuildParseDevicePath_Roundtrip(t *testing.T) {
 	assert.Equal(t, portal, pPortal)
 	assert.Equal(t, iqn, pIQN)
 	assert.Equal(t, lun, pLUN)
+}
+
+func TestCreateOrUpdateNode(t *testing.T) {
+	const (
+		testIQN    = "iqn.2010-10.org.openstack:volume-vol-001"
+		testPortal = "10.0.0.1:3260"
+	)
+	queryArgs := []string{"-m", "node", "-T", testIQN, "-p", testPortal}
+	createArgs := []string{"-m", "node", "-T", testIQN, "-p", testPortal, "--op", "new"}
+
+	type scriptedCmd struct {
+		output string
+		err    error
+	}
+
+	tests := []struct {
+		name         string
+		scripted     []scriptedCmd
+		expectedArgs [][]string
+		wantErr      string
+	}{
+		{
+			name: "node record already exists - skips create",
+			scripted: []scriptedCmd{
+				{output: "tcp,1 " + testIQN + "\n"},
+			},
+			expectedArgs: [][]string{queryArgs},
+		},
+		{
+			name: "node record missing - creates successfully",
+			scripted: []scriptedCmd{
+				{output: "iscsiadm: No records found", err: errors.New("exit status 21")},
+				{output: ""},
+			},
+			expectedArgs: [][]string{queryArgs, createArgs},
+		},
+		{
+			name: "pre-check fails with unexpected error",
+			scripted: []scriptedCmd{
+				{output: "iscsiadm: cannot open InitiatorName file", err: errors.New("exit status 7")},
+			},
+			expectedArgs: [][]string{queryArgs},
+			wantErr:      "iscsiadm node query failed",
+		},
+		{
+			name: "create fails after missing pre-check",
+			scripted: []scriptedCmd{
+				{output: "iscsiadm: No records found", err: errors.New("exit status 21")},
+				{output: "iscsiadm: Could not add new record", err: errors.New("exit status 6")},
+			},
+			expectedArgs: [][]string{queryArgs, createArgs},
+			wantErr:      "iscsiadm create node failed",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fakeExec := &testingexec.FakeExec{}
+			var gotArgs [][]string
+			for _, scripted := range test.scripted {
+				scripted := scripted // capture
+				fakeCmd := &testingexec.FakeCmd{
+					CombinedOutputScript: []testingexec.FakeAction{
+						func() ([]byte, []byte, error) {
+							return []byte(scripted.output), nil, scripted.err
+						},
+					},
+				}
+				fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) utilsexec.Cmd {
+					assert.Equal(t, "iscsiadm", cmd)
+					gotArgs = append(gotArgs, append([]string(nil), args...))
+					return testingexec.InitFakeCmd(fakeCmd, cmd)
+				})
+			}
+
+			initiator := &iscsiadmInitiator{exec: fakeExec}
+			err := initiator.CreateOrUpdateNode(context.Background(), testIQN, testPortal)
+
+			if test.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), test.wantErr)
+			}
+			assert.Equal(t, test.expectedArgs, gotArgs)
+		})
+	}
 }
 
 func TestReadInitiatorIQN_Valid(t *testing.T) {

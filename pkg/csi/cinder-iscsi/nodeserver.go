@@ -175,10 +175,14 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		}
 	}
 
-	// ── iSCSI Discovery ──────────────────────────────────────────────────
-	// e.g. iscsiadm -m discovery -t sendtargets -p "69.167.149.97:3260"
-	if err := ns.ISCSI.Discovery(ctx, portal); err != nil {
-		return nil, status.Errorf(codes.Internal, "iSCSI discovery failed: %v", err)
+	// ── Ensure iSCSI node record exists ──────────────────────────────────
+	// Cinder already provides target_iqn/target_portal in PublishContext. Use
+	// those values directly instead of SendTargets discovery, which some
+	// backends (for example SolidFire) reject unless discovery-time CHAP has
+	// already been configured on the host.
+	// e.g. iscsiadm -m node -T <iqn> -p "69.167.149.97:3260" --op new
+	if err := ns.ISCSI.CreateOrUpdateNode(ctx, iqn, portal); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create iSCSI node record: %v", err)
 	}
 
 	// ── Set CHAP auth if required ────────────────────────────────────────

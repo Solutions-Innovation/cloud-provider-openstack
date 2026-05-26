@@ -1,0 +1,14 @@
+cacert:
+  enabled: true
+  source: hostPath
+  mountPath: /etc/ssl/certs
+  filename: ca-certificates.crt
+  hostPath:
+    path: /etc/ssl/certs
+    type: Directory
+
+csi:
+  plugin:
+    image:
+      repository: ghcr.io/solutions-innovation/cinder-iscsi-csi-plugin
+      tag: test
