@@ -62,6 +62,7 @@
     - [8.1 Network Topology](#81-network-topology)
     - [8.2 Network Requirements](#82-network-requirements)
   - [9. Prerequisites](#9-prerequisites)
+    - [9.1 Troubleshooting Sanity Check: PVC `Bound`, Pod `ContainerCreating`](#91-troubleshooting-sanity-check-pvc-bound-pod-containercreating)
   - [10. Risks and Mitigations](#10-risks-and-mitigations)
   - [11. Future Work](#11-future-work)
   - [Appendix A — iSCSI Initiator Configuration for Pure Storage](#appendix-a--iscsi-initiator-configuration-for-pure-storage)
@@ -71,6 +72,14 @@
     - [A.4 Automation with Ansible](#a4-automation-with-ansible)
     - [A.5 Troubleshooting — IQN Not Registered](#a5-troubleshooting--iqn-not-registered)
     - [A.6 RHOSO 18 Cinder Microversion Compatibility](#a6-rhoso-18-cinder-microversion-compatibility)
+  - [Appendix B — Cinder v3 Attachment API: curl Walkthrough](#appendix-b--cinder-v3-attachment-api-curl-walkthrough)
+    - [B.1 Authenticate and get a token](#b1-authenticate-and-get-a-token)
+    - [B.2 Locate the Cinder endpoint and a target volume](#b2-locate-the-cinder-endpoint-and-a-target-volume)
+    - [B.3 Create an attachment (no connector — volume moves to `reserved`)](#b3-create-an-attachment-no-connector--volume-moves-to-reserved)
+    - [B.4 Update the attachment with the initiator connector](#b4-update-the-attachment-with-the-initiator-connector)
+    - [B.5 Connect the iSCSI session (on the worker node)](#b5-connect-the-iscsi-session-on-the-worker-node)
+    - [B.6 Mark the attachment complete (microversion 3.44)](#b6-mark-the-attachment-complete-microversion-344)
+    - [B.7 Tear down — logout and delete the attachment](#b7-tear-down--logout-and-delete-the-attachment)
   - [12. References](#12-references)
 
 ---
@@ -1721,6 +1730,170 @@ delete-volume-mode = retain
 | **WRC K8S Cluster** | Existing WRC K8S cluster with CDI installed and operational. |
 | **Privileged Host Access** | CSI Node DaemonSet pods must run as privileged to execute `iscsiadm` and access `/dev/disk/by-path/`. |
 
+### 9.1 Troubleshooting Sanity Check: PVC `Bound`, Pod `ContainerCreating`
+
+During the block-volume sanity check, a PVC that reaches `Bound` confirms that
+controller-side provisioning succeeded: Kubernetes called `CreateVolume`, the CSI
+controller created a Cinder volume, and a PV was returned. The workload pod should
+normally move from `ContainerCreating` to `Running` within seconds to a few minutes
+after scheduling. Waiting for multiple hours is not expected and should be treated
+as a node-side attach, iSCSI login, kubelet, or container runtime problem.
+
+Use the following checks to identify where the flow is blocked.
+
+1. Confirm the PVC, PV, and scheduled node.
+
+```bash
+kubectl get pvc csi-pvc-cinder-iscsi-block -o wide
+kubectl get pod test-block-cinder-iscsi -o wide
+
+PV_NAME=$(kubectl get pvc csi-pvc-cinder-iscsi-block -o jsonpath='{.spec.volumeName}')
+VOL_ID=$(kubectl get pv "$PV_NAME" -o jsonpath='{.spec.csi.volumeHandle}')
+NODE_NAME=$(kubectl get pod test-block-cinder-iscsi -o jsonpath='{.spec.nodeName}')
+
+echo "PV_NAME=$PV_NAME"
+echo "VOL_ID=$VOL_ID"
+echo "NODE_NAME=$NODE_NAME"
+kubectl get pv "$PV_NAME" -o yaml
+```
+
+Interpretation:
+
+- `PVC STATUS=Bound` means Cinder volume provisioning is complete.
+- An empty `NODE_NAME` means the pod has not been scheduled yet; check scheduler
+  events, taints, node selectors, and resource pressure before investigating iSCSI.
+- A non-empty `NODE_NAME` with long-running `ContainerCreating` means kubelet is
+  waiting on volume setup or container creation on that worker.
+
+2. Read the pod events. This is the fastest way to separate volume attach issues
+   from image/runtime issues.
+
+```bash
+kubectl describe pod test-block-cinder-iscsi
+kubectl get events --sort-by=.lastTimestamp | tail -50
+```
+
+Common event patterns:
+
+| Event text | Likely area |
+|------------|-------------|
+| `AttachVolume.Attach failed`, `MountVolume.SetUp failed`, `NodeStageVolume`, `NodePublishVolume` | CSI node-side attach or iSCSI login |
+| `timed out waiting for the condition`, `context deadline exceeded` | CSI sidecar timeout, kubelet timeout, or slow backend/API response |
+| `failed to pull image`, `ImagePullBackOff`, `ErrImagePull` | Container image registry/runtime, not Cinder iSCSI |
+| `iscsid`, `iscsiadm`, `No route to host`, `connection refused`, `CHAP` | Worker host iSCSI prerequisites or storage network |
+
+3. Inspect the Kubernetes `VolumeAttachment` object for the PV.
+
+```bash
+VA_NAME=$(kubectl get volumeattachment -o jsonpath="{range .items[?(@.spec.source.persistentVolumeName=='$PV_NAME')]}{.metadata.name}{'\n'}{end}")
+echo "VA_NAME=$VA_NAME"
+
+kubectl get volumeattachment "$VA_NAME" -o yaml
+kubectl describe volumeattachment "$VA_NAME"
+```
+
+Interpretation:
+
+- `status.attached: true` means the external-attacher completed
+  `ControllerPublishVolume`; focus on kubelet `NodeStageVolume` and
+  `NodePublishVolume` on the selected worker.
+- Missing `status.attached` or an attach error means the controller path failed;
+  inspect controller logs before investigating the node.
+
+4. Check CSI controller logs when the attachment did not complete.
+
+```bash
+kubectl -n kube-system logs deploy/csi-cinder-iscsi-controllerplugin \
+  -c cinder-iscsi-csi-plugin --tail=300
+kubectl -n kube-system logs deploy/csi-cinder-iscsi-controllerplugin \
+  -c csi-attacher --tail=200
+kubectl -n kube-system logs deploy/csi-cinder-iscsi-controllerplugin \
+  -c csi-provisioner --tail=200
+```
+
+Look for:
+
+- `ControllerPublishVolume` failures.
+- Cinder API authentication or authorization errors.
+- Cinder attachment update errors.
+- Missing or non-iSCSI `connection_info` returned by the backend.
+
+5. Check the node plugin on the worker that owns the pod.
+
+```bash
+NODEPLUGIN_POD=$(kubectl -n kube-system get pod -l app=csi-cinder-iscsi-nodeplugin \
+  -o jsonpath="{.items[?(@.spec.nodeName=='$NODE_NAME')].metadata.name}")
+echo "NODEPLUGIN_POD=$NODEPLUGIN_POD"
+
+kubectl -n kube-system get pod "$NODEPLUGIN_POD" -o wide
+kubectl -n kube-system logs "$NODEPLUGIN_POD" \
+  -c cinder-iscsi-csi-plugin --tail=300
+kubectl -n kube-system logs "$NODEPLUGIN_POD" \
+  -c node-driver-registrar --tail=100
+```
+
+Look for:
+
+- `NodeStageVolume` and `NodePublishVolume` entries for `VOL_ID`.
+- iSCSI discovery/login errors.
+- Device wait timeout messages while waiting for `/dev/disk/by-path`.
+- Permission errors accessing `/dev`, `/sys`, `/etc/iscsi`, or `/var/lib/iscsi`.
+
+6. Validate iSCSI state from the node plugin container.
+
+```bash
+kubectl -n kube-system exec "$NODEPLUGIN_POD" -c cinder-iscsi-csi-plugin -- iscsiadm -m session
+kubectl -n kube-system exec "$NODEPLUGIN_POD" -c cinder-iscsi-csi-plugin -- iscsiadm -m node
+kubectl -n kube-system exec "$NODEPLUGIN_POD" -c cinder-iscsi-csi-plugin -- sh -c 'ls -l /dev/disk/by-path | grep iscsi || true'
+kubectl -n kube-system exec "$NODEPLUGIN_POD" -c cinder-iscsi-csi-plugin -- sh -c 'lsblk || true'
+```
+
+Interpretation:
+
+- No iSCSI session usually means login failed or was never attempted.
+- A session exists but no `/dev/disk/by-path` entry usually means the SCSI device
+  did not appear before `device-wait-timeout` expired.
+- A by-path device exists while the pod is still `ContainerCreating` points to
+  kubelet device publish or container runtime setup.
+
+7. Validate required host services and storage-network reachability on the worker.
+
+Run these on `NODE_NAME` with the platform's normal node-access method:
+
+```bash
+sudo systemctl status iscsid
+sudo test -s /etc/iscsi/initiatorname.iscsi && cat /etc/iscsi/initiatorname.iscsi
+sudo iscsiadm -m session || true
+sudo iscsiadm -m node || true
+
+# Replace <target-ip> with the target_portal IP from controller logs or Cinder connection_info.
+nc -vz <target-ip> 3260
+```
+
+The node must have `iscsid` running, a valid initiator IQN, and TCP connectivity
+to the iSCSI target portal on port 3260. For Pure Storage, also confirm that the
+worker initiator IQN is registered or allowed by the FlashArray host/host group.
+
+8. Correlate with OpenStack when OpenStack CLI access is available.
+
+```bash
+openstack volume show "$VOL_ID"
+openstack volume attachment list --volume "$VOL_ID"
+```
+
+Expected state while the pod is starting or running:
+
+- The Cinder volume exists and matches the PV `volumeHandle`.
+- An attachment exists for the Kubernetes worker.
+- If the volume exists but there is no attachment, focus on controller publish
+  and external-attacher logs.
+- If an attachment exists but the pod remains `ContainerCreating`, focus on the
+  node plugin, `iscsid`, CHAP, target reachability, and kubelet events.
+
+If all CSI and iSCSI checks look healthy but the pod still does not start, inspect
+container runtime and kubelet logs on `NODE_NAME`; at that point the root cause is
+likely outside Cinder provisioning.
+
 ---
 
 ## 10. Risks and Mitigations
@@ -1950,6 +2123,215 @@ driver initialization. On RHOSO 18 it will always pass. The only edge case is
 migrating from RHOSP 13, where 3.44 (`os-complete`) is unavailable — the driver
 handles this gracefully by skipping the `CompleteAttachment` call when
 `SupportsV344 == false`.
+
+---
+
+## Appendix B — Cinder v3 Attachment API: curl Walkthrough
+
+This appendix shows how to use raw `curl` calls against the Cinder v3 Attachments
+API to allocate iSCSI connection info for a volume — the same sequence the CSI
+driver executes internally during `ControllerPublishVolume`.
+
+Defaults below match the dev LVM-iSCSI OpenStack (`69.167.148.187`).
+
+### B.1 Authenticate and get a token
+
+```bash
+TOKEN=$(curl -si -X POST http://69.167.148.187/identity/v3/auth/tokens \
+  -H "Content-Type: application/json" \
+  -d '{
+    "auth": {
+      "identity": {
+        "methods": ["password"],
+        "password": {
+          "user": {
+            "name": "admin",
+            "password": "$OS_PASSWORD",
+            "domain": {"name": "Default"}
+          }
+        }
+      },
+      "scope": {
+        "project": {"id": "04ae6b5d64b34570910d13172b5426b5"}
+      }
+    }
+  }' | grep -i '^X-Subject-Token' | awk '{print $2}' | tr -d '\r')
+
+echo "TOKEN=$TOKEN"
+```
+
+### B.2 Locate the Cinder endpoint and a target volume
+
+```bash
+# Get the Cinder v3 endpoint (volumev3 service, public interface)
+CINDER=$(curl -s http://69.167.148.187/identity/v3/endpoints \
+  -H "X-Auth-Token: $TOKEN" | \
+  python3 -c "
+import sys,json
+eps=json.load(sys.stdin)['endpoints']
+print(next(e['url'] for e in eps if e['interface']=='public' and 'volumev3' in e.get('service_id','') or e.get('type','')=='volumev3'))
+" 2>/dev/null || echo "http://69.167.148.187:8776/v3/04ae6b5d64b34570910d13172b5426b5")
+
+echo "CINDER=$CINDER"
+
+# List available volumes (pick one with status=available)
+curl -s "$CINDER/volumes" -H "X-Auth-Token: $TOKEN" | \
+  python3 -c "
+import sys,json
+for v in json.load(sys.stdin)['volumes']:
+    print(v['id'], v['name'], v.get('status'))
+"
+
+VOLUME_ID=<paste-volume-id-here>
+```
+
+### B.3 Create an attachment (no connector — volume moves to `reserved`)
+
+This corresponds to the CSI `CreateVolume` attachment reservation step. No
+iSCSI session is established yet.
+
+```bash
+ATTACH=$(curl -s -X POST "$CINDER/attachments" \
+  -H "X-Auth-Token: $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "X-OpenStack-Volume-microversion: 3.54" \
+  -d "{
+    \"attachment\": {
+      \"volume_id\": \"$VOLUME_ID\",
+      \"mode\": \"rw\"
+    }
+  }")
+
+echo "$ATTACH" | python3 -m json.tool
+ATTACH_ID=$(echo "$ATTACH" | python3 -c "import sys,json; print(json.load(sys.stdin)['attachment']['id'])")
+echo "ATTACH_ID=$ATTACH_ID"
+# Volume status is now: reserved
+```
+
+### B.4 Update the attachment with the initiator connector
+
+Sending the connector causes Cinder to call `initialize_connection` on the
+iSCSI backend. The response includes the `connection_info` the initiator needs
+to log in. This is what `ControllerPublishVolume` does.
+
+Replace `INITIATOR_IQN` with the IQN of the worker node that will mount the volume
+(from `/etc/iscsi/initiatorname.iscsi`).
+
+```bash
+INITIATOR_IQN="iqn.1994-05.com.redhat:worker-0"   # replace with actual IQN
+
+CONN=$(curl -s -X PUT "$CINDER/attachments/$ATTACH_ID" \
+  -H "X-Auth-Token: $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "X-OpenStack-Volume-microversion: 3.54" \
+  -d "{
+    \"attachment\": {
+      \"connector\": {
+        \"initiator\": \"$INITIATOR_IQN\",
+        \"ip\": \"127.0.0.1\",
+        \"host\": \"worker-0\",
+        \"os_type\": \"linux2\",
+        \"platform\": \"x86_64\",
+        \"multipath\": false,
+        \"do_local_attach\": false
+      }
+    }
+  }")
+
+echo "$CONN" | python3 -m json.tool
+```
+
+Expected `connection_info` shape in the response (LVM-iSCSI backend):
+
+```json
+{
+  "attachment": {
+    "id": "<attach-id>",
+    "status": "attached",
+    "connection_info": {
+      "driver_volume_type": "iscsi",
+      "data": {
+        "target_iqn":      "iqn.2010-10.org.openstack:volume-<vol-id>",
+        "target_portal":   "69.167.148.187:3260",
+        "target_lun":      0,
+        "auth_method":     "CHAP",
+        "auth_username":   "<chap-user>",
+        "auth_password":   "<chap-secret>",
+        "volume_id":       "<vol-id>",
+        "discard":         false
+      }
+    }
+  }
+}
+```
+
+Extract the key fields for use with `iscsiadm`:
+
+```bash
+TGT_IQN=$(echo "$CONN"    | python3 -c "import sys,json; d=json.load(sys.stdin)['attachment']['connection_info']['data']; print(d['target_iqn'])")
+TGT_PORTAL=$(echo "$CONN" | python3 -c "import sys,json; d=json.load(sys.stdin)['attachment']['connection_info']['data']; print(d['target_portal'])")
+TGT_LUN=$(echo "$CONN"    | python3 -c "import sys,json; d=json.load(sys.stdin)['attachment']['connection_info']['data']; print(d['target_lun'])")
+CHAP_USER=$(echo "$CONN"  | python3 -c "import sys,json; d=json.load(sys.stdin)['attachment']['connection_info']['data']; print(d.get('auth_username',''))")
+CHAP_PASS=$(echo "$CONN"  | python3 -c "import sys,json; d=json.load(sys.stdin)['attachment']['connection_info']['data']; print(d.get('auth_password',''))")
+
+echo "Target IQN:    $TGT_IQN"
+echo "Target portal: $TGT_PORTAL"
+echo "LUN:           $TGT_LUN"
+echo "CHAP user:     $CHAP_USER"
+```
+
+### B.5 Connect the iSCSI session (on the worker node)
+
+With the connection info from B.4, log in from the initiator host:
+
+```bash
+# Configure CHAP credentials for this target
+iscsiadm -m node --targetname "$TGT_IQN" --portal "$TGT_PORTAL" \
+  --op new
+iscsiadm -m node --targetname "$TGT_IQN" --portal "$TGT_PORTAL" \
+  --op update -n node.session.auth.authmethod -v CHAP
+iscsiadm -m node --targetname "$TGT_IQN" --portal "$TGT_PORTAL" \
+  --op update -n node.session.auth.username -v "$CHAP_USER"
+iscsiadm -m node --targetname "$TGT_IQN" --portal "$TGT_PORTAL" \
+  --op update -n node.session.auth.password -v "$CHAP_PASS"
+
+# Login
+iscsiadm -m node --targetname "$TGT_IQN" --portal "$TGT_PORTAL" --login
+
+# Identify the block device (appears as /dev/sd* or /dev/disk/by-path/...)
+ls -l /dev/disk/by-path/*"$TGT_IQN"*lun-"$TGT_LUN"
+```
+
+### B.6 Mark the attachment complete (microversion 3.44)
+
+Signals Cinder that the host has successfully connected (`os-complete` action).
+The volume status moves from `reserved` → `in-use`.
+
+```bash
+curl -s -X POST "$CINDER/attachments/$ATTACH_ID/action" \
+  -H "X-Auth-Token: $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "X-OpenStack-Volume-microversion: 3.44" \
+  -d '{"os-complete": {}}'
+# HTTP 204 No Content = success
+```
+
+### B.7 Tear down — logout and delete the attachment
+
+```bash
+# Logout iSCSI session on the worker node
+iscsiadm -m node --targetname "$TGT_IQN" --portal "$TGT_PORTAL" --logout
+
+# Delete the attachment via Cinder (calls terminate_connection + detach on backend)
+curl -s -X DELETE "$CINDER/attachments/$ATTACH_ID" \
+  -H "X-Auth-Token: $TOKEN" \
+  -H "X-OpenStack-Volume-microversion: 3.54"
+# HTTP 200 = success; volume status returns to: available
+```
+
+> **Tip:** If the volume must return to `available` without an iSCSI logout (e.g.,
+> to test `DeleteVolume` from the CSI driver), skip the `iscsiadm --logout` step —
+> Cinder will call `terminate_connection` on the backend regardless.
 
 ---
 
