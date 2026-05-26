@@ -121,7 +121,7 @@ secret:
 #      password=password
 #      trust-id=trust-id
 #      region=RegionOne
-#      ca-file=/etc/cacert/ca-bundle.crt
+#      ca-file=/etc/ssl/certs/ca-certificates.crt
 
 # ConfigMap for iSCSI driver configuration (driver.conf).
 # Contains no credentials — managed independently from the Secret.
@@ -145,6 +145,45 @@ driverConfig:
       create-timeout = 300
       detach-timeout = 120
       delete-volume-mode = retain
+
+# Optional CA certificate bundle for HTTPS-enabled OpenStack endpoints using
+# self-signed or private CA certificates.
+#
+# The CSI controller reads cloud.conf and calls Keystone/Cinder APIs, so this
+# mount is applied to the controller plugin pod only. The CSI node plugin does
+# not read cloud.conf and does not call Keystone/Cinder.
+#
+# cloud.conf must reference a file that exists inside the controller container,
+# for example:
+#   [Global]
+#   ca-file=/etc/ssl/certs/ca-certificates.crt
+#
+# HostPath mode does not create or install the CA file. The file must already
+# exist on every node where the controller pod may run, or the controller pod
+# must be pinned to a node where it exists.
+#
+# Example host validation for a Debian-style system CA bundle:
+#   ls -ld /etc/ssl/certs
+#   ls -l /etc/ssl/certs/ca-certificates.crt
+#   openssl s_client \
+#     -connect <keystone-host>:443 \
+#     -servername <keystone-host> \
+#     -CAfile /etc/ssl/certs/ca-certificates.crt \
+#     -verify_return_error </dev/null
+#
+# Expected openssl success:
+#   Verify return code: 0 (ok)
+cacert:
+  enabled: false
+  source: hostPath  # hostPath or secret
+  mountPath: /etc/ssl/certs
+  filename: ca-certificates.crt
+  hostPath:
+    path: /etc/ssl/certs
+    type: Directory
+  secret:
+    name: cinder-iscsi-ca-cert
+    optional: false
 
 storageClass:
   enabled: true
