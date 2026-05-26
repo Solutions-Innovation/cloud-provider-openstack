@@ -180,6 +180,11 @@ spec:
               subPath: driver.conf
               readOnly: true
             {{- end }}
+            {{- if .Values.cacert.enabled }}
+            - name: cacert
+              mountPath: {{ .Values.cacert.mountPath }}
+              readOnly: true
+            {{- end }}
           {{- with .Values.csi.plugin.volumeMounts }}
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -200,6 +205,20 @@ spec:
         - name: driver-config
           configMap:
             name: {{ .Values.driverConfig.name }}
+        {{- end }}
+        {{- if .Values.cacert.enabled }}
+        - name: cacert
+          {{- if eq .Values.cacert.source "secret" }}
+          secret:
+            secretName: {{ .Values.cacert.secret.name }}
+            optional: {{ .Values.cacert.secret.optional }}
+          {{- else if eq .Values.cacert.source "hostPath" }}
+          hostPath:
+            path: {{ .Values.cacert.hostPath.path }}
+            type: {{ .Values.cacert.hostPath.type }}
+          {{- else }}
+          {{- fail "cacert.source must be either 'hostPath' or 'secret'" }}
+          {{- end }}
         {{- end }}
         {{- with .Values.csi.plugin.volumes }}
           {{- toYaml . | nindent 8 }}

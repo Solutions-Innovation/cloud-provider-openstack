@@ -27,5 +27,43 @@ Use this StorageClass for iSCSI-backed block PVCs:
 Driver configuration (driver.conf) is managed via ConfigMap "{{ .Values.driverConfig.name }}".
 {{- end }}
 
+{{- if .Values.cacert.enabled }}
+
+CA certificate bundle mounting is enabled for the CSI controller plugin:
+  source: {{ .Values.cacert.source }}
+  mountPath: {{ .Values.cacert.mountPath }}
+{{- if eq .Values.cacert.source "hostPath" }}
+  hostPath: {{ .Values.cacert.hostPath.path }}
+
+The CA bundle must already exist on every node where the CSI controller pod may run,
+or the controller pod must be pinned to a node where it exists. Helm only mounts the
+directory; it does not create or install certificates on the host.
+{{- else if eq .Values.cacert.source "secret" }}
+  secret: {{ .Values.cacert.secret.name }}
+
+Create the CA Secret before installing or upgrading this chart.
+{{- end }}
+
+Make sure cloud.conf references the mounted CA file, for example:
+
+  [Global]
+  ca-file={{ .Values.cacert.mountPath }}/{{ .Values.cacert.filename }}
+
+{{- if eq .Values.cacert.source "hostPath" }}
+For hostPath mode, validate the host CA bundle and endpoint trust before install:
+
+  ls -ld {{ .Values.cacert.hostPath.path }}
+  ls -l {{ .Values.cacert.hostPath.path }}/{{ .Values.cacert.filename }}
+  openssl s_client \
+    -connect <keystone-host>:443 \
+    -servername <keystone-host> \
+    -CAfile {{ .Values.cacert.hostPath.path }}/{{ .Values.cacert.filename }} \
+    -verify_return_error </dev/null
+
+Expected success:
+  Verify return code: 0 (ok)
+{{- end }}
+{{- end }}
+
 NOTE: This driver provides raw block volumes only (volumeMode: Block).
       Filesystem volumes are not supported.
