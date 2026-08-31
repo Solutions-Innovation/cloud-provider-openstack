@@ -159,3 +159,6 @@ zz_generated.openapi.go
 
 # local gopath
 .go
+
+# GitHub skills (local only)
+.github/skills/
