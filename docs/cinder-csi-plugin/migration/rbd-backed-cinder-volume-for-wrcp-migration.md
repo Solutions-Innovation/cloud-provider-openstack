@@ -1,353 +1,605 @@
-# RBD-Backed Cinder Volume for WRCP Migration — CSI Plugin Proposal
+# RBD-Backed Cinder Volume for WRCP Migration — CSI Plugin Design
 
-**Status:** Proposal (pre-implementation)
+**Status:** Revised proposal (v2, post-review)
 **Driver name:** `cinder-rbd.csi.windriver.com`
 **Author:** Wind River Migration Framework Team
-**Date:** 2026-08-31
+**Date:** 2026-08-31 (v1), revised 2026-09-01 (v2)
 
-Sibling proposal to:
+**Target baseline:** WRCP 24.09 and later (Kubernetes 1.29.2, Linux 6.6,
+Rook Ceph 18.2.x)
+**Node mounter:** Kernel RBD (`krbd`) — `rbd-nbd` is NOT part of the
+initial design
+**Volume mode:** Raw block only, `SINGLE_NODE_WRITER`
+**Cinder API minimum:** microversion **3.44**
+
+Sibling design to:
 - `iscsi-backed-cinder-volume-for-wrcp-migration.md` (implemented on
   `wndrvr/cinder-iscsi-csi-plugin-impl`)
 - `nfs-backed-cinder-volume-for-wrcp-migration.md`
 
+> **Revision note (v2):** the initial proposal chose `rbd-nbd` as the
+> node data path and mirrored the cinder-iscsi attachment lifecycle
+> (delete attachment on every ControllerUnpublishVolume). Both were
+> revised after environment validation on WRCP 24.09; see §14 for the
+> full list of changes and rationale.
+
 ---
 
-## 1. Motivation
+## 1. Executive decision
 
-The migration framework (V2O via KubeVirt CDI, O2O via the NBD pipeline)
-needs raw block access to Cinder volumes from WRCP worker hosts. The
-existing `cinder-iscsi-csi-plugin` solves this for iSCSI-capable Cinder
-backends (LVM, SolidFire, …). Many target clouds, however, back Cinder
-with **Ceph RBD**, whose Cinder driver does not expose iSCSI targets —
-`initialize_connection()` returns RBD-native connection info intended
-for a Ceph client, not an iSCSI initiator.
+The plugin is a **Cinder-controlled, kernel-RBD CSI driver** that uses:
 
-This proposal adds a third migration CSI driver, `cinder-rbd`, that
-reuses the validated cinder-iscsi architecture (Cinder v3 self-service
-attachments, no Nova, no temporary/Shadow VM) and replaces the node-side
-`iscsiadm` data path with `rbd-nbd`.
+1. **Cinder attachments as the control-plane ownership reservation.**
+2. **Kernel RBD (`krbd`) as the node data path.**
+3. **Ceph exclusive locking during writable mappings.**
+4. **A persistent Cinder attachment for the complete migration PVC
+   lifetime, including gaps between CDI precopy pods.**
 
-WRCP deployments host OpenStack on top of a platform-integrated Ceph
-cluster: the monitors are directly reachable from worker hosts and the
-Ceph client tooling (`ceph-common`, `rbd-nbd`) is already installed.
-This makes the native RBD data path the natural fit.
+This matches the validated WRCP 24.09 environment, where the platform's
+Ceph-CSI already maps RBD volumes through the kernel and active devices
+appear as `/dev/rbdN`. The design does not depend on a host `rbd-nbd`
+executable, an NBD kernel-device pool, or a long-running userspace
+mapping daemon.
 
-## 2. Key feasibility question (validated by research, to be confirmed by Phase 0)
+The initial implementation uses the Ceph identity returned by Cinder —
+normally `client.cinder` — with a Kubernetes Secret containing the
+matching key. A dedicated identity may be introduced later only under
+the conditions in §6.
 
-> Does the Cinder Ceph/RBD driver expose usable connection info through
-> the attachments API **without attaching the volume to a temporary VM**?
+## 2. Problem statement
 
-**Answer: yes, with two caveats.** The Cinder v3 attachments API
-(microversion >= 3.27) is backend-agnostic; `PUT /v3/attachments/{id}`
-with a connector invokes the RBD driver's `initialize_connection()`
-exactly as it does for LVM/iSCSI. This is the mechanism cinderlib and
-Ember-CSI rely on for VM-less attachment. The returned payload is:
+The migration workflow (V2O via KubeVirt CDI, O2O via the NBD pipeline)
+provisions a target Cinder volume as a Kubernetes raw-block PVC.
+Temporary NBD receiver pods write migration data to that PVC. CDI may
+create and remove multiple pods across precopy and cutover phases.
+
+The plugin therefore needs two independent lifecycles:
+
+- **Control-plane lifecycle:** the target Cinder volume remains
+  reserved for the migration from CSI `CreateVolume` until
+  `DeleteVolume`.
+- **Node data-path lifecycle:** a node maps the Ceph RBD image only
+  while a migration pod stages and uses the volume.
+
+Deleting the Cinder attachment during every `ControllerUnpublishVolume`
+(as the cinder-iscsi plugin does) would incorrectly release the
+control-plane reservation between CDI phases, creating an unsafe
+`available` window in which Cinder/Nova consumers could claim the
+volume. Conversely, retaining a kernel RBD mapping after
+`NodeUnstageVolume` would violate CSI node lifecycle expectations.
+
+The design keeps the Cinder attachment persistent while mapping and
+unmapping the RBD image normally at the node. This is the NFS migration
+driver's persistent-reservation invariant, without the Nova shadow VM:
+the Cinder attachments API directly provides the RBD connection
+information.
+
+**Why the iSCSI plugin's semantics don't transfer:** iSCSI targets are
+per-initiator, so the attachment must be deleted to terminate the
+target. RBD connection information is node-agnostic (monitors +
+pool/image), so a single reservation can span pod movements between
+nodes.
+
+## 3. Validated WRCP 24.09 baseline
+
+The following facts were confirmed in the existing WRCP/WRO environment
+and override the assumptions in the initial (v1) proposal:
+
+| Area | Validated result | Design consequence |
+|---|---|---|
+| Platform | WRCP 24.09, Kubernetes 1.29.2, Linux 6.6 | WRCP 24.09 is the minimum baseline |
+| Ceph topology | WRCP Kubernetes and WRO Cinder use the same Rook-managed Ceph cluster | Cinder connection info identifies a locally reachable image |
+| Ceph version | Rook Ceph 18.2.2; Ceph-CSI container tools 18.2.1 | Bundle a qualified Ceph 18.2.x `rbd` client in the plugin image |
+| Existing K8s path | Ceph-CSI uses `krbd`; active devices are `/dev/rbdN` | Use `krbd` as the default mounter |
+| Host tooling | Host `rbd` is Ceph 14.2.22; host `rbd-nbd` is absent | Do not depend on host Ceph user-space tools |
+| NBD resources | Kernel NBD module exposes a finite 16-device pool | Avoid consuming NBD devices for the storage mapping |
+| Ceph identities | Cinder uses `client.cinder`; Ceph-CSI uses separate CSI identities | The node key must match Cinder's returned `auth_username` |
+| Cinder backend | Active volume type is `ceph-rook-store` | Do not hard-code an inactive `rbd1` type |
+| Cinder response | Attachment update returns **flat** RBD connection fields | Parse the flat schema; tolerate nested `data` only for compatibility |
+| Image naming | `name` is `cinder-volumes/<cinder-volume-uuid>` — no `volume-` prefix | Use Cinder's exact `name`; split only the first `/` |
+
+## 4. Goals and non-goals
+
+**Goals**
+- Provision or adopt a Cinder RBD-backed volume as a Kubernetes
+  raw-block PV.
+- Keep the Cinder volume reserved throughout a multi-stage migration.
+- Map the exact Cinder-selected RBD image on a WRCP worker using krbd.
+- Preserve CSI idempotency across retries, pod replacement, plugin
+  restart, and partial failures.
+- Enforce one writable node mapping while the volume is actively staged.
+- Retain the Cinder volume by default after the migration PVC is
+  deleted (Blueprint handoff).
+- Avoid Nova, a shadow VM, host `rbd-nbd`, and dynamically copied Ceph
+  credentials.
+
+**Non-goals**
+- General-purpose replacement for the upstream Cinder CSI plugin.
+- Filesystem-mode PVCs, RWX, snapshots, clones, online expansion,
+  topology-aware provisioning (see §12).
+- Cross-Ceph-cluster replication.
+- Automatic support for RBD image features the WRCP kernel cannot map.
+- Permanent hard fencing against privileged actors that bypass Cinder
+  with direct Ceph credentials (see §13).
+
+## 5. Architecture
+
+```text
+                         WRCP Kubernetes
+
+  CDI / migration controller
+             |
+             | PVC, ControllerPublish, NodeStage
+             v
+  +-----------------------------+
+  | cinder-rbd CSI controller   |
+  |                             |
+  | - Cinder volume lifecycle   |
+  | - persistent attachment     |
+  | - attachment reconciliation |
+  +-------------+---------------+
+                |
+                | Cinder v3 API, microversion >= 3.44
+                v
+  +-----------------------------+
+  | WRO Cinder                  |
+  | RBD volume driver           |
+  +-------------+---------------+
+                |
+                | connection_info:
+                | cluster, monitors, pool/image,
+                | auth_username, secret UUID
+                v
+  +-----------------------------+
+  | Shared Rook Ceph cluster    |
+  | pool: cinder-volumes        |
+  +-------------+---------------+
+                ^
+                | krbd map --exclusive
+                |
+  +-------------+---------------+
+  | cinder-rbd CSI node         |
+  |                             |
+  | bundled Ceph 18.2.x `rbd`   |
+  | host kernel RBD module      |
+  +-------------+---------------+
+                |
+                | /dev/rbdN exposed as CSI block device
+                v
+       NBD receiver / CDI importer pod
+```
+
+### Separation of control and data planes
+
+**Control plane:** the Cinder attachment is a persistent ownership
+reservation. It starts during `CreateVolume` and ends during
+`DeleteVolume`. `ControllerUnpublishVolume` does not delete it.
+
+**Data plane:** the node plugin maps the RBD image with krbd during
+`NodeStageVolume` and unmaps it during `NodeUnstageVolume`.
+`NodePublishVolume`/`NodeUnpublishVolume` only create and remove the
+raw-block bind target required by kubelet.
+
+### Connection information contract
+
+The validated attachment-update response is **flat**:
 
 ```json
 {
   "driver_volume_type": "rbd",
-  "data": {
-    "name": "volumes/volume-<uuid>",
-    "hosts": ["<mon1>", "<mon2>", "<mon3>"],
-    "ports": ["6789", "6789", "6789"],
-    "cluster_name": "ceph",
-    "auth_enabled": true,
-    "auth_username": "cinder",
-    "secret_type": "ceph",
-    "secret_uuid": "<libvirt-secret-uuid>",
-    "volume_id": "<uuid>",
-    "access_mode": "rw"
-  }
+  "cluster_name": "ceph",
+  "name": "cinder-volumes/<cinder-volume-uuid>",
+  "auth_enabled": true,
+  "auth_username": "cinder",
+  "secret_type": "ceph",
+  "secret_uuid": "<ceph-fsid>",
+  "volume_id": "<cinder-volume-uuid>",
+  "hosts": ["10.107.190.121", "10.106.210.60", "10.98.180.79"],
+  "ports": ["6789", "6789", "6789"]
 }
 ```
 
-**Caveat 1 — not iSCSI.** There is no portal/IQN/LUN. The node must
-attach with a Ceph client (`rbd map` krbd or `rbd-nbd`). The existing
-cinder-iscsi node service and its `driver_volume_type == "iscsi"`
-validation cannot consume this; a new node data path is required.
+The plugin must:
+- Treat `name` as authoritative and split only the first `/` into pool
+  and image. Never add a `volume-` prefix or assume the pool name.
+- Validate `driver_volume_type == "rbd"`.
+- Pair `hosts[n]` with `ports[n]`.
+- Treat `secret_uuid` as an identifier (it equals the Ceph FSID here),
+  never as a key.
+- Accept a nested `data` object only as a backward-compatible alternate
+  representation.
+- **Persist the normalized connection data** (volume metadata +
+  controller cache) because later attachment GET responses may omit it.
+- Never log a Ceph key or generated keyring.
 
-**Caveat 2 — no credentials.** The cephx key is deliberately absent
-from connection_info (CVE-2020-10755 removed the old `keyring` field).
-`secret_uuid` references a libvirt secret that only exists on Nova
-compute hosts — useless to us. The node plugin therefore needs a cephx
-client keyring delivered out-of-band (Kubernetes Secret; see §6).
+## 6. Ceph authentication model
 
-Phase 0 (§10) validates both caveats against a real WRCP cloud with
-curl only, before any code is written.
+### Initial implementation
 
-## 3. Alternatives considered
+A namespace-scoped Kubernetes Secret contains the key for the Ceph
+identity returned by Cinder:
 
-| Approach | Verdict | Reason |
-|---|---|---|
-| **A. Native RBD sibling plugin (this proposal)** | **Selected** | WRCP hosts already run Ceph clients; no extra infrastructure; reuses 90% of the proven cinder-iscsi controller design |
-| B. Cinder RBD-iSCSI driver (`cinder.volume.drivers.ceph.rbd_iscsi`) + ceph-iscsi gateways, reusing cinder-iscsi plugin unmodified | Rejected | Requires deploying and operating ceph-iscsi gateway infrastructure on the OpenStack side; ceph-iscsi is deprecated in recent Ceph releases; extra network hop on the data path |
-| C. Generalize cinder-iscsi into a multi-protocol driver (node picks iscsiadm vs rbd by `driver_volume_type`) | Rejected (for now) | Keeps blast radius small and release cadence independent; the shared controller logic can be extracted into a common package later if a third backend appears |
-| D. Upstream ceph-csi pointed directly at the Ceph cluster (bypassing Cinder) | Rejected | Volumes are Cinder-managed; migration handoff (retain → Blueprint boots target VM from the Cinder volume) requires the Cinder lifecycle |
-| E. krbd (`rbd map`) instead of rbd-nbd on the node | Deferred | rbd-nbd chosen for full image-feature support independent of host kernel; krbd can be added later as a driver.conf option |
-
-## 4. Architecture
-
-```
-                        ┌────────────────────────────────────────┐
-                        │ Controller Deployment (kube-system)    │
- CreateVolume  ────────▶│  Cinder volume + reserved attachment   │──── Cinder v3 API
- ControllerPublish ────▶│  UpdateAttachmentConnector             │     (mv >= 3.27,
- ControllerUnpublish ──▶│  DeleteAttachment + clear metadata     │      no Nova)
- DeleteVolume  ────────▶│  retain (default) | delete             │
-                        └────────────────────────────────────────┘
-                                     │ publish_context:
-                                     │ pool_image, mon_hosts,
-                                     │ cluster_name, auth_username
-                                     ▼
-                        ┌────────────────────────────────────────┐
-                        │ Node DaemonSet (per worker host)       │
- NodeStage    ─────────▶│  rbd-nbd map pool/image → /dev/nbdX    │──── Ceph mons
- NodePublish  ─────────▶│  bind-mount /dev/nbdX → volumeDevices  │     (direct, cephx
- NodeUnstage  ─────────▶│  rbd-nbd unmap                         │      key from Secret)
-                        └────────────────────────────────────────┘
+```text
+auth_username  = cinder
+keyring entity = client.cinder
 ```
 
-Identical to cinder-iscsi in every dimension except the node data path:
-- Block-only (`volumeMode: Block`), `SINGLE_NODE_WRITER`, pods use
-  `volumeDevices`.
-- Controller capabilities: `CREATE_DELETE_VOLUME`, `PUBLISH_UNPUBLISH_VOLUME`.
-- Node capabilities: `STAGE_UNSTAGE_VOLUME`, `GET_VOLUME_STATS`.
-- `csi.attachment_id` in Cinder volume metadata is the single source of
-  truth; on-demand attachment creation in ControllerPublishVolume with
-  one 404 retry; ControllerUnpublishVolume deletes the attachment and
-  clears metadata (keeps Cinder volume status truthful: `in-use` ↔
-  `available`).
-- DeleteVolume default `retain` (attachment deleted, CSI metadata
-  stripped, volume left `available` for the migration Blueprint);
-  per-volume `csi.cleanupVolume` override; `delete-volume-mode` config.
-- Startup `DiscoverCinderCapabilities` hard-fails below microversion
-  3.27; `CompleteAttachment` (3.44) best-effort.
+The Secret is created and rotated by the platform operator. The plugin
+must not retrieve credentials from a Cinder pod, copy host keyrings, or
+infer the key from `secret_uuid`. The controller validates that the
+configured Secret identity matches the returned `auth_username`; a
+mismatch is a hard failure.
 
-## 5. Package structure
+**Why not a dedicated least-privilege identity initially:** the krbd
+map `--id` and the keyring must belong to the *same* identity.
+Supplying a `client.wrcp-csi` key while mapping as `cinder` fails
+authentication.
 
-```
-pkg/csi/cinder-rbd/                # package name: rbd
-├── driver.go                      # cinder-rbd.csi.windriver.com, capabilities
-├── controllerserver.go            # ~copied from cinder-iscsi; RBD connector + validation
-├── nodeserver.go                  # NodeGetInfo/Stage/Unstage/Publish/Unpublish/Stats
-├── identityserver.go              # mode-aware Probe (Cinder caps | rbd-nbd check)
-├── rbdnbd.go                      # RBDConnector interface + rbd-nbd implementation
-├── rbdnbd_mock.go                 # testify mock
-├── connectioninfo.go              # publish-context keys, ParseNodeID (2-field), validation
-├── server.go / utils.go           # copied
-└── openstack/                     # copied from cinder-iscsi/openstack, RBD conn parsing
-    ├── openstack.go               # IOpenStackRBD, RBDOpts/VolumeOpts
-    ├── openstack_volumes.go
-    ├── openstack_attachments.go   # parseRBDConnectionInfo instead of iSCSI
-    └── openstack_mock.go
+### Future dedicated identity
 
-cmd/cinder-rbd-csi-plugin/main.go
-charts/cinder-rbd-csi-plugin/
-manifests/cinder-rbd-csi-plugin/
-examples/cinder-rbd-csi-plugin/
-.github/workflows/cinder-rbd-csi-release.yaml
-```
+`client.wrcp-cinder-rbd-csi` is acceptable only when all hold:
+- explicit configuration overrides the connection username,
+- the supplied key belongs to that exact identity,
+- the identity has the required capabilities on the Cinder pool,
+- exclusive-lock and blocklist recovery have been tested,
+- the boundary is documented and accepted by the Ceph operator.
 
-## 6. Controller design deltas (vs cinder-iscsi)
+## 7. Kernel RBD node data path
 
-### 6.1 Node ID and connector
-Node ID simplifies to `hostname;ip` (no IQN — the host may not have
-open-iscsi configured at all). The connector sent to
-`UpdateAttachmentConnector`:
+### Why krbd
 
-```json
-{
-  "host": "<hostname>",
-  "ip": "<storage-network-ip>",
-  "platform": "x86_64",
-  "os_type": "linux2",
-  "multipath": false,
-  "do_local_attach": true
-}
+- It is already the active WRCP Ceph-CSI data path (validated).
+- It creates a kernel-owned `/dev/rbdN` device with **no userspace
+  daemon** — mappings inherently survive plugin pod restarts, removing
+  the entire daemon-lifecycle problem class.
+- It does not consume the finite `/dev/nbdN` pool.
+- The host has no `rbd-nbd` binary; the host's Ceph 14 CLI must not be
+  used. The plugin image bundles a qualified Ceph 18.2.x `rbd` CLI; the
+  mapping itself is implemented by the host kernel module.
+
+`rbd-nbd` remains a future, explicitly configured fallback for an image
+feature krbd cannot map. It must never be selected automatically.
+
+### Map operation
+
+The node plugin writes a temporary volume-specific `ceph.conf` (monitor
+addresses from connection info) and a keyring from the Secret, then:
+
+```bash
+rbd device map \
+  --device-type krbd \
+  --exclusive \
+  --cluster ceph \
+  --id cinder \
+  --conf    /run/cinder-rbd-csi/<volume-id>/ceph.conf \
+  --keyring /run/cinder-rbd-csi/<volume-id>/keyring \
+  cinder-volumes/<image-name>
 ```
 
-`do_local_attach: true` signals a bare-metal/local consumer (the
-cinderlib convention). Phase 0 confirms the WRCP Cinder RBD driver
-accepts this connector shape.
+`--exclusive` requires the image's `exclusive-lock` feature (default
+for Cinder-created images on Ceph 18); lock contention behavior is a
+Phase 0 gate.
 
-### 6.2 Connection info validation and publish context
-`ValidateRBDConnectionInfo` requires `driver_volume_type == "rbd"`,
-non-empty `name` (`pool/image`) and `hosts[]`. A non-RBD backend fails
-publish with a clear error (fail-fast on misconfiguration).
+The implementation must not rely on the `/dev/rbdN` number remaining
+constant. It records the returned path but reconciles ownership through
+`rbd device list --format json` and sysfs identity before reusing or
+unmapping a device.
 
-PublishContext keys (consumed by NodeStageVolume):
+Before publishing a writable device it verifies:
+- mapped cluster/FSID matches the configured cluster,
+- mapped pool and image exactly match Cinder's `name`,
+- the mapping is exclusive and no conflicting writable client holds the
+  lock,
+- the block device is present with the expected size.
 
-| Key | Source | Example |
-|---|---|---|
-| `pool_image` | `data.name` | `volumes/volume-bf39da68-...` |
-| `mon_hosts` | `data.hosts` + `data.ports`, joined | `10.0.0.1:6789,10.0.0.2:6789` |
-| `cluster_name` | `data.cluster_name` | `ceph` |
-| `auth_enabled` | `data.auth_enabled` | `true` |
-| `auth_username` | `data.auth_username` | `cinder` |
-| `driver_volume_type` | fixed | `rbd` |
+If exclusive mapping or lock acquisition fails, `NodeStageVolume`
+fails. No silent fallback to non-exclusive mapping.
 
-**No credentials flow through the publish context** (improvement over
-iSCSI's CHAP-in-publishContext): the cephx key lives only in a
-node-side Secret.
+## 8. CSI lifecycle
 
-## 7. Node design
+### CreateVolume
+1. Resolve the Cinder volume type from the StorageClass (the active
+   WRCP type is `ceph-rook-store`; never hard-code).
+2. Create the Cinder volume or reconcile an existing operation using
+   the CSI request identity.
+3. Wait until the volume is usable.
+4. Create a **persistent attachment reservation** without a connector,
+   using a **stable migration-owner UUID** as the attachment's
+   `instance_uuid` (no Nova instance exists — Phase 0 gate).
+5. Record driver ownership metadata as a recovery hint (§9).
+6. Return the Cinder volume UUID as the CSI volume ID.
 
-### 7.1 RBDConnector interface (`rbdnbd.go`)
+### ControllerPublishVolume
+Under a per-volume process-safe lock:
+1. **List** Cinder attachments for the volume (the list is the source
+   of truth, not metadata).
+2. Reconcile the attachment owned by this driver/migration owner;
+   create it if `CreateVolume` failed before reservation completed.
+3. Reject a conflicting non-driver attachment (operator resolution
+   required).
+4. Update the owned attachment with the node connector **only if
+   connection information has not yet been obtained**.
+5. **Require successful attachment completion** (microversion ≥ 3.44).
+   `CompleteAttachment` is not best-effort; a deployment that cannot
+   support 3.44 is not production-qualified.
+6. Normalize, persist, and return non-secret connection fields in
+   `publish_context`.
 
-```go
-type RBDConnector interface {
-    Map(ctx context.Context, poolImage, monHosts, user, keyringPath, confPath string) (device string, err error)
-    Unmap(ctx context.Context, device string) error
-    FindMapped(ctx context.Context, poolImage string) (device string, found bool, err error)
-    CheckRbdNbd(ctx context.Context) error   // probe: binary present + nbd module loaded
-}
+For subsequent CDI phases, return the existing normalized connection
+information. **Do not create one attachment per pod.** (RBD connection
+info is node-agnostic, so a connector recorded from an earlier node
+remains functionally valid.)
+
+### ControllerUnpublishVolume
+**Return success without deleting the persistent attachment.** CDI may
+delete one migration pod and create another during precopy/cutover;
+releasing the attachment here would open an unsafe `available` window.
+
+### NodeStageVolume
+1. Validate block mode and `SINGLE_NODE_WRITER`.
+2. Load and validate `publish_context`.
+3. Reconcile any existing mapping for the same cluster/pool/image
+   (idempotency by live-map identity, not by staging file).
+4. If absent, map with `krbd --exclusive` (§7).
+5. Verify mapping identity and size.
+6. Atomically write the staging record: volume ID, FSID, pool, image,
+   device path, map generation.
+
+### NodePublishVolume / NodeUnpublishVolume
+Standard raw-block target exposure/removal; verify the target resolves
+to the staged mapping. No Cinder interaction.
+
+### NodeUnstageVolume
+1. Verify no remaining publish targets reference the staged device.
+2. Reconcile the current map by cluster/pool/image; confirm the device
+   still belongs to this volume (a recycled `/dev/rbdN` number must
+   never be unmapped without identity verification).
+3. Unmap; confirm absence; remove the staging record.
+
+A missing staging file is **not** proof that a mapping is absent —
+always reconcile live kernel maps.
+
+### DeleteVolume
+Under the per-volume lock:
+1. Confirm no node mapping remains, or return a retryable error.
+2. List and reconcile all attachments; delete **only** driver-owned
+   ones.
+3. Wait until the volume leaves `in-use`/`reserved`.
+4. Default: **retain** the volume, removing only CSI ownership
+   metadata (Blueprint boots the target VM from it). Delete the volume
+   only when the explicit cleanup policy is enabled (per-volume
+   `csi.cleanupVolume` override or driver-level mode, as in the iSCSI
+   plugin).
+
+### Controller state machine
+
+```text
+NEW
+ | Create Cinder volume
+ v
+VOLUME_AVAILABLE
+ | Create persistent attachment reservation
+ v
+RESERVED
+ | Attachment update + complete, capture connection_info
+ v
+ATTACHED_CONTROL_PLANE  <── ControllerUnpublish: no state change
+ |                          NodeStage/Unstage: data path only
+ | DeleteVolume
+ v
+RELEASING ──> RETAINED_VOLUME (default)
+        └───> DELETED_VOLUME (explicit cleanup only)
 ```
 
-Concrete implementation shells out to `rbd-nbd` via `k8s.io/utils/exec`
-(same pattern as `iscsiadmInitiator`); unit tests inject a testify mock.
+## 9. Attachment ownership and reconciliation
 
-### 7.2 NodeStageVolume
-1. Validate; **block-only enforcement** (reject Mount capability).
-2. Parse `pool_image`, `mon_hosts`, `auth_username` from publish context.
-3. Idempotency: `FindMapped(pool/image)` (`rbd-nbd list-mapped`) — if
-   mapped and the device node exists, rewrite `<staging>/devicepath`
-   and return success.
-4. Generate a minimal per-volume `ceph.conf` under the staging dir
-   (mon hosts from publish context); keyring read from the mounted
-   Secret path (`[RBD] keyring-path`, default `/etc/ceph-csi/keyring`).
-5. `rbd-nbd map <pool/image> --id <user> --conf <conf> [extra args]`
-   executed **in the host namespace** (see §7.4) → `/dev/nbdX`.
-6. Wait for the device node (reuse `WaitForDevice` polling,
-   `device-wait-timeout`). On failure: best-effort `Unmap` before
-   returning (the Logout+DeleteNode pairing rule, adapted).
-7. Persist device path to `<stagingTargetPath>/devicepath` (same file
-   contract as cinder-iscsi).
+Volume metadata is a **hint, not the source of truth**:
 
-### 7.3 Other node RPCs
-- **NodeUnstage:** read devicepath (ENOENT → idempotent success) →
-  `Unmap` → remove staging files.
-- **NodePublish/Unpublish/GetVolumeStats:** byte-identical to
-  cinder-iscsi (bind-mount to the `volumeDevices` target file, reuse
-  the patched `pkg/util/mount.MakeFile` that replaces kubelet-created
-  directories; block stats report Total only).
-- **NodeGetInfo:** `hostname;ip`; IP from `[RBD] storage-interface`
-  NIC or primary route (logic reused from iSCSI).
-- **NodeExpandVolume:** Unimplemented (`rbd-nbd` picks up Cinder
-  os-extend resizes; revisit if online resize is needed).
+```text
+csi.rbd.driver        = cinder-rbd.csi.windriver.com
+csi.rbd.owner_uuid    = <stable-migration-owner-uuid>
+csi.rbd.attachment_id = <last-known-attachment-uuid>
+csi.rbd.request_id    = <create-volume-idempotency-key>
+```
 
-### 7.4 rbd-nbd daemon lifecycle (the one genuinely new risk)
-Each mapping is backed by a long-lived userspace `rbd-nbd` process. If
-that process runs inside the plugin container, **a DaemonSet pod
-restart or upgrade kills every mapped volume on the node**, breaking
-running migration pods with I/O errors (the well-known ceph-csi
-failure mode).
+For every mutating controller RPC the plugin: acquires the per-volume
+lock → lists the actual attachment collection → classifies attachments
+(owned / conflicting / stale / unrelated) → uses metadata only to
+accelerate matching → repairs missing metadata → removes duplicate
+owned attachments only when no node mapping depends on them → never
+deletes an unrelated attachment automatically.
 
-Mitigation:
-- **Spawn in the host namespace:** the node pod already runs
-  `privileged: true` + `hostPID: true` (as cinder-iscsi does); execute
-  `nsenter --target 1 --mount --net -- rbd-nbd map ...` so the daemon
-  is parented to the host, surviving plugin restarts. `FindMapped` and
-  `Unmap` run through the same nsenter wrapper.
-- **Node prerequisites:** `nbd` kernel module (init container runs
-  `modprobe nbd`), `rbd-nbd` binary on the host (already shipped by
-  WRCP), staging-time existence check in Probe.
-- **Recovery runbook:** if an rbd-nbd daemon dies (OOM/crash), the
-  device returns EIO; recovery is pod reschedule → unstage/stage cycle
-  remaps the image. Documented in the troubleshooting guide.
+The controller runs **startup reconciliation** for volumes carrying
+this driver's ownership metadata.
 
-## 8. Configuration
+## 10. Node state and crash recovery
 
-### cloud.conf — unchanged (Keystone credentials, Secret-mounted).
+The node plugin keeps a durable staging record under the CSI plugin
+directory; it aids recovery but never overrides live kernel and Ceph
+evidence.
 
-### driver.conf — `[Volume]` unchanged; `[ISCSI]` replaced by `[RBD]`:
+**Startup reconciliation:** for each driver-owned staging record,
+compare with `rbd device list --format json`; verify pool/image via
+sysfs; recreate a missing target link when the map is valid; mark an
+absent mapping unstaged; **quarantine** (never blindly unmap) a device
+whose identity conflicts with the record. Unrecorded but matching live
+maps are adopted only after Cinder attachment and ownership validation.
+
+| Failure | Required behavior |
+|---|---|
+| Volume created, reservation not created | Retry `CreateVolume`; find by request identity, create reservation |
+| Reservation created, metadata write failed | List attachments, reconstruct metadata |
+| Attachment update ok, RPC response lost | Find existing attachment, recover normalized connection data |
+| Map ok, staging record write failed | Detect map by pool/image, adopt after ownership validation |
+| Plugin restart with live map | Reconcile and reuse the same kernel mapping |
+| Node crash | Reconcile kernel map, staging records, Cinder attachment |
+| Exclusive map denied | Fail `NodeStageVolume`; never fall back to non-exclusive |
+| Conflicting Cinder attachment | Fail safely; operator resolution |
+| Unmap timeout | Keep staging state, return retryable failure |
+| Cinder API down during unstage | Unmap may proceed; persistent attachment reconciled later |
+
+## 11. Security, deployment, configuration
+
+**Node DaemonSet requires:** privileged container (or equivalently
+validated capability/device policy), host `/dev`, required `/sys`
+access for RBD identity reconciliation, kubelet plugin/pod-volume
+paths, a writable private runtime directory for generated Ceph config
+and staging state, and Secret access limited to the driver service
+account.
+
+**Not required** (unlike the v1 rbd-nbd design): host PID namespace for
+a mapper daemon, host `/usr/bin/rbd*`, host `/etc/ceph` credentials,
+`/dev/nbd*`, NBD module configuration.
+
+Generated keyrings use restrictive permissions and are removed when no
+longer needed. Credentials never appear in `publish_context`, logs,
+annotations, or volume metadata.
+
+**Configuration example:**
 
 ```ini
+[Global]
+cloud-config=/etc/kubernetes/cloud.conf
+driver-name=cinder-rbd.csi.windriver.com
+cinder-min-microversion=3.44
+retain-volume=true
+
 [RBD]
-map-timeout         = 30                       ; seconds, rbd-nbd map
-device-wait-timeout = 30                       ; seconds, wait for /dev/nbdX
-keyring-path        = /etc/ceph-csi/keyring    ; cephx keyring (mounted Secret)
-rbd-nbd-args        =                          ; optional, e.g. --try-netlink
-storage-interface   =                          ; NIC for NodeGetInfo IP; empty = primary
-
-[Volume]
-create-timeout      = 300
-detach-timeout      = 120
-default-volume-type =
-metadata-prefix     = csi
-delete-volume-mode  = retain
+mounter=krbd
+exclusive=true
+expected-cluster-name=ceph
+expected-fsid=<per-deployment Ceph FSID>
+ceph-client-version-major=18
+credential-secret-name=cinder-rbd-ceph-client
+credential-secret-namespace=kube-system
+map-timeout=120s
+unmap-timeout=120s
 ```
 
-### Ceph credentials Secret (`cinder-rbd-cephx`, kube-system)
-A **dedicated least-privilege cephx client** (not the host's admin
-key), e.g.:
+The FSID is an environment-specific identifier (not a credential),
+configured per deployment.
 
-```
-ceph auth get-or-create client.wrcp-csi \
-  mon 'profile rbd' osd 'profile rbd pool=volumes'
-```
+**CDI StorageProfile:** as with the iSCSI plugin, CDI must be patched
+per StorageClass (`claimPropertySets: [{accessModes: [ReadWriteOnce],
+volumeMode: Block}]`) or DataVolume PVCs default to Filesystem and hang
+Pending.
 
-Stored as a Secret with a `keyring` key, mounted read-only into the
-node DaemonSet at `/etc/ceph-csi/`. Key rotation = Secret update +
-rolling restart of the DaemonSet (keys are read at map time, not
-cached; existing mappings keep their session).
+## 12. Supported capabilities
 
-## 9. Deployment
+Initial: `CREATE_DELETE_VOLUME`, `PUBLISH_UNPUBLISH_VOLUME`,
+`SINGLE_NODE_WRITER`, raw block mode. Expansion only if separately
+validated.
 
-Mirrors cinder-iscsi manifests/chart with these deltas:
+Not initially advertised: filesystem volumes, snapshots, clones,
+multi-node writer/reader, online expansion, topology-aware provisioning.
 
-| Item | cinder-iscsi | cinder-rbd |
+`NodeGetInfo.MaxVolumesPerNode` reflects platform constraints; NBD
+device limits are irrelevant under krbd.
+
+**Observability:** logs/metrics use non-secret identifiers only (CSI
+volume ID, Cinder volume/attachment UUIDs, owner UUID, node ID, FSID,
+pool/image, device path, state). Recommended metrics: Cinder API
+latency/failures, reconciliation outcomes, duplicate/conflicting
+attachments, map/unmap latency, exclusive-lock failures, orphaned
+maps/records, volumes retained vs deleted.
+
+## 13. Residual fencing limitation
+
+The persistent Cinder attachment fences all consumers that obey Cinder.
+The krbd exclusive lock fences second writable Ceph clients **while a
+node mapping is active**. Between CDI stages, `NodeUnstageVolume`
+removes the mapping, so no Ceph-level lock remains — a privileged actor
+with direct Ceph credentials could bypass Cinder during that gap. This
+is an explicit trust-boundary limitation; an uninterrupted Ceph-level
+lock across inter-pod gaps would require a durable lock owner or
+persistent mapping service and must not be hidden inside the CSI node
+lifecycle.
+
+## 14. Changes from the initial (v1) proposal
+
+| v1 design area | v2 revision | Reason |
 |---|---|---|
-| Node host mounts | `/etc/iscsi`, `/var/lib/iscsi`, `/run/lock/iscsi`, `/dev`, `/var/lib/kubelet` | `/dev`, `/var/lib/kubelet` + Secret `cinder-rbd-cephx` |
-| Init container | — | `modprobe nbd` |
-| Host prerequisites | open-iscsi, iscsid, initiatorname | ceph-common, rbd-nbd, nbd module (all WRCP-native) |
-| Sidecars | provisioner v5.3.0, attacher v4.10.0, livenessprobe v2.17.0, registrar v2.15.0 | identical |
-| Security context | privileged, hostPID, hostNetwork | identical |
-| CDI StorageProfile patch | required | required (same reason: block-only) |
-| CI | `wndrvr_v*` tags → ghcr.io image + OCI chart | cloned workflow, image `ghcr.io/solutions-innovation/cinder-rbd-csi-plugin` |
+| `rbd-nbd` as data path | Kernel RBD (`krbd`) default; rbd-nbd future opt-in only | Host has no `rbd-nbd`; Ceph-CSI already uses krbd; removes daemon lifecycle entirely |
+| Host tooling assumed | Bundle qualified Ceph 18.2.x `rbd` CLI in image | Host CLI is Ceph 14 |
+| `nsenter` host-namespace daemon spawn | Removed | No daemon exists under krbd |
+| NBD module init container, device pool concerns | Removed | Not applicable to krbd |
+| Attachment deleted on every unpublish (iSCSI semantics) | One persistent attachment until `DeleteVolume` | Prevents unsafe `available` window between CDI phases; RBD info is node-agnostic |
+| `CompleteAttachment` best-effort (mv 3.44 optional) | Required; minimum microversion 3.44 | Persistent reservation must reach `in-use`; validated environment supports it |
+| Nested `data` connection_info assumed | Flat schema is authoritative; nested tolerated for compat | Validated response is flat |
+| Image `volumes/volume-<uuid>` | Exact `name`, validated form `cinder-volumes/<uuid>` | Validated; never synthesize prefixes |
+| Dedicated `client.wrcp-csi` key | `client.cinder` key initially; dedicated identity gated (§6) | map `--id` and key must be the same identity |
+| Metadata `attachment_id` as source of truth | Attachment list under per-volume lock; metadata as hint | Long-lived attachments need reconciliation |
+| Fencing via CSI access mode only | krbd `--exclusive` + lock-contention testing | Real single-writer enforcement |
+| Missing staging file = unmapped | Reconcile live kernel maps by FSID/pool/image | Staging records can be lost while maps persist |
 
-The demo walkthrough, examples (`pvc-only.yaml`, `block/block.yaml`),
-and troubleshooting guide are cloned and adapted (`iscsiadm -m session`
-→ `rbd-nbd list-mapped`, by-path device → `/dev/nbdX`).
+## 15. Phase 0 qualification gates
 
-## 10. Risks and open questions
+### Already validated
+WRCP 24.09 krbd data path; active type `ceph-rook-store`;
+`driver_volume_type=rbd`; flat connection info; image name
+`<pool>/<uuid>` without prefix; `auth_username=cinder`; `secret_uuid` =
+Ceph FSID; no host `rbd-nbd`; Ceph 18.2.x tools available in Ceph-CSI
+image; shared Ceph cluster between WRCP and Cinder.
 
-| # | Risk / question | Mitigation / resolution path |
-|---|---|---|
-| 1 | WRCP Cinder RBD driver rejects the bare-metal connector or returns unexpected connection_info | **Phase 0 spike is the gate** — no code before it passes |
-| 2 | rbd-nbd daemon death → EIO on mapped device | host-namespace spawn (§7.4); recovery runbook |
-| 3 | Double-map from two nodes (RBD does not enforce per-initiator exclusivity like iSCSI targets) | CSI `SINGLE_NODE_WRITER` + external-attacher; optional `rbd status` watcher check before map |
-| 4 | cephx key compromise (node Secret) | least-privilege `profile rbd` client scoped to the volumes pool; RBAC on the Secret |
-| 5 | Ceph mon addresses in connection_info unreachable from workers | WRCP topology makes mons local; Phase 0 confirms reachability |
-| 6 | Image features unsupported by mapper | rbd-nbd supports all features (reason it was chosen over krbd) |
-| 7 | Cinder metadata loss orphans attachment | same on-demand-create + 404-retry design as cinder-iscsi |
+### Must pass before production
+1. Build a minimal node image with the qualified Ceph 18.2.x `rbd` CLI.
+2. Map a Cinder image using the exact returned connection fields and
+   the operator-provided `client.cinder` Secret.
+3. Write, read, flush, unmap, remap, verify integrity.
+4. Confirm `--exclusive` blocks a second writable client.
+5. Recovery after node-plugin restart with a live map.
+6. Recovery after node reboot.
+7. Attachment creation without a real Nova server using the stable
+   migration-owner UUID.
+8. Attachment update + completion with microversion ≥ 3.44.
+9. Persistent attachment survives multiple CDI publish/unpublish cycles.
+10. Fault injection after each external side effect; verify idempotent
+    recovery.
+11. Deliberate duplicate owned attachments; safe reconciliation.
+12. Credential rotation and insufficient-capability failures.
+13. No Secret material in logs, CSI responses, or metadata.
+14. Full precopy + cutover workflow with pod movement between nodes.
 
-## 11. Phased implementation plan
+**Gates 2, 4, 7, 8, 9 are blocking.**
 
-- **Phase 0 — feasibility spike (gate, ~1 day, zero code):** on a real
-  WRCP cloud with curl/openstack CLI: create volume → `POST
-  /v3/attachments` (reserve, no server) → `PUT` with the §6.1 connector
-  → inspect connection_info → create `client.wrcp-csi` cephx user →
-  manual `rbd-nbd map` → dd read/write → `rbd-nbd unmap` → `DELETE
-  /v3/attachments/{id}` → confirm volume returns to `available`.
-  Output: a curl walkthrough doc (like the iSCSI one) + go/no-go.
-- **Phase 1 — controller:** `pkg/csi/cinder-rbd/` controller +
-  openstack package (copied from cinder-iscsi, RBD deltas), unit tests.
-- **Phase 2 — node:** `RBDConnector` + node RPCs + nsenter host-spawn,
-  unit tests with mock.
-- **Phase 3 — deploy:** manifests, Helm chart, CDI StorageProfile,
-  examples, chart verify script.
-- **Phase 4 — release & E2E:** CI workflow, staging deployment,
-  demo-walkthrough validation, troubleshooting guide.
+## 16. Implementation plan
 
-## 12. References
+1. **Controller foundation** — reuse the cinder-iscsi Cinder client and
+   CSI scaffolding; strict RBD connection normalization; require
+   microversion 3.44; per-volume locking; attachment-list
+   reconciliation; persistent reservation semantics.
+2. **Kernel RBD node path** — node image with Ceph 18.2.x tools;
+   generated `ceph.conf` + protected keyring handling; exclusive
+   mapping; live-map/sysfs reconciliation; raw-block stage/publish.
+3. **Recovery and lifecycle** — durable staging records; controller and
+   node startup reconciliation; fault injection around every side
+   effect; retain-by-default deletion.
+4. **Qualification** — all Phase 0 gates; multi-stage CDI migration
+   tests; restart/reboot/reschedule/Cinder-outage/mon-disruption tests;
+   operator runbook for conflicting attachments and quarantined maps.
 
-- Existing implementation: `pkg/csi/cinder-iscsi/` on
+Package layout mirrors the cinder-iscsi plugin (`pkg/csi/cinder-rbd/`,
+`cmd/cinder-rbd-csi-plugin/`, chart, manifests, examples, release
+workflow) with the node layer replaced by an `RBDMapper` abstraction
+(`Map`/`Unmap`/`ListMapped`/`VerifyIdentity`) over the bundled `rbd`
+CLI.
+
+## 17. References
+
+- Initial (v1) proposal: this file's git history on
+  `wndrvr/cinder-rbd-csi-plugin-design`
+- iSCSI sibling: `pkg/csi/cinder-iscsi/` on
   `wndrvr/cinder-iscsi-csi-plugin-impl`; skill
   `.github/skills/cinder-iscsi-csi/`
-- Cinder attachments API (mv 3.27/3.44):
+- NFS sibling: `nfs-backed-cinder-volume-for-wrcp-migration.md`; skill
+  `.github/skills/nfs-cinder-csi/`
+- Cinder attachments API:
   https://docs.openstack.org/api-ref/block-storage/v3/#attachments
-- Cinder RBD driver: `cinder/volume/drivers/rbd.py`
-  (`initialize_connection`)
+- Ceph RBD command reference: https://docs.ceph.com/en/reef/man/8/rbd/
+- Ceph exclusive locks:
+  https://docs.ceph.com/en/reef/rbd/rbd-exclusive-locks/
+- Ceph user management:
+  https://docs.ceph.com/en/latest/rados/operations/user-management/
+- Ceph-CSI RBD-NBD design (prior art for why krbd was preferred):
+  https://github.com/ceph/ceph-csi/blob/devel/docs/design/proposals/rbd-nbd.md
 - CVE-2020-10755 — keyring removed from RBD connection_info
-- cinderlib / Ember-CSI — prior art for VM-less Cinder attachment
-- ceph-csi rbd-nbd restart problem — prior art for §7.4
