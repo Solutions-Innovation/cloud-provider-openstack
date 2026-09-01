@@ -1,0 +1,41 @@
+# RBAC for the Cinder RBD CSI NODE plugin.
+#
+# Note there is no 'secrets' permission: the node plugin reads its Ceph
+# credential from a projected Secret volume, not through the API. That is a
+# deliberate reduction in blast radius for a privileged DaemonSet.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cinder-rbd-openstack-cinder-rbd-csi-node-sa
+  namespace: kube-system
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: cinder-rbd-openstack-cinder-rbd-csi-nodeplugin-role
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - events
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: cinder-rbd-openstack-cinder-rbd-csi-nodeplugin-binding
+subjects:
+- kind: ServiceAccount
+  name: cinder-rbd-openstack-cinder-rbd-csi-node-sa
+  namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: cinder-rbd-openstack-cinder-rbd-csi-nodeplugin-role
+  apiGroup: rbac.authorization.k8s.io

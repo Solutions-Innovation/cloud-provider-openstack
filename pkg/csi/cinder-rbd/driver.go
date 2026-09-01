@@ -179,16 +179,24 @@ func (d *Driver) SetupControllerService(cloud openstack.IOpenStackRBD) {
 	d.ids.cloud = cloud
 }
 
-// SetupNodeService wires the node service.
+// SetupNodeService wires the node service with production dependencies.
 //
 // opts carries the [RBD] section of driver.conf and must already have had
 // ApplyDefaults and Validate applied by the config loader.
 func (d *Driver) SetupNodeService(opts openstack.RBDOpts, vopts openstack.VolumeOpts) {
-	klog.Info("Providing node service")
+	d.SetupNodeServiceWithDeps(opts, vopts,
+		NewRBDCLIMapper(opts),
+		NewFileCredentialProvider(opts.CredentialPath),
+		mount.GetMountProvider())
+}
 
-	mapper := NewRBDCLIMapper(opts)
-	creds := NewFileCredentialProvider(opts.CredentialPath)
-	mounter := mount.GetMountProvider()
+// SetupNodeServiceWithDeps wires the node service with explicit dependencies.
+//
+// This exists so the CSI sanity suite can substitute an in-memory kernel and
+// credential source. Production code goes through SetupNodeService.
+func (d *Driver) SetupNodeServiceWithDeps(opts openstack.RBDOpts, vopts openstack.VolumeOpts,
+	mapper RBDMapper, creds CephCredentialProvider, mounter mount.IMount) {
+	klog.Info("Providing node service")
 
 	d.ns = NewNodeServer(d, opts, vopts, mapper, creds, mounter)
 

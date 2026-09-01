@@ -1,0 +1,22 @@
+{{- if .Values.storageClass.enabled }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClass.name }}
+  {{- if .Values.storageClass.isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+  labels:
+    {{- include "cinder-rbd-csi.labels" . | nindent 4 }}
+provisioner: cinder-rbd.csi.windriver.com
+reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+# Hardcoded false: the driver does not advertise EXPAND_VOLUME, so enabling this
+# would let Kubernetes accept a resize the driver then rejects. Not a knob.
+allowVolumeExpansion: false
+{{- if .Values.storageClass.parameters }}
+parameters:
+  {{- toYaml .Values.storageClass.parameters | nindent 2 }}
+{{- end }}
+{{- end }}

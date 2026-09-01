@@ -1,0 +1,12 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: cinder-rbd.csi.windriver.com
+  labels:
+    {{- include "cinder-rbd-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-driver
+spec:
+  attachRequired: true
+  podInfoOnMount: false
+  volumeLifecycleModes:
+  - Persistent

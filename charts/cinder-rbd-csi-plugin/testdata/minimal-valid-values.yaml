@@ -1,0 +1,5 @@
+# Minimal configuration that must render. Used by helm lint and the verify
+# script, because the default values deliberately fail on the FSID guard.
+driverConfig:
+  rbd:
+    expectedFsid: c5f7876d-258c-4152-b26a-a3ab532fda28

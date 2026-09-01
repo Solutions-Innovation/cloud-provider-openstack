@@ -1,0 +1,258 @@
+extraLabels: {}
+
+nameOverride: ""
+fullnameOverride: ""
+timeout: 3m
+
+csi:
+  attacher:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-attacher
+      tag: v4.10.0
+      pullPolicy: IfNotPresent
+    resources: {}
+    extraArgs: {}
+    extraEnv: []
+  provisioner:
+    topology: "false"
+    image:
+      repository: registry.k8s.io/sig-storage/csi-provisioner
+      tag: v5.3.0
+      pullPolicy: IfNotPresent
+    resources: {}
+    extraArgs: {}
+    extraEnv: []
+  livenessprobe:
+    image:
+      repository: registry.k8s.io/sig-storage/livenessprobe
+      tag: v2.17.0
+      pullPolicy: IfNotPresent
+    failureThreshold: 5
+    initialDelaySeconds: 10
+    timeoutSeconds: 10
+    periodSeconds: 60
+    # Node-specific overrides — node plugins need faster failure detection
+    # than controller plugins. These override the shared values above for
+    # the node DaemonSet only.
+    node:
+      failureThreshold: 5
+      initialDelaySeconds: 10
+      timeoutSeconds: 3
+      periodSeconds: 10
+    resources: {}
+    extraArgs: {}
+    extraEnv: []
+  nodeDriverRegistrar:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
+      tag: v2.15.0
+      pullPolicy: IfNotPresent
+    resources: {}
+    extraArgs: {}
+    extraEnv: []
+  plugin:
+    image:
+      repository: ghcr.io/solutions-innovation/cinder-rbd-csi-plugin
+      pullPolicy: Always
+      tag:  # defaults to .Chart.AppVersion
+    volumes: []
+    volumeMounts: []
+    nodePlugin:
+      dnsPolicy: ClusterFirstWithHostNet
+      hostPID: false
+      podAnnotations: {}
+      podLabels: {}
+      podSecurityContext: {}
+      securityContext: {}
+      affinity: {}
+      nodeSelector: {}
+      tolerations:
+        - operator: Exists
+      kubeletDir: /var/lib/kubelet
+      extraArgs: {}
+    controllerPlugin:
+      replicas: 1
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 0
+          maxSurge: 1
+      podAnnotations: {}
+      podLabels: {}
+      podSecurityContext: {}
+      securityContext: {}
+      affinity: {}
+      nodeSelector: {}
+      tolerations: []
+      extraArgs: {}
+    resources: {}
+    httpEndpoint:
+      enabled: false
+      port: 8080
+    extraArgs: {}
+    extraEnv: []
+
+# Log verbosity level.
+logVerbosityLevel: 2
+
+# Secret for OpenStack cloud credentials (cloud.conf).
+# Options:
+# 1) Use existing secret (default): set enabled=true, create=false, set name
+# 2) Create from values: set enabled=true, create=true, provide data below
+# 3) Mount from host: set enabled=false, hostMount=true
+# 4) Inject via agent: set enabled=false, hostMount=false
+#
+# Default: enabled=true expects a pre-existing Secret named
+# "cinder-rbd-csi-cloud-config" in the release namespace.
+# Create it before install:
+#   kubectl create secret generic cinder-rbd-csi-cloud-config \
+#     --from-file=cloud.conf=/path/to/cloud.conf -n kube-system
+secret:
+  enabled: true
+  hostMount: false
+  create: false
+  filename: cloud.conf
+  name: cinder-rbd-csi-cloud-config
+#  data:
+#    cloud.conf: |-
+#      [Global]
+#      auth-url=http://openstack-control-plane
+#      user-id=user-id
+#      password=password
+#      trust-id=trust-id
+#      region=RegionOne
+#      ca-file=/etc/ssl/certs/ca-certificates.crt
+
+# ConfigMap for the RBD driver configuration (driver.conf).
+#
+# Contains no credentials. expected-fsid is an environment identifier and
+# credential-path only names a directory; the Ceph key lives in the Secret
+# referenced by cephCredential below.
+driverConfig:
+  enabled: true
+  create: true
+  name: cinder-rbd-driver-config
+  rbd:
+    # Only krbd is supported in this release; the driver rejects anything else
+    # at startup and this chart refuses to render it.
+    mounter: krbd
+    # Must remain true. A writable non-exclusive kernel RBD mapping allows a
+    # second writer and defeats the Ceph exclusive-lock guarantee.
+    exclusive: true
+    expectedClusterName: ceph
+    # REQUIRED — rendering fails if empty. Obtain with:
+    #   kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph fsid
+    expectedFsid: ""
+    cephClientVersionMajor: 18
+    credentialPath: /etc/cinder-rbd-csi/ceph
+    runtimeDir: /run/cinder-rbd-csi
+    stateDir: /var/lib/cinder-rbd-csi
+    mapTimeout: 120s
+    unmapTimeout: 120s
+    deviceWaitTimeout: 60s
+    # 0 means unlimited, pending measurement of the krbd mapping limit.
+    maxVolumesPerNode: 0
+  volume:
+    createTimeout: 300
+    detachTimeout: 120
+    # Read from the StorageClass at runtime; this is only the fallback.
+    defaultVolumeType: ceph-rook-store
+    metadataPrefix: csi.rbd
+    # retain keeps the Cinder volume after PVC deletion so the migration
+    # Blueprint can attach it to the target VM. Change with care.
+    deleteVolumeMode: retain
+
+# Operator-managed Ceph credential.
+#
+# The operator duplicates the existing platform client.cinder key into this
+# Secret; there is no automated synchronisation. See the operator runbook.
+#
+# create: false means "the Secret already exists"; the chart only projects it
+# into the node plugin. Never commit a Ceph key to a values file.
+cephCredential:
+  create: false
+  secretName: cinder-rbd-ceph-client
+  userIDKey: userID
+  userKeyKey: userKey
+  userID: ""
+  userKey: ""
+
+# Optional CA certificate bundle for HTTPS-enabled OpenStack endpoints using
+# self-signed or private CA certificates.
+#
+# The CSI controller reads cloud.conf and calls Keystone/Cinder APIs, so this
+# mount is applied to the controller plugin pod only. The CSI node plugin does
+# not read cloud.conf and does not call Keystone/Cinder.
+#
+# cloud.conf must reference a file that exists inside the controller container,
+# for example:
+#   [Global]
+#   ca-file=/etc/ssl/certs/ca-certificates.crt
+#
+# HostPath mode does not create or install the CA file. The file must already
+# exist on every node where the controller pod may run, or the controller pod
+# must be pinned to a node where it exists.
+#
+# Example host validation for a Debian-style system CA bundle:
+#   ls -ld /etc/ssl/certs
+#   ls -l /etc/ssl/certs/ca-certificates.crt
+#   openssl s_client \
+#     -connect <keystone-host>:443 \
+#     -servername <keystone-host> \
+#     -CAfile /etc/ssl/certs/ca-certificates.crt \
+#     -verify_return_error </dev/null
+#
+# Expected openssl success:
+#   Verify return code: 0 (ok)
+cacert:
+  enabled: false
+  source: hostPath  # hostPath or secret
+  mountPath: /etc/ssl/certs
+  filename: ca-certificates.crt
+  hostPath:
+    path: /etc/ssl/certs
+    type: Directory
+  secret:
+    name: cinder-rbd-ca-cert
+    optional: false
+
+storageClass:
+  enabled: true
+  name: cinder-rbd-migration
+  isDefault: false
+  reclaimPolicy: Delete
+  volumeBindingMode: Immediate
+  parameters:
+    type: ceph-rook-store
+    availability: nova
+
+# CDI StorageProfile patch.
+# KubeVirt CDI auto-creates a StorageProfile per StorageClass but only
+# populates claimPropertySets for known provisioners. Our custom provisioner
+# (cinder-rbd.csi.windriver.com) is not in CDI's built-in map, so without
+# this patch CDI defaults DataVolume PVCs to volumeMode: Filesystem — which
+# this block-only driver rejects.
+#
+# Enable this when CDI is installed on the cluster and DataVolumes will
+# target this StorageClass (e.g., V2O/O2O migration workflows).
+#
+# The storageProfile name is automatically set to match storageClass.name.
+#
+# TODO: Upstream PR to kubevirt/containerized-data-importer to add
+# cinder-rbd.csi.windriver.com to CapabilitiesByProvisionerKey.
+# Once merged and deployed, this patch becomes unnecessary.
+storageProfile:
+  enabled: true
+  claimPropertySets:
+    - accessModes:
+        - ReadWriteOnce
+      volumeMode: Block
+
+# Cluster identifier — appended to volume metadata.
+clusterID: "kubernetes"
+
+priorityClassName: ""
+
+imagePullSecrets: []
+
+commonAnnotations: {}

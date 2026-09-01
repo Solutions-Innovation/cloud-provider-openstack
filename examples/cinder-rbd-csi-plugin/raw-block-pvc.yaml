@@ -1,0 +1,17 @@
+---
+# A raw-block PVC for the Cinder RBD CSI driver.
+#
+# volumeMode: Block is MANDATORY. This driver rejects Filesystem volumes, so a
+# PVC without it stays Pending.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: migration-target-disk
+spec:
+  accessModes:
+    - ReadWriteOnce        # SINGLE_NODE_WRITER; the Ceph exclusive lock enforces it
+  volumeMode: Block        # required
+  resources:
+    requests:
+      storage: 20Gi        # rounded up to whole GiB by Cinder
+  storageClassName: cinder-rbd-migration

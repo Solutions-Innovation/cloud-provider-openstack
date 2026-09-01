@@ -1,0 +1,20 @@
+---
+# Source: openstack-cinder-rbd-csi/templates/cinder-rbd-csi-driver.yaml
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: cinder-rbd.csi.windriver.com
+  labels:
+    app.kubernetes.io/name: openstack-cinder-rbd-csi
+    helm.sh/chart: openstack-cinder-rbd-csi-2.35.0
+    app.kubernetes.io/instance: cinder-rbd
+    app.kubernetes.io/version: "v1.35.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: wrc-migration
+    app.kubernetes.io/component: csi-driver
+spec:
+  attachRequired: true
+  podInfoOnMount: false
+  volumeLifecycleModes:
+  - Persistent
+

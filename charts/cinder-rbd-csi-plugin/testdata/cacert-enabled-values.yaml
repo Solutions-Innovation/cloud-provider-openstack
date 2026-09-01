@@ -1,0 +1,11 @@
+driverConfig:
+  rbd:
+    expectedFsid: c5f7876d-258c-4152-b26a-a3ab532fda28
+cacert:
+  enabled: true
+  source: hostPath
+  mountPath: /etc/ssl/certs
+  filename: ca-certificates.crt
+  hostPath:
+    path: /etc/ssl/certs
+    type: Directory
