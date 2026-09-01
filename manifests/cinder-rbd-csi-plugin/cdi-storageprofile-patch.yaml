@@ -1,0 +1,27 @@
+---
+# CDI StorageProfile for the Cinder RBD CSI driver.
+#
+# Why this is required, not optional:
+#
+# CDI decides a DataVolume's volumeMode from an internal
+# CapabilitiesByProvisionerKey map. This driver's provisioner name is not in that
+# map, so CDI falls back to volumeMode: Filesystem. This driver serves raw block
+# volumes only and rejects Filesystem, so the DataVolume's PVC stays Pending with
+# no obvious cause and no event pointing at the real problem.
+#
+# The StorageProfile name MUST equal the StorageClass name, or CDI ignores it.
+#
+# Reapply this after every StorageClass recreation: deleting the StorageClass
+# orphans the profile, and CDI reverts to the Filesystem default.
+#
+# TODO: upstream cinder-rbd.csi.windriver.com into CDI's provisioner
+# capabilities map so this patch becomes unnecessary.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: StorageProfile
+metadata:
+  name: cinder-rbd-migration
+spec:
+  claimPropertySets:
+    - accessModes:
+        - ReadWriteOnce
+      volumeMode: Block

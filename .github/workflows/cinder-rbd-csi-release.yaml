@@ -1,0 +1,274 @@
+name: Cinder RBD CSI Plugin Release
+
+on:
+  push:
+    branches:
+      - "wndrvr/cinder-rbd-csi-plugin-impl"
+    tags:
+      - "wndrvr_v*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: solutions-innovation/cinder-rbd-csi-plugin
+  HELM_CHART_DIR: charts/cinder-rbd-csi-plugin
+  HELM_OCI_REPO: oci://ghcr.io/solutions-innovation/charts
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Build & push Docker image to GHCR
+  # ---------------------------------------------------------------------------
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine version from git
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/wndrvr_v* ]]; then
+            # Tag push: use full tag name as image tag (e.g. wndrvr_v1.0.0)
+            TAG_NAME="${GITHUB_REF#refs/tags/}"             # wndrvr_v1.0.0
+            RAW_TAG="${GITHUB_REF#refs/tags/wndrvr_}"       # v1.0.0
+            echo "version=${TAG_NAME}" >> "$GITHUB_OUTPUT"   # image tag
+            echo "build_version=${RAW_TAG}" >> "$GITHUB_OUTPUT"  # semver for go binary
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
+          else
+            # Branch push: use semver-compliant pre-release for go binary
+            SHA_SHORT=$(git rev-parse --short HEAD)
+            echo "version=dev-${SHA_SHORT}" >> "$GITHUB_OUTPUT"          # image tag
+            echo "build_version=v0.0.0-dev.${SHA_SHORT}" >> "$GITHUB_OUTPUT"  # semver for go binary
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Go module cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-mod-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-mod-${{ runner.os }}-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # On tag push: wndrvr_v1.0.0 + latest
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.is_tag }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_tag }}
+            # On branch push: dev-<sha> + branch name slug
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.is_tag == 'false' }}
+            type=ref,event=branch,enable=${{ steps.version.outputs.is_tag == 'false' }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          target: cinder-rbd-csi-plugin
+          platforms: linux/amd64
+          build-args: |
+            VERSION=${{ steps.version.outputs.build_version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Package Helm chart & push as OCI artifact to GHCR
+  # ---------------------------------------------------------------------------
+
+      - name: Verify the bundled Ceph client major version
+        # The driver bundles its own rbd CLI because the WRCP host ships Ceph 14
+        # while the cluster runs Ceph 18. A repository or base-image drift that
+        # pulled a different major version would break every map at runtime, so
+        # it is caught here instead.
+        run: |
+          set -euo pipefail
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}"
+          version=$(docker run --rm --entrypoint rbd "$image" --version)
+          echo "bundled client: $version"
+          major=$(echo "$version" | sed -nE 's/^ceph version ([0-9]+)\..*/\1/p')
+          if [ "$major" != "18" ]; then
+            echo "::error::bundled rbd client major version is '$major', expected 18" >&2
+            exit 1
+          fi
+
+  helm-package:
+    runs-on: ubuntu-latest
+    needs: build-and-push-image
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      chart_version: ${{ steps.chart_version.outputs.chart_version }}
+      chart_file: ${{ steps.package.outputs.chart_file }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Determine versions
+        id: chart_version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/wndrvr_v* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"               # wndrvr_v1.0.0
+            RAW_TAG="${GITHUB_REF#refs/tags/wndrvr_}"         # v1.0.0
+            SEMVER="${RAW_TAG#v}"                               # 1.0.0
+            echo "chart_version=${SEMVER}" >> "$GITHUB_OUTPUT"
+            echo "app_version=${TAG_NAME}" >> "$GITHUB_OUTPUT"  # wndrvr_v1.0.0
+          else
+            SHA_SHORT=$(git rev-parse --short HEAD)
+            echo "chart_version=0.0.0-dev.${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+            echo "app_version=dev-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - name: Update Chart.yaml with release version
+        run: |
+          CHART_VERSION="${{ steps.chart_version.outputs.chart_version }}"
+          APP_VERSION="${{ steps.chart_version.outputs.app_version }}"
+          IMAGE_REPO="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          sed -i "s/^version:.*/version: ${CHART_VERSION}/" ${{ env.HELM_CHART_DIR }}/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: ${APP_VERSION}/" ${{ env.HELM_CHART_DIR }}/Chart.yaml
+
+          echo "--- Updated Chart.yaml ---"
+          cat ${{ env.HELM_CHART_DIR }}/Chart.yaml
+
+      - name: Update values.yaml image tag for this build
+        run: |
+          APP_VERSION="${{ steps.chart_version.outputs.app_version }}"
+          # Set the default tag in values.yaml so the packaged chart is self-contained
+          sed -i "s|tag:.*# defaults to .Chart.AppVersion|tag: \"${APP_VERSION}\"  # defaults to .Chart.AppVersion|" \
+            ${{ env.HELM_CHART_DIR }}/values.yaml
+
+          echo "--- Updated values.yaml image section ---"
+          grep -A3 'repository:' ${{ env.HELM_CHART_DIR }}/values.yaml | head -5
+
+      - name: Lint Helm chart
+        # The default values deliberately fail rendering: expectedFsid has no
+        # safe default, so it is required. Lint against the minimal valid
+        # configuration, and separately assert the guard still fires.
+        run: |
+          set -euo pipefail
+          helm lint ${{ env.HELM_CHART_DIR }} \
+            -f ${{ env.HELM_CHART_DIR }}/testdata/minimal-valid-values.yaml
+          if helm template t ${{ env.HELM_CHART_DIR }} >/dev/null 2>&1; then
+            echo "::error::the chart rendered without an expectedFsid; the safety guard has regressed" >&2
+            exit 1
+          fi
+
+      - name: Verify Helm chart compatibility renders
+        run: bash hack/verify-cinder-rbd-chart.sh
+
+      - name: Package Helm chart
+        id: package
+        run: |
+          helm package ${{ env.HELM_CHART_DIR }} --destination /tmp/helm-packages
+          CHART_FILE=$(ls /tmp/helm-packages/*.tgz)
+          echo "chart_file=${CHART_FILE}" >> "$GITHUB_OUTPUT"
+          echo "Packaged: ${CHART_FILE}"
+
+      - name: Log in to GHCR for Helm OCI
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} \
+            --username ${{ github.actor }} \
+            --password-stdin
+
+      - name: Push Helm chart to OCI registry
+        run: |
+          helm push ${{ steps.package.outputs.chart_file }} ${{ env.HELM_OCI_REPO }}
+
+      - name: Upload Helm chart as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: ${{ steps.package.outputs.chart_file }}
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Create GitHub Release (tag pushes only)
+  # ---------------------------------------------------------------------------
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/wndrvr_v')
+    runs-on: ubuntu-latest
+    needs: [build-and-push-image, helm-package]
+    permissions:
+      contents: write
+      packages: read
+
+    steps:
+      - name: Download Helm chart artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: helm-chart
+          path: /tmp/helm-release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Cinder iSCSI CSI Plugin ${{ needs.build-and-push-image.outputs.version }}"
+          body: |
+            ## Cinder iSCSI CSI Plugin — ${{ needs.build-and-push-image.outputs.version }}
+
+            ### Docker Image
+            ```
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push-image.outputs.version }}
+            ```
+            Digest: `${{ needs.build-and-push-image.outputs.image_digest }}`
+
+            ### Helm Chart (OCI)
+            ```
+            helm install cinder-rbd-csi \
+              ${{ env.HELM_OCI_REPO }}/openstack-cinder-rbd-csi \
+              --version ${{ needs.helm-package.outputs.chart_version }}
+            ```
+
+            ### Helm Chart (tgz)
+            Download the attached `.tgz` file and install:
+            ```
+            helm install cinder-rbd-csi ./openstack-cinder-rbd-csi-${{ needs.helm-package.outputs.chart_version }}.tgz
+            ```
+          draft: false
+          prerelease: false
+          files: |
+            /tmp/helm-release/*.tgz

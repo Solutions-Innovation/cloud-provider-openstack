@@ -102,6 +102,9 @@ test-manila-csi-sanity: work
 test-cinder-iscsi-csi-sanity: work
 	go test $(GIT_HOST)/$(BASE_DIR)/tests/sanity/cinder-iscsi
 
+test-cinder-rbd-csi-sanity: work
+	go test $(GIT_HOST)/$(BASE_DIR)/tests/sanity/cinder-rbd
+
 # kept for compatibility reasons.
 fmt: check
 lint: check

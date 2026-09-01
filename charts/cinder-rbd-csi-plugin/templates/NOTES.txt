@@ -1,0 +1,70 @@
+{{- $cacert := include "cinder-rbd-csi.cacert" . | fromYaml -}}
+RBD-backed Cinder CSI plugin has been installed.
+
+{{- if .Values.storageClass.enabled }}
+StorageClass "{{ .Values.storageClass.name }}" has been created with:
+  provisioner: cinder-rbd.csi.windriver.com
+  reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+  volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+
+Use this StorageClass for RBD-backed block PVCs:
+
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: my-rbd-block-pvc
+  spec:
+    accessModes:
+      - ReadWriteOnce
+    volumeMode: Block
+    resources:
+      requests:
+        storage: 10Gi
+    storageClassName: {{ .Values.storageClass.name }}
+{{- end }}
+
+{{- if .Values.driverConfig.enabled }}
+
+Driver configuration (driver.conf) is managed via ConfigMap "{{ .Values.driverConfig.name }}".
+{{- end }}
+
+{{- if $cacert.enabled }}
+
+CA certificate bundle mounting is enabled for the CSI controller plugin:
+  source: {{ $cacert.source }}
+  mountPath: {{ $cacert.mountPath }}
+{{- if eq $cacert.source "hostPath" }}
+  hostPath: {{ $cacert.hostPath.path }}
+
+The CA bundle must already exist on every node where the CSI controller pod may run,
+or the controller pod must be pinned to a node where it exists. Helm only mounts the
+directory; it does not create or install certificates on the host.
+{{- else if eq $cacert.source "secret" }}
+  secret: {{ $cacert.secret.name }}
+
+Create the CA Secret before installing or upgrading this chart.
+{{- end }}
+
+Make sure cloud.conf references the mounted CA file, for example:
+
+  [Global]
+  ca-file={{ $cacert.mountPath }}/{{ $cacert.filename }}
+
+{{- if eq $cacert.source "hostPath" }}
+For hostPath mode, validate the host CA bundle and endpoint trust before install:
+
+  ls -ld {{ $cacert.hostPath.path }}
+  ls -l {{ $cacert.hostPath.path }}/{{ $cacert.filename }}
+  openssl s_client \
+    -connect <keystone-host>:443 \
+    -servername <keystone-host> \
+    -CAfile {{ $cacert.hostPath.path }}/{{ $cacert.filename }} \
+    -verify_return_error </dev/null
+
+Expected success:
+  Verify return code: 0 (ok)
+{{- end }}
+{{- end }}
+
+NOTE: This driver provides raw block volumes only (volumeMode: Block).
+      Filesystem volumes are not supported.

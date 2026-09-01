@@ -2311,8 +2311,44 @@ misconfiguration from becoming silent unsafety.
 | 5.5 | Examples and a demo walkthrough | `examples/cinder-rbd-csi-plugin/` |
 | 5.6 | Release workflow incl. the `rbd --version` gate | `.github/workflows/cinder-rbd-csi-release.yaml` |
 | 5.7 | Metrics exposure and a dashboard/alert starting point | chart, runbook |
-| 5.8 | Optional CSI sanity suite, or explicitly none (no dangling target) | `tests/sanity/cinder-rbd/` |
+| 5.8 | **CSI sanity suite** — promoted to a primary deliverable, replacing Phase 6 workflow integration | `tests/sanity/cinder-rbd/` — **43 specs pass** |
 | 5.9 | File the deferred `pkg/csi/cinderattach/` extraction follow-up (§3) | issue tracker |
+
+**Phase 5 status: COMPLETE except the container image** (2026-09-01).
+`helm lint` and all 22 `verify-cinder-rbd-chart.sh` checks pass against a real
+helm 3.17.0; the CSI sanity suite passes 43 specs; static manifests are generated
+from the verified chart so the two cannot drift. The Dockerfile stage and the
+release workflow remain **unbuilt and unrun** — no container runtime is available
+in the development environment.
+
+**Phase 5 findings**
+
+1. **The default values must fail to render.** `expectedFsid` has no safe
+   default, so `helm lint` with defaults fails by design. Both the verify script
+   and the release workflow lint against `testdata/minimal-valid-values.yaml`
+   and *separately* assert the guard still fires, so a regression that made the
+   chart render without an FSID is caught rather than rewarded.
+2. **`/sys` must be mounted read-write.** The iSCSI chart mounts it read-only,
+   which is correct there. `rbd device map` and `unmap` work by writing to
+   `/sys/bus/rbd/{add,remove}`, so inheriting `readOnly: true` would have made
+   every map fail. The verify script asserts the absence of `readOnly` on that
+   mount specifically.
+3. **`allowVolumeExpansion` is hardcoded false, not a value.** The driver does
+   not advertise `EXPAND_VOLUME`; making it configurable would let Kubernetes
+   accept a resize the driver then rejects.
+4. **Static manifests are generated from the chart** rather than hand-written,
+   so the two representations cannot drift. RBAC is split by object name, not by
+   rule content — the attacher and provisioner roles legitimately reference
+   `csinodes`, which a naive filter miscategorises.
+5. **Two CSI sanity specs are inapplicable** and skipped with recorded reasons,
+   not silently: one hardcodes a filesystem volume in its setup despite
+   `TestVolumeAccessType: "block"` (a csi-test v5.0.0 limitation), and one
+   expects `ControllerPublishVolume` to detect a nonexistent node, which this
+   driver cannot do — it has no Kubernetes client by design and the Cinder RBD
+   backend accepts any connector host.
+6. **The node plugin needs no `secrets` RBAC.** It reads its Ceph credential
+   from a projected volume, not the API, which is a deliberate reduction in blast
+   radius for a privileged DaemonSet.
 
 **Exit criteria**
 - `helm lint` and `hack/verify-cinder-rbd-chart.sh` pass; rendering with an
@@ -2325,6 +2361,12 @@ misconfiguration from becoming silent unsafety.
   test a map) is executed by someone who did not write the code.
 
 ### Phase 6 — Migration workflow integration and full qualification
+
+> **DESCOPED** for this delivery (decision of 2026-09-01): the CSI sanity suite
+> in Phase 5 substitutes for full workflow integration. The items below remain
+> the prerequisites for *production* qualification and are recorded so the gap is
+> explicit, not forgotten. The driver must not be described as
+> production-qualified until they are met.
 
 **Goal:** close every remaining item of P§15 and prove the real workflows.
 

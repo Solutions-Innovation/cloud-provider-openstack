@@ -1,0 +1,29 @@
+---
+# A pod consuming the raw block device.
+#
+# Use volumeDevices, never volumeMounts: there is no filesystem to mount.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: migration-writer
+spec:
+  restartPolicy: Never
+  containers:
+    - name: writer
+      image: registry.k8s.io/e2e-test-images/busybox:1.29-4
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          echo "block device:"; ls -l /dev/target
+          echo "writing 4MiB"; dd if=/dev/zero of=/dev/target bs=1M count=4 conv=fsync
+          echo "reading back"; dd if=/dev/target bs=1M count=4 | wc -c
+          sleep 3600
+      volumeDevices:
+        - name: target
+          devicePath: /dev/target
+  volumes:
+    - name: target
+      persistentVolumeClaim:
+        claimName: migration-target-disk

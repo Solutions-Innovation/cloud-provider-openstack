@@ -1,0 +1,22 @@
+{{- if .Values.storageProfile.enabled }}
+{{- /*
+CDI StorageProfile patch — configures volumeMode: Block as the default
+for DataVolumes using this StorageClass. Required because CDI does not
+recognize the cinder-rbd.csi.windriver.com provisioner in its built-in
+CapabilitiesByProvisionerKey map.
+
+This resource is a patch to the auto-generated StorageProfile (CDI creates
+one per StorageClass). The name MUST match the StorageClass name.
+
+See: https://github.com/kubevirt/containerized-data-importer/blob/main/doc/storageprofile.md
+*/ -}}
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: StorageProfile
+metadata:
+  name: {{ .Values.storageClass.name }}
+  labels:
+    {{- include "cinder-rbd-csi.labels" . | nindent 4 }}
+spec:
+  claimPropertySets:
+    {{- toYaml .Values.storageProfile.claimPropertySets | nindent 4 }}
+{{- end }}

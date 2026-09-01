@@ -1,0 +1,23 @@
+---
+# Source: openstack-cinder-rbd-csi/templates/storageclass.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cinder-rbd-migration
+  labels:
+    app.kubernetes.io/name: openstack-cinder-rbd-csi
+    helm.sh/chart: openstack-cinder-rbd-csi-2.35.0
+    app.kubernetes.io/instance: cinder-rbd
+    app.kubernetes.io/version: "v1.35.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: wrc-migration
+provisioner: cinder-rbd.csi.windriver.com
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+# Hardcoded false: the driver does not advertise EXPAND_VOLUME, so enabling this
+# would let Kubernetes accept a resize the driver then rejects. Not a knob.
+allowVolumeExpansion: false
+parameters:
+  availability: nova
+  type: ceph-rook-store
+
