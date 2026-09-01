@@ -166,6 +166,41 @@ LABEL name="cinder-iscsi-csi-plugin" \
 CMD ["/bin/cinder-iscsi-csi-plugin"]
 
 ##
+## cinder-rbd-csi-plugin (development)
+##
+FROM ${DEBIAN_IMAGE} AS cinder-rbd-csi-plugin
+
+# The WRCP host ships Ceph 14 tooling while the storage cluster runs Ceph 18.2.x,
+# so the plugin bundles its own qualified client. The kernel performs the
+# mapping; this CLI only issues it.
+#
+# Verified 2026-09-01: download.ceph.com/debian-reef publishes a bookworm suite
+# whose ceph-common is 18.2.8-1~bpo12+1. The container base is bookworm even
+# though the WRCP hosts are Debian 11 — container userspace is independent of
+# the host, and only the shared 6.6 kernel does the mapping.
+ARG CEPH_PKG_VERSION=18.2.8-1~bpo12+1
+RUN clean-install ca-certificates curl gnupg \
+ && curl -fsSL https://download.ceph.com/keys/release.asc \
+      -o /etc/apt/trusted.gpg.d/ceph.asc \
+ && echo "deb https://download.ceph.com/debian-reef bookworm main" \
+      > /etc/apt/sources.list.d/ceph.list \
+ && clean-install ceph-common="${CEPH_PKG_VERSION}" mount util-linux \
+ && rbd --version
+
+COPY --from=builder /build/cinder-rbd-csi-plugin /bin/cinder-rbd-csi-plugin
+COPY --from=certs /etc/ssl/certs /etc/ssl/certs
+
+LABEL name="cinder-rbd-csi-plugin" \
+      license="Apache Version 2.0" \
+      maintainers="Kubernetes Authors" \
+      description="Cinder RBD CSI Plugin" \
+      distribution-scope="public" \
+      summary="Cinder RBD CSI Plugin for Ceph RBD-backed Cinder volumes" \
+      help="none"
+
+CMD ["/bin/cinder-rbd-csi-plugin"]
+
+##
 ## k8s-keystone-auth
 ##
 FROM ${DISTROLESS_IMAGE} AS k8s-keystone-auth

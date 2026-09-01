@@ -13,6 +13,9 @@ Rook Ceph 18.2.x)
 completion uses microversion 3.44 when available
 
 Related designs:
+- `rbd-cinder-csi-implementation-design.md` — the paired detailed
+  implementation design for this proposal (package layout, interfaces, RPC
+  map, phase plan)
 - `iscsi-backed-cinder-volume-for-wrcp-migration.md`
 - `nfs-backed-cinder-volume-for-wrcp-migration.md`
 
@@ -699,8 +702,15 @@ workflow) with the node layer replaced by an `RBDMapper` abstraction
 (`Map`/`Unmap`/`ListMapped`/`VerifyIdentity`) over the bundled `rbd`
 CLI.
 
+Section 16 is the outline; the paired
+`rbd-cinder-csi-implementation-design.md` expands it into phases with tasks,
+target files, and exit criteria, and pulls the mandatory Section 15
+qualification items into a blocking Phase 0.
+
 ## 17. References
 
+- Paired implementation design:
+  `rbd-cinder-csi-implementation-design.md`
 - Related iSCSI design:
   `iscsi-backed-cinder-volume-for-wrcp-migration.md`
 - Related NFS design:
