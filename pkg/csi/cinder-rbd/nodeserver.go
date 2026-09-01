@@ -42,6 +42,7 @@ type nodeServer struct {
 	Credentials CephCredentialProvider
 	Mounter     mount.IMount
 	Staging     *stagingStore
+	Isolation   *isolationSet
 
 	// Injection point for unit testing NodeGetInfo. There is deliberately no
 	// getInterfaceIPFunc: the Cinder RBD connector requires only "host".
@@ -134,6 +135,16 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context,
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 		}
 		return nil, status.Errorf(codes.FailedPrecondition, "ceph credential unavailable: %v", err)
+	}
+
+	// A volume isolated by reconciliation is refused up front. Re-discovering
+	// the same conflict on every stage attempt would produce identical failures
+	// with no indication that the node is degraded.
+	if entry, isolated := ns.Isolation.Get(volumeID); isolated {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"volume %s is isolated on this node and will not be served: %s. "+
+				"Operator resolution is required; see the operator runbook.",
+			volumeID, entry.Detail)
 	}
 
 	// Step 4: idempotency by live-map identity.

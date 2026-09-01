@@ -28,8 +28,10 @@ limitations under the License.
 package rbd
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -43,6 +45,10 @@ import (
 // driverName is a constant, not configuration. A mutable driver name would
 // break CSIDriver and CSINode registration.
 const driverName = "cinder-rbd.csi.windriver.com"
+
+// nodeReconcileTimeout bounds startup reconciliation. It must not block node
+// readiness indefinitely if the rbd CLI hangs.
+const nodeReconcileTimeout = 2 * time.Minute
 
 var (
 	// specVersion is the CSI spec version this driver targets.
@@ -196,6 +202,41 @@ func (d *Driver) SetupNodeService(opts openstack.RBDOpts, vopts openstack.Volume
 		// preferable to crash-looping a DaemonSet on a transient filesystem
 		// problem. The staging RPCs fail loudly until it is fixed.
 		klog.Errorf("SetupNodeService: node runtime preparation failed: %v", err)
+		return
+	}
+
+	// Reconcile before the gRPC server starts accepting calls. Running this
+	// after would let a NodeStageVolume race the pass that decides whether an
+	// existing mapping is adoptable or isolated.
+	d.reconcileNodeState()
+}
+
+// reconcileNodeState compares durable staging records against live kernel state.
+//
+// A failure leaves the node serving: the per-RPC paths perform the same identity
+// checks, so correctness does not depend on this pass succeeding. What is lost is
+// the up-front report, so the failure is logged prominently.
+func (d *Driver) reconcileNodeState() {
+	ctx, cancel := context.WithTimeout(context.Background(), nodeReconcileTimeout)
+	defer cancel()
+
+	rec := newReconciler(d.ns.Mapper, d.ns.Staging, d.ns.Isolation)
+	result, err := rec.Reconcile(ctx)
+	if err != nil {
+		klog.Errorf("SetupNodeService: startup reconciliation failed: %v; "+
+			"per-RPC identity checks still apply", err)
+		return
+	}
+
+	klog.Infof("SetupNodeService: startup reconciliation complete "+
+		"(adopted=%d unstaged=%d isolated=%d reported=%d)",
+		result.Adopted, result.Unstaged, result.Isolated, result.Reported)
+
+	if result.Isolated > 0 {
+		// Loud on purpose: an isolated mapping means this node cannot serve
+		// those volumes until an operator resolves the conflict.
+		klog.Errorf("SetupNodeService: %d mapping(s) are ISOLATED and will not be served: %v. "+
+			"See the operator runbook for resolution.", result.Isolated, result.IsolatedIdentities())
 	}
 }
 

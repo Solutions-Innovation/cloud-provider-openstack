@@ -461,6 +461,7 @@ func AddExtraFlags(fs *pflag.FlagSet) {
 // InitOpenStackProvider records config paths and starts metrics serving.
 func InitOpenStackProvider(cfgFiles []string, httpEndpoint string) {
 	metrics.RegisterMetrics("cinder-rbd-csi")
+	registerDriverMetrics()
 	if httpEndpoint != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", legacyregistry.HandlerWithReset())

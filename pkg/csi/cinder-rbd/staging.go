@@ -272,3 +272,25 @@ func (s *stagingStore) NextGeneration(volumeID string) int {
 	}
 	return 1
 }
+
+// WriteIndexOnly updates just the node-scoped index copy.
+//
+// Used by startup reconciliation: the staging-path copy lives under a kubelet
+// directory that may not exist yet after a reboot, and NodeStageVolume rewrites
+// it on the next call regardless.
+func (s *stagingStore) WriteIndexOnly(rec *StagingRecord) error {
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal staging record: %w", err)
+	}
+	data = append(data, '\n')
+	return writeFileAtomic(s.indexPath(rec.VolumeID), data, stagingRecordMode)
+}
+
+// RemoveIndexOnly deletes just the node-scoped index copy.
+func (s *stagingStore) RemoveIndexOnly(volumeID string) error {
+	if err := os.Remove(s.indexPath(volumeID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove staging index: %w", err)
+	}
+	return nil
+}

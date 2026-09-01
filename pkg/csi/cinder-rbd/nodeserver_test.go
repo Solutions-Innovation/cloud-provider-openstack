@@ -74,6 +74,7 @@ func newNodeFixture(t *testing.T) *nodeFixture {
 		Credentials: f.creds,
 		Mounter:     f.mounter,
 		Staging:     newStagingStore(opts),
+		Isolation:   newIsolationSet(),
 	}
 	return f
 }
