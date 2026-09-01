@@ -217,6 +217,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context,
 			"publish will recover by listing attachment records", attachmentKey, vol.ID, err)
 	}
 
+	attachmentRecordsCreated.WithLabelValues(attachReasonCreateVolume).Inc()
 	klog.V(2).Infof("CreateVolume: created volume %s (%s) with reserved attachment record %s",
 		vol.ID, volName, attachmentID)
 
@@ -283,6 +284,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context,
 		if err := cs.Cloud.DeleteVolume(ctx, volumeID); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to delete volume %s: %v", volumeID, err)
 		}
+		volumesDeleted.WithLabelValues().Inc()
 		klog.V(2).Infof("DeleteVolume: deleted Cinder volume %s (explicit cleanup)", volumeID)
 		return &csi.DeleteVolumeResponse{}, nil
 	}
@@ -292,6 +294,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context,
 		klog.Warningf("DeleteVolume: failed to strip CSI metadata from retained volume %s: %v",
 			volumeID, err)
 	}
+	volumesRetained.WithLabelValues().Inc()
 	klog.V(2).Infof("DeleteVolume: retained Cinder volume %s for migration handoff", volumeID)
 	return &csi.DeleteVolumeResponse{}, nil
 }
@@ -409,6 +412,7 @@ func (cs *controllerServer) resolveMissingAttachment(ctx context.Context,
 		return cs.createAndPersistAttachment(ctx, volumeID, attachmentKey)
 	case 1:
 		adopted := records[0].ID
+		attachmentRecordsCreated.WithLabelValues(attachReasonAdopted).Inc()
 		klog.V(2).Infof("ControllerPublishVolume: adopting existing attachment record %s for volume %s "+
 			"and restoring its metadata", adopted, volumeID)
 		if err := cs.Cloud.SetVolumeMetadata(ctx, volumeID,
@@ -424,6 +428,7 @@ func (cs *controllerServer) resolveMissingAttachment(ctx context.Context,
 		for _, r := range records {
 			ids = append(ids, r.ID)
 		}
+		duplicateAttachmentRecords.WithLabelValues().Inc()
 		return "", status.Errorf(codes.FailedPrecondition,
 			"volume %s has %d attachment records (%v); refusing to guess which one to use — "+
 				"operator resolution required", volumeID, len(records), ids)
@@ -482,6 +487,8 @@ func (cs *controllerServer) ControllerUnpublishVolume(ctx context.Context,
 	} else if err := cs.Cloud.DeleteAttachment(ctx, attachmentID); err != nil {
 		return nil, status.Errorf(codes.Internal,
 			"failed to delete attachment record %s for volume %s: %v", attachmentID, volumeID, err)
+	} else {
+		attachmentRecordsDeleted.WithLabelValues().Inc()
 	}
 
 	if err := cs.Cloud.DeleteVolumeMetadata(ctx, volumeID, []string{attachmentKey}); err != nil {

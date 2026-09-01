@@ -97,6 +97,7 @@ func NewNodeServer(d *Driver, opts openstack.RBDOpts, vopts openstack.VolumeOpts
 		Credentials: creds,
 		Mounter:     mounter,
 		Staging:     newStagingStore(opts),
+		Isolation:   newIsolationSet(),
 	}
 }
 

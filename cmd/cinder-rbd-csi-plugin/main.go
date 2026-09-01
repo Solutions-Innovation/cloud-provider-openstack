@@ -95,6 +95,9 @@ func main() {
 func handle() {
 	d := rbd.NewDriver(&rbd.DriverOpts{Endpoint: endpoint, ClusterID: cluster})
 
+	// Registered through a hook so the openstack package need not import its
+	// parent, which would be an import cycle.
+	openstack.SetDriverMetricsRegistrar(rbd.RegisterDriverMetrics)
 	openstack.InitOpenStackProvider(cloudConfig, httpEndpoint)
 
 	if provideControllerService {

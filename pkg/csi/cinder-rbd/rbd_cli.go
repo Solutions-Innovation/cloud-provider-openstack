@@ -201,15 +201,19 @@ func (m *rbdCLIMapper) Map(ctx context.Context, req MapRequest) (MappedDevice, e
 		timeout = m.opts.MapTimeoutDuration()
 	}
 
+	start := time.Now()
 	stdout, stderr, err := m.run(ctx, timeout, args...)
 	if err != nil {
 		combined := strings.ToLower(stdout + " " + stderr + " " + err.Error())
 		if containsAny(combined, exclusiveLockDeniedPatterns) {
+			observeMap(start, resultLockDenied)
 			return MappedDevice{}, fmt.Errorf("rbd: map %s: %w: %v",
 				req.Identity, ErrExclusiveLockDenied, err)
 		}
+		observeMap(start, resultError)
 		return MappedDevice{}, err
 	}
+	observeMap(start, resultSuccess)
 
 	devicePath := strings.TrimSpace(stdout)
 	if devicePath == "" {
@@ -250,20 +254,25 @@ func (m *rbdCLIMapper) Unmap(ctx context.Context, devicePath string, timeout tim
 	args = append(args, clusterArgs("", m.clusterConfPath(), "", "")...)
 	args = append(args, devicePath)
 
+	start := time.Now()
 	_, stderr, err := m.run(ctx, timeout, args...)
 	if err != nil {
 		combined := strings.ToLower(stderr + " " + err.Error())
 		switch {
 		case containsAny(combined, notMappedPatterns):
 			// Already gone: unmap is idempotent.
+			observeUnmap(start, resultSuccess)
 			klog.V(4).Infof("Unmap: %s was not mapped", devicePath)
 			return nil
 		case containsAny(combined, deviceBusyPatterns):
+			observeUnmap(start, resultError)
 			return fmt.Errorf("rbd: unmap %s: %w: %v", devicePath, ErrDeviceBusy, err)
 		default:
+			observeUnmap(start, resultError)
 			return err
 		}
 	}
+	observeUnmap(start, resultSuccess)
 
 	klog.V(4).Infof("Unmap: unmapped %s", devicePath)
 	return nil

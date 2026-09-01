@@ -2249,8 +2249,38 @@ Phase 5.
 | 4.3 | Orphan/conflict reporting, isolation state, metrics | `reconcile.go`, `nodeserver.go` |
 | 4.4 | Fault-injection harness: fail after each external side effect | `*_test.go` + a lab script |
 | 4.5 | Repeated publish/unpublish cycles across two workers | lab script |
-| 4.6 | Operator runbook: conflicting records, isolated maps, key rotation, stuck unmap | `docs/…/rbd-cinder-csi-operator-runbook.md` |
+| 4.6 | Operator runbook: conflicting records, isolated maps, key rotation, stuck unmap | [`rbd-cinder-csi-operator-runbook.md`](rbd-cinder-csi-operator-runbook.md) — **written** |
 | 4.7 | Reconciler and recovery unit tests | `reconcile_test.go` |
+
+**Phase 4 status: CODE COMPLETE** (2026-09-01). 392 tests/subtests pass, race
+detector clean, lint clean repo-wide. All twelve §9.2 rows have a named test in
+`faultinjection_test.go`. The lab-demonstration halves of tasks 4.4 and 4.5
+(fault injection and two-worker cycles against a live cluster) need a deployed
+image and move to Phase 6.
+
+**Phase 4 findings**
+
+1. **Foreign-pool filtering is required, not optional.** Reporting every
+   unrecorded mapping would flag all five platform Ceph-CSI mappings on every
+   restart. The reconciler restricts "unrecognized" reporting to pools that
+   appear in its own records, so `kube-rbd` is ignored entirely.
+2. **Isolation must be held in memory, not just logged.** Without an explicit
+   isolation set, a mismatched mapping is re-discovered on every stage attempt
+   and produces an identical failure with no signal that the node is degraded.
+   `NodeStageVolume` now refuses an isolated volume up front.
+3. **Only the node index is refreshed on adoption.** The staging-path copy lives
+   under a kubelet directory that may not exist after a reboot, and
+   `NodeStageVolume` rewrites it anyway.
+4. **A map-then-record-failure must not roll back the mapping.** Unmapping would
+   discard working state; the next stage adopts it by pool/image. The RPC still
+   fails so kubelet retries. This is the one place where leaving a side effect in
+   place is safer than undoing it.
+5. **`isolationSet` methods are nil-tolerant.** A hand-constructed `nodeServer`
+   would otherwise panic, turning a wiring gap into a crash in a privileged
+   DaemonSet — the same class of defect as the Phase 1 typed-nil bug.
+6. **Metric labels exclude pool, image, FSID and device path.** They are
+   unbounded in cardinality and belong in logs; only closed sets (result, reason)
+   are labels.
 
 **Exit criteria**
 - Every row of the §9.2 table has a passing test or a recorded lab
@@ -2643,6 +2673,7 @@ A reviewer should be able to reject a change by pointing at one line here.
 - Implemented sibling: [iSCSI-Cinder CSI Implementation Design](iscsi-cinder-csi-implementation-design.md)
 - [NFS-Cinder CSI Implementation Design](nfs-cinder-csi-implementation-design.md)
 - [Kubernetes CSI Architecture Reference](kubernetes-csi-architecture-reference.md)
+- [Operator runbook](rbd-cinder-csi-operator-runbook.md)
 - Cinder attachments API: https://docs.openstack.org/api-ref/block-storage/v3/#attachments
 - Ceph `rbd` command reference: https://docs.ceph.com/en/reef/man/8/rbd/
 - Ceph exclusive locks: https://docs.ceph.com/en/reef/rbd/rbd-exclusive-locks/
