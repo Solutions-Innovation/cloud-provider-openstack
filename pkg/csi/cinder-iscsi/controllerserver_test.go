@@ -485,9 +485,24 @@ func TestDeleteVolume_PerVolumeOverridesDriverConfig(t *testing.T) {
 
 // ── ControllerPublishVolume Tests ────────────────────────────────────────────
 
+// TestControllerPublishVolume_Success also guards the behaviour introduced by
+// commit ea84cbb8: the attachment_id in the PV volumeContext is immutable and
+// goes stale after the first ControllerUnpublishVolume, so Cinder volume
+// metadata is the only source of truth. The request below deliberately carries
+// a *different*, stale attachment_id in VolumeContext; the driver must ignore it
+// and use the one from metadata.
 func TestControllerPublishVolume_Success(t *testing.T) {
 	cs, mockCloud := newTestControllerServer()
 	ctx := context.Background()
+
+	// Metadata is authoritative and holds att-456.
+	mockCloud.On("GetVolume", ctx, "vol-123").Return(&volumes.Volume{
+		ID: "vol-123",
+		Metadata: map[string]string{
+			"csi.attachment_id": "att-456",
+		},
+	}, nil)
+	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
 
 	connInfo := &openstack.ISCSIConnectionInfo{
 		DriverVolumeType: openstack.DriverVolumeTypeISCSI,
@@ -509,7 +524,8 @@ func TestControllerPublishVolume_Success(t *testing.T) {
 		NodeId:           "worker-3;iqn.1993-08.org.debian:01:abc;10.0.0.103",
 		VolumeCapability: blockVolumeCapability(),
 		VolumeContext: map[string]string{
-			"attachment_id": "att-456",
+			// Stale value from CreateVolume: must be ignored in favour of metadata.
+			"attachment_id": "att-STALE-FROM-PV-CONTEXT",
 		},
 	}
 
@@ -608,6 +624,12 @@ func TestControllerPublishVolume_RejectsMountCapability(t *testing.T) {
 
 // ── ControllerUnpublishVolume Tests ──────────────────────────────────────────
 
+// TestControllerUnpublishVolume_Success reflects the implemented behaviour:
+// delete the current attachment record and CLEAR the attachment_id from
+// metadata. It deliberately does not expect the older "rotation" design
+// (delete + immediately create a replacement) — the next publish creates a
+// record on demand, which is what returns the volume to available between
+// migration pods.
 func TestControllerUnpublishVolume_Success(t *testing.T) {
 	cs, mockCloud := newTestControllerServer()
 	ctx := context.Background()
@@ -620,12 +642,9 @@ func TestControllerUnpublishVolume_Success(t *testing.T) {
 		},
 	}, nil)
 
-	mockCloud.On("DeleteAttachment", ctx, "att-old").Return(nil)
-	mockCloud.On("CreateAttachment", ctx, "vol-123").Return("att-new", nil)
 	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
-	mockCloud.On("SetVolumeMetadata", ctx, "vol-123", map[string]string{
-		"csi.attachment_id": "att-new",
-	}).Return(nil)
+	mockCloud.On("DeleteAttachment", ctx, "att-old").Return(nil)
+	mockCloud.On("DeleteVolumeMetadata", ctx, "vol-123", []string{"csi.attachment_id"}).Return(nil)
 
 	req := &csi.ControllerUnpublishVolumeRequest{
 		VolumeId: "vol-123",
@@ -637,6 +656,8 @@ func TestControllerUnpublishVolume_Success(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 	mockCloud.AssertExpectations(t)
+	// No replacement attachment is created here.
+	mockCloud.AssertNotCalled(t, "CreateAttachment")
 }
 
 func TestControllerUnpublishVolume_VolumeNotFound(t *testing.T) {
@@ -669,12 +690,10 @@ func TestControllerUnpublishVolume_NoExistingAttachment(t *testing.T) {
 		Metadata: map[string]string{},
 	}, nil)
 
-	// No DeleteAttachment call expected - attachment is empty
-	mockCloud.On("CreateAttachment", ctx, "vol-123").Return("att-new", nil)
+	// No DeleteAttachment expected — metadata carries no attachment_id.
+	// Metadata clearing still runs unconditionally and is harmless.
 	mockCloud.On("GetVolumeOpts").Return(openstack.VolumeOpts{})
-	mockCloud.On("SetVolumeMetadata", ctx, "vol-123", map[string]string{
-		"csi.attachment_id": "att-new",
-	}).Return(nil)
+	mockCloud.On("DeleteVolumeMetadata", ctx, "vol-123", []string{"csi.attachment_id"}).Return(nil)
 
 	req := &csi.ControllerUnpublishVolumeRequest{
 		VolumeId: "vol-123",
@@ -687,6 +706,7 @@ func TestControllerUnpublishVolume_NoExistingAttachment(t *testing.T) {
 	assert.NotNil(t, resp)
 	mockCloud.AssertExpectations(t)
 	mockCloud.AssertNotCalled(t, "DeleteAttachment", mock.Anything, mock.Anything)
+	mockCloud.AssertNotCalled(t, "CreateAttachment")
 }
 
 // ── ValidateVolumeCapabilities Tests ─────────────────────────────────────────

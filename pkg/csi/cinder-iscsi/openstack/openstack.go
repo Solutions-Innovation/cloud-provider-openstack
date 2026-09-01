@@ -349,7 +349,7 @@ func CreateOpenStackProvider(cloudName string) (IOpenStackISCSI, error) {
 	ctx := context.Background()
 	caps, err := instance.DiscoverCinderCapabilities(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("Cinder microversion probe failed: %w", err)
+		return nil, fmt.Errorf("cinder microversion probe failed: %w", err)
 	}
 	klog.Infof("Cinder capabilities: v3.27=%v v3.44=%v", caps.SupportsV327, caps.SupportsV344)
 
