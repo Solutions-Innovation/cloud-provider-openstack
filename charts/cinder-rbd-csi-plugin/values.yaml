@@ -69,6 +69,19 @@ csi:
       tolerations:
         - operator: Exists
       kubeletDir: /var/lib/kubelet
+      # Mount the host's /lib/modules read-only into the node plugin.
+      #
+      # Only needed where the `rbd` kernel module is not already loaded and the
+      # plugin must `modprobe` it, which requires the module tree. On the
+      # validated platform it is preloaded — platform Ceph-CSI maps krbd on the
+      # same nodes — so this stays off and the plugin sees one less host path.
+      #
+      # Turn it on only if the node plugin logs a missing-module failure. Check
+      # first with: lsmod | grep '^rbd'
+      mountLibModules: false
+      # Extra /etc/hosts entries, for a Ceph monitor or Keystone endpoint that
+      # cluster DNS cannot resolve. Empty means the pod uses DNS only.
+      hostAliases: []
       extraArgs: {}
     controllerPlugin:
       replicas: 1
@@ -84,6 +97,8 @@ csi:
       affinity: {}
       nodeSelector: {}
       tolerations: []
+      # See the nodePlugin note above.
+      hostAliases: []
       extraArgs: {}
     resources: {}
     httpEndpoint:
@@ -113,6 +128,13 @@ secret:
   create: false
   filename: cloud.conf
   name: cinder-rbd-csi-cloud-config
+  # Only used when create is true. Leaving it empty with create=true is rejected
+  # at render time, because it would produce a Secret with no cloud.conf and the
+  # controller would fail later with an empty OpenStack configuration.
+  #
+  # Prefer create=false and an out-of-band Secret: values files end up in version
+  # control, and this content holds OpenStack credentials.
+  data: {}
 #  data:
 #    cloud.conf: |-
 #      [Global]

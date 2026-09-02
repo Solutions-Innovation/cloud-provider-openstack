@@ -246,9 +246,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          name: "Cinder iSCSI CSI Plugin ${{ needs.build-and-push-image.outputs.version }}"
+          name: "Cinder RBD CSI Plugin ${{ needs.build-and-push-image.outputs.version }}"
           body: |
-            ## Cinder iSCSI CSI Plugin — ${{ needs.build-and-push-image.outputs.version }}
+            ## Cinder RBD CSI Plugin — ${{ needs.build-and-push-image.outputs.version }}
 
             ### Docker Image
             ```

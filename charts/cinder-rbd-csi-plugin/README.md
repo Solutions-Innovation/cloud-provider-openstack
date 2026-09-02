@@ -109,6 +109,31 @@ platform Ceph-CSI already does on the same nodes, but it means:
 - Generated keyrings live in a memory-backed `emptyDir` (`runtimeDir`) so key
   material never reaches disk.
 - `hostPID` is **not** required, unlike the iSCSI sibling driver.
+- `/lib/modules` is **not** mounted by default. See below.
+
+### Kernel module mount
+
+`csi.plugin.nodePlugin.mountLibModules` (default `false`) controls whether the
+host's `/lib/modules` is mounted read-only into the node plugin. It is only
+needed where the `rbd` kernel module is not already loaded and the plugin has to
+`modprobe` it, which requires the module tree.
+
+On the validated platform the module is preloaded — platform Ceph-CSI maps krbd
+on the same nodes — so the default keeps one less host path out of the pod.
+
+Enable it only if the node plugin reports a missing-module failure. Confirm the
+premise first:
+
+```bash
+lsmod | grep '^rbd'      # a line here means you do NOT need this option
+```
+
+```yaml
+csi:
+  plugin:
+    nodePlugin:
+      mountLibModules: true
+```
 
 ## Using it
 
@@ -140,7 +165,9 @@ bash hack/verify-cinder-rbd-chart.sh
 ```
 
 The verify script asserts the safety guards fire, `/sys` is writable, no iSCSI
-paths leaked in, and no key material appears in rendered output.
+paths leaked in, no key material appears in rendered output, and every value the
+templates read is declared in `values.yaml` — an undeclared value silently reads
+as empty, which makes a typo indistinguishable from an intentional default.
 
 ## Troubleshooting
 

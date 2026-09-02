@@ -60,6 +60,10 @@ expect_render_failure "cephCredential.secretName is required" -f "${valid}" \
 # Creating the Secret without a key would render an empty credential.
 expect_render_failure "cephCredential.userKey is empty" -f "${valid}" \
   --set cephCredential.create=true
+# Same failure mode for the cloud config: an empty stringData renders cleanly and
+# fails much later, as an empty OpenStack configuration in the controller.
+expect_render_failure "secret.data is empty" -f "${valid}" \
+  --set secret.create=true
 
 echo "==> 3. node plugin host access"
 ds=$(render -f "${valid}" | awk '/kind: DaemonSet/,0')
@@ -88,6 +92,21 @@ pass "runtime directory memory-backed"
 # The credential is projected read-only with a restrictive mode.
 grep -q 'defaultMode: 0400' <<<"${ds}" || fail "the Ceph credential must be projected with mode 0400"
 pass "credential projected 0400"
+
+# /lib/modules is an opt-in. The default must not mount it: the validated
+# platform preloads the rbd module, and an undeclared value that silently
+# defaults to off is indistinguishable from a typo, so both directions of the
+# switch are asserted.
+grep -q 'mountPath: /lib/modules' <<<"${ds}" && fail "/lib/modules must not be mounted by default"
+pass "/lib/modules not mounted by default"
+
+libmod=$(render -f "${valid}" --set csi.plugin.nodePlugin.mountLibModules=true \
+  | awk '/kind: DaemonSet/,0')
+grep -q 'mountPath: /lib/modules' <<<"${libmod}" \
+  || fail "mountLibModules=true did not mount /lib/modules — the value is not wired up"
+grep -A1 'mountPath: /lib/modules' <<<"${libmod}" | grep -q 'readOnly: true' \
+  || fail "/lib/modules must be mounted readOnly"
+pass "mountLibModules opt-in works and is read-only"
 
 echo "==> 4. no iSCSI residue"
 full=$(render -f "${valid}")
@@ -147,6 +166,59 @@ pass "StorageProfile name matches the StorageClass"
 echo "==> 8. block-only StorageClass"
 grep -q 'allowVolumeExpansion: false' <<<"${full}" || fail "expansion must not be advertised"
 pass "volume expansion not advertised"
+
+echo "==> 9. every value a template reads is declared"
+# A template that reads .Values.some.undeclared.knob does not fail: Helm yields
+# nil, so `if` and `with` blocks silently take the empty branch. The chart then
+# has an invisible switch that no operator can discover from values.yaml and no
+# reviewer can tell apart from a typo.
+#
+# The values tree comes from Helm rather than a YAML parser so this needs no
+# Python packages beyond the standard library.
+dump="${chart_dir}/templates/zz-values-dump.yaml"
+cleanup_dump() { rm -f "${dump}"; }
+trap cleanup_dump EXIT
+printf '{{ .Values | toJson }}\n' > "${dump}"
+values_json=$(helm template rbd "${chart_dir}" -f "${valid}" \
+  --show-only templates/zz-values-dump.yaml 2>/dev/null | grep -v '^\(---\|#\)')
+cleanup_dump
+trap - EXIT
+[[ -n "${values_json}" ]] || fail "could not obtain the resolved values tree from helm"
+
+undeclared=$(VALUES_JSON="${values_json}" CHART_DIR="${chart_dir}" python3 - <<'PY'
+import json, os, re, glob
+values = json.loads(os.environ["VALUES_JSON"])
+chart = os.environ["CHART_DIR"]
+
+referenced = set()
+for pattern in ("templates/**/*.yaml", "templates/**/*.tpl"):
+    for path in glob.glob(os.path.join(chart, pattern), recursive=True):
+        if path.endswith("zz-values-dump.yaml"):
+            continue
+        with open(path) as fh:
+            for match in re.finditer(r"\.Values((?:\.[A-Za-z_][A-Za-z0-9_]*)+)", fh.read()):
+                referenced.add(match.group(1).lstrip("."))
+
+def declared(dotted):
+    node = values
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+for path in sorted(p for p in referenced if not declared(p)):
+    print(path)
+PY
+) || fail "the undeclared-values check could not run"
+
+if [[ -n "${undeclared}" ]]; then
+  while read -r path; do
+    [[ -n "${path}" ]] && echo "  undeclared: .Values.${path}" >&2
+  done <<<"${undeclared}"
+  fail "the templates above read values that values.yaml does not declare; declare them (with a default and a comment) so they are discoverable"
+fi
+pass "all $(grep -roh '\.Values\(\.[A-Za-z_][A-Za-z0-9_]*\)\+' "${chart_dir}/templates" | sort -u | wc -l | tr -d ' ') referenced value paths are declared"
 
 echo
 echo "All Cinder RBD chart checks passed."

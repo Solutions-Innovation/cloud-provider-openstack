@@ -45,6 +45,10 @@ a subtle loss of safety discovered later.
 {{- fail "\n\ncephCredential.create is true but cephCredential.userKey is empty.\n\nSupply the key with --set-file or an out-of-band values file. Never commit a Ceph key to a values file in version control.\n" }}
 {{- end }}
 
+{{- if and .Values.secret.create .Values.secret.enabled (not .Values.secret.data) }}
+{{- fail "\n\nsecret.create is true but secret.data is empty.\n\nThis would render a Secret with no cloud.conf, and the controller would fail at runtime with an empty OpenStack configuration instead of here. Either supply secret.data (see the commented example in values.yaml), or set secret.create=false and create the Secret out of band:\n\n  kubectl create secret generic <name> --from-file=cloud.conf=/path/to/cloud.conf -n <namespace>\n" }}
+{{- end }}
+
 {{- if ne .Values.driverConfig.volume.deleteVolumeMode "retain" }}
 {{- fail (printf "\n\ndriverConfig.volume.deleteVolumeMode must be \"retain\", got %q.\n\nRetain is the only mode this driver implements. Cinder's \"available\" status reflects attachment records, not kernel state: after a force detach or an unreachable node a volume can read available while a worker still holds a kernel RBD mapping and the Ceph exclusive lock. Deleting the image out from under a live mapping corrupts data rather than returning an error, so automatic deletion is withheld until the cross-node no-map proof exists.\n\nDelete retained volumes out of band once you have confirmed no node holds a mapping; see the operator runbook.\n" .Values.driverConfig.volume.deleteVolumeMode) }}
 {{- end }}
