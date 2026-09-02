@@ -48,6 +48,12 @@ expect_render_failure 'mounter must be "krbd"' -f "${valid}" \
 # A typo such as "delet" must not be silently read as retain.
 expect_render_failure "deleteVolumeMode must be" -f "${valid}" \
   --set driverConfig.volume.deleteVolumeMode=delet
+# Retain-only: the controller cannot prove no node holds a kernel mapping, so
+# asking it to destroy Cinder volumes must be refused at render time. Refusing
+# here rather than at the DeleteVolume RPC is deliberate — failing the RPC would
+# leave the PersistentVolume in a delete loop that never completes.
+expect_render_failure "deleteVolumeMode must be" -f "${valid}" \
+  --set driverConfig.volume.deleteVolumeMode=delete
 # The node plugin cannot read a credential without a Secret name.
 expect_render_failure "cephCredential.secretName is required" -f "${valid}" \
   --set cephCredential.secretName=""

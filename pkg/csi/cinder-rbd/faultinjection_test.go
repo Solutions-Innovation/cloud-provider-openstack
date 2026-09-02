@@ -38,6 +38,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder-rbd/openstack"
 	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
 )
@@ -104,51 +105,149 @@ func TestFault_CreateVolumeResponseLost_RetryAdoptsExistingVolume(t *testing.T) 
 	cloud.AssertNotCalled(t, "CreateAttachment")
 }
 
-// §9.2 row 2: reservation created, metadata write failed.
+// §9.2 row 1 variant: the volume exists from a prior attempt but carries no
+// attachment ID — the reservation half never landed.
 //
-// Publish must find the orphaned record by listing and restore the metadata,
-// rather than creating a second reservation that would hold the volume forever.
-func TestFault_ReservationCreatedMetadataWriteFailed_PublishAdoptsRecord(t *testing.T) {
+// Returning the volume as-is would report success for an unreserved volume, and
+// because a listed record is never adopted it would then fail closed at publish.
+// The retry must reconcile the missing reservation so it converges.
+func TestFault_ExistingVolumeMissingReservation_RetryCreatesIt(t *testing.T) {
 	cs, cloud := newTestControllerServer(t)
 	ctx := t.Context()
 
-	// CreateVolume: the metadata write fails but the RPC still succeeds.
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
-	cloud.On("GetVolumesByName", ctx, "pvc-1").Return([]volumes.Volume{}, nil)
+	cloud.On("GetVolumesByName", ctx, "pvc-1").Return([]volumes.Volume{{
+		ID: testVolumeID, Name: "pvc-1", Size: 1, Metadata: map[string]string{},
+	}}, nil)
+	cloud.On("ListAttachmentsByVolume", ctx, testVolumeID).
+		Return([]openstack.Attachment{}, nil).Once()
+	cloud.On("CreateAttachment", ctx, testVolumeID).Return(testAttachmentID, nil).Once()
+	cloud.On("SetVolumeMetadata", ctx, testVolumeID,
+		map[string]string{attachmentMetaKey: testAttachmentID}).Return(nil).Once()
+
+	resp, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "pvc-1",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1024 * 1024 * 1024},
+		VolumeCapabilities: []*csi.VolumeCapability{blockCapability()},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, testAttachmentID, resp.Volume.VolumeContext[metaKeySuffixAttachmentID],
+		"the reconciled reservation must be reported back")
+	cloud.AssertNotCalled(t, "CreateVolume")
+	cloud.AssertExpectations(t)
+}
+
+// Same shape, but a record already exists that the driver cannot attribute.
+// Adopting it is exactly what must not happen, so CreateVolume fails closed.
+func TestFault_ExistingVolumeWithUnattributableRecord_FailsClosed(t *testing.T) {
+	cs, cloud := newTestControllerServer(t)
+	ctx := t.Context()
+
+	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+	cloud.On("GetVolumesByName", ctx, "pvc-1").Return([]volumes.Volume{{
+		ID: testVolumeID, Name: "pvc-1", Size: 1, Metadata: map[string]string{},
+	}}, nil)
+	cloud.On("ListAttachmentsByVolume", ctx, testVolumeID).Return([]openstack.Attachment{
+		{ID: "att-unknown", VolumeID: testVolumeID, Status: "reserved"},
+	}, nil).Once()
+
+	_, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "pvc-1",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1024 * 1024 * 1024},
+		VolumeCapabilities: []*csi.VolumeCapability{blockCapability()},
+	})
+	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
+	cloud.AssertNotCalled(t, "CreateAttachment")
+	cloud.AssertNotCalled(t, "SetVolumeMetadata")
+}
+
+// §9.2 row 2: reservation created, metadata write failed.
+//
+// The attachment ID in volume metadata is the only record of driver ownership,
+// and a listed record is never adopted, so a volume whose ID was not persisted is
+// unusable. CreateVolume must therefore roll both halves back and fail, leaving
+// nothing for the retry to reconcile — and the retry must then succeed.
+func TestFault_ReservationCreatedMetadataWriteFailed_RollsBackAndRetrySucceeds(t *testing.T) {
+	cs, cloud := newTestControllerServer(t)
+	ctx := t.Context()
+
+	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+	cloud.On("GetVolumesByName", ctx, "pvc-1").Return([]volumes.Volume{}, nil).Once()
 	cloud.On("CreateVolume", ctx, mock.Anything, nil).
 		Return(&volumes.Volume{ID: testVolumeID, Size: 1}, nil)
 	cloud.On("WaitVolumeTargetStatus", ctx, testVolumeID, mock.Anything, mock.Anything).Return(nil)
 	cloud.On("CreateAttachment", ctx, testVolumeID).Return(testAttachmentID, nil).Once()
 	cloud.On("SetVolumeMetadata", ctx, testVolumeID,
 		map[string]string{attachmentMetaKey: testAttachmentID}).Return(assert.AnError).Once()
+	// Rollback: the record first, then the volume that would otherwise be
+	// orphaned. Both are confirmed here, so no ownership claim survives.
+	cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(nil).Once()
+	cloud.On("DeleteVolume", ctx, testVolumeID).Return(nil).Once()
 
 	_, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
 		Name:               "pvc-1",
 		VolumeCapabilities: []*csi.VolumeCapability{blockCapability()},
 	})
-	require.NoError(t, err, "a metadata write failure must not fail CreateVolume")
+	assert.Equal(t, codes.Aborted, codeOf(t, err),
+		"an unpersisted ownership record must fail the RPC retryably")
 
-	// Publish: metadata is empty, but a record exists and is adopted.
+	// The retry finds nothing left over and completes normally.
+	cloud.On("GetVolumesByName", ctx, "pvc-1").Return([]volumes.Volume{}, nil).Once()
+	cloud.On("CreateAttachment", ctx, testVolumeID).Return("att-retry", nil).Once()
+	cloud.On("SetVolumeMetadata", ctx, testVolumeID,
+		map[string]string{attachmentMetaKey: "att-retry"}).Return(nil).Once()
+
+	resp, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "pvc-1",
+		VolumeCapabilities: []*csi.VolumeCapability{blockCapability()},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "att-retry", resp.Volume.VolumeContext[metaKeySuffixAttachmentID])
+	cloud.AssertExpectations(t)
+}
+
+// §9.2 row 2, unconfirmed-rollback variant: the record could not be deleted.
+//
+// This is an operator-resolution boundary, not a recoverable one. An
+// unattributable record is left in Cinder, and the next publish must fail closed
+// on it rather than adopt it — adoption is what would let the driver attach a
+// record it cannot prove it owns.
+func TestFault_UnconfirmedRollbackLeavesVolumeFailingClosed(t *testing.T) {
+	cs, cloud := newTestControllerServer(t)
+	ctx := t.Context()
+
+	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+	cloud.On("GetVolumesByName", ctx, "pvc-1").Return([]volumes.Volume{}, nil)
+	cloud.On("CreateVolume", ctx, mock.Anything, nil).
+		Return(&volumes.Volume{ID: testVolumeID, Size: 1}, nil)
+	cloud.On("WaitVolumeTargetStatus", ctx, testVolumeID, mock.Anything, mock.Anything).Return(nil)
+	cloud.On("CreateAttachment", ctx, testVolumeID).Return(testAttachmentID, nil).Once()
+	cloud.On("SetVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(assert.AnError).Once()
+	cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(assert.AnError).Once()
+	cloud.On("DeleteVolume", ctx, testVolumeID).Return(nil).Once()
+
+	_, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "pvc-1",
+		VolumeCapabilities: []*csi.VolumeCapability{blockCapability()},
+	})
+	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
+	assert.Contains(t, status.Convert(err).Message(), "unattributable",
+		"the operator must be told a record was left behind")
+
+	// A publish against a volume carrying that leftover record refuses to run.
 	cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
 		ID: testVolumeID, Metadata: map[string]string{},
 	}, nil)
-	cloud.On("GetRBDOpts").Return(defaultRBDOpts(t))
 	cloud.On("ListAttachmentsByVolume", ctx, testVolumeID).Return([]openstack.Attachment{
 		{ID: testAttachmentID, VolumeID: testVolumeID, Status: "reserved"},
 	}, nil)
-	cloud.On("SetVolumeMetadata", ctx, testVolumeID,
-		map[string]string{attachmentMetaKey: testAttachmentID}).Return(nil).Once()
-	cloud.On("UpdateAttachmentConnector", ctx, testAttachmentID, mock.Anything).
-		Return(labConnectionInfo(), nil)
-	cloud.On("CompleteAttachment", ctx, testAttachmentID).Return(nil)
 
 	_, err = cs.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
 		VolumeId: testVolumeID, NodeId: testNodeID, VolumeCapability: blockCapability(),
 	})
-	require.NoError(t, err)
-
-	// Exactly one reservation was ever created.
+	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
 	cloud.AssertNumberOfCalls(t, "CreateAttachment", 1)
+	cloud.AssertNotCalled(t, "UpdateAttachmentConnector")
 }
 
 // §9.2 row 4: map succeeded, staging record write failed.
@@ -461,8 +560,44 @@ func TestFault_ConflictingLiveMapAtUnstage_NeverUnmaps(t *testing.T) {
 
 // §9.2 row 3: attachment update succeeded, RPC response lost.
 //
-// The stale record returns 404 on the next update; exactly one replacement is
-// created and the update is retried once.
+// Recovery variant: the record is still present and already carries usable
+// connection information. It must be reused as-is. Updating again would be at
+// best wasteful and at worst rejected, because Cinder can refuse an update on a
+// record it has already advanced to attached/in-use — which would strand a volume
+// that is in fact correctly attached.
+func TestFault_AttachmentUpdateResponseLost_StoredConnectionIsReused(t *testing.T) {
+	cs, cloud := newTestControllerServer(t)
+	ctx := t.Context()
+
+	cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
+		ID: testVolumeID, Metadata: map[string]string{attachmentMetaKey: testAttachmentID},
+	}, nil)
+	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+	cloud.On("GetRBDOpts").Return(defaultRBDOpts(t))
+	cloud.On("GetAttachment", ctx, testAttachmentID).Return(&openstack.Attachment{
+		ID:             testAttachmentID,
+		VolumeID:       testVolumeID,
+		Status:         "attached",
+		ConnectionInfo: labConnectionInfo(),
+	}, nil).Once()
+	// Completion stays best-effort and idempotent.
+	cloud.On("CompleteAttachment", ctx, testAttachmentID).Return(nil).Maybe()
+
+	resp, err := cs.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: testVolumeID, NodeId: testNodeID, VolumeCapability: blockCapability(),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, testAttachmentID, resp.PublishContext[PublishContextAttachmentID])
+
+	cloud.AssertNotCalled(t, "UpdateAttachmentConnector")
+	cloud.AssertNotCalled(t, "CreateAttachment")
+}
+
+// §9.2 row 3, stale variant: the record is gone rather than merely un-echoed.
+//
+// The 404 on update is what distinguishes the two. Exactly one replacement is
+// created and the update retried once; retrying indefinitely would mask a backend
+// deleting records as fast as they are created.
 func TestFault_AttachmentUpdateResponseLost_OneReplacementOnly(t *testing.T) {
 	cs, cloud := newTestControllerServer(t)
 	ctx := t.Context()
@@ -472,6 +607,11 @@ func TestFault_AttachmentUpdateResponseLost_OneReplacementOnly(t *testing.T) {
 	}, nil)
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
 	cloud.On("GetRBDOpts").Return(defaultRBDOpts(t))
+	// The reuse probe finds nothing usable, so the update path runs.
+	cloud.On("GetAttachment", ctx, "att-stale").
+		Return((*openstack.Attachment)(nil), cpoerrors.ErrNotFound).Maybe()
+	cloud.On("GetAttachment", ctx, testAttachmentID).
+		Return(&openstack.Attachment{Status: "reserved"}, nil).Maybe()
 	cloud.On("UpdateAttachmentConnector", ctx, "att-stale", mock.Anything).
 		Return((*openstack.RBDConnectionInfo)(nil), cpoerrors.ErrNotFound).Once()
 	cloud.On("CreateAttachment", ctx, testVolumeID).Return(testAttachmentID, nil).Once()

@@ -1,7 +1,7 @@
 {{/*
 Render-time guards.
 
-These exist because both conditions are silently dangerous rather than loudly
+These exist because these conditions are silently dangerous rather than loudly
 broken:
 
   * An empty expectedFsid disables identity check 1 of the pre-publish gate.
@@ -13,7 +13,14 @@ broken:
     rendering it produces a DaemonSet that crash-loops on a config error. Better
     to fail here, where the message can explain why.
 
-Failing at render time turns both into an immediate, explained error instead of
+  * deleteVolumeMode other than retain would ask the controller to destroy
+    Cinder volumes it cannot prove are unmapped. Cinder reports available based
+    on attachment records, not kernel state, so a volume can read available
+    while a worker still holds a kernel RBD mapping. The driver rejects any
+    other value at startup, so rendering it produces a controller that
+    crash-loops.
+
+Failing at render time turns these into an immediate, explained error instead of
 a subtle loss of safety discovered later.
 */}}
 
@@ -38,7 +45,7 @@ a subtle loss of safety discovered later.
 {{- fail "\n\ncephCredential.create is true but cephCredential.userKey is empty.\n\nSupply the key with --set-file or an out-of-band values file. Never commit a Ceph key to a values file in version control.\n" }}
 {{- end }}
 
-{{- if not (or (eq .Values.driverConfig.volume.deleteVolumeMode "retain") (eq .Values.driverConfig.volume.deleteVolumeMode "delete")) }}
-{{- fail (printf "\n\ndriverConfig.volume.deleteVolumeMode must be \"retain\" or \"delete\", got %q.\n\nThe driver rejects any other value at startup; a typo such as \"delet\" would otherwise be read as retain.\n" .Values.driverConfig.volume.deleteVolumeMode) }}
+{{- if ne .Values.driverConfig.volume.deleteVolumeMode "retain" }}
+{{- fail (printf "\n\ndriverConfig.volume.deleteVolumeMode must be \"retain\", got %q.\n\nRetain is the only mode this driver implements. Cinder's \"available\" status reflects attachment records, not kernel state: after a force detach or an unreachable node a volume can read available while a worker still holds a kernel RBD mapping and the Ceph exclusive lock. Deleting the image out from under a live mapping corrupts data rather than returning an error, so automatic deletion is withheld until the cross-node no-map proof exists.\n\nDelete retained volumes out of band once you have confirmed no node holds a mapping; see the operator runbook.\n" .Values.driverConfig.volume.deleteVolumeMode) }}
 {{- end }}
 {{- end -}}

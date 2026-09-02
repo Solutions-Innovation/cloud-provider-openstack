@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
@@ -165,12 +166,21 @@ func (cs *controllerServer) CreateVolume(ctx context.Context,
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %q already exists with size %dGiB, requested %dGiB", volName, vol.Size, sizeGiB)
 		}
-		klog.V(3).Infof("CreateVolume: reusing existing volume %s (%s)", vol.ID, volName)
+		// Returning here without checking the reservation would report success
+		// for a volume that is not reserved — the "volume created, reservation
+		// not created" boundary. Reconcile it before returning, otherwise a
+		// retry after a partial create converges on an unusable volume.
+		attachmentID, err := cs.ensureReservation(ctx, &vol, attachmentKey)
+		if err != nil {
+			return nil, err
+		}
+		klog.V(3).Infof("CreateVolume: reusing existing volume %s (%s) with attachment record %s",
+			vol.ID, volName, attachmentID)
 		return &csi.CreateVolumeResponse{
 			Volume: &csi.Volume{
 				VolumeId:      vol.ID,
 				CapacityBytes: int64(vol.Size) * gibiByte,
-				VolumeContext: map[string]string{metaKeySuffixAttachmentID: vol.Metadata[attachmentKey]},
+				VolumeContext: map[string]string{metaKeySuffixAttachmentID: attachmentID},
 			},
 		}, nil
 	}
@@ -208,13 +218,20 @@ func (cs *controllerServer) CreateVolume(ctx context.Context,
 			"failed to create reserved attachment record for volume %s: %v", vol.ID, err))
 	}
 
-	// A failed metadata write is not fatal: ControllerPublishVolume recovers by
-	// listing the volume's attachment records. Failing here would leak the
-	// record we just created.
+	// Persisting the attachment ID is fatal, not advisory. Cinder volume
+	// metadata is the only record of driver ownership, and a listed record is
+	// never adopted, so a volume whose ID was not persisted is unusable. Roll
+	// the record back and return a retryable error rather than reporting success
+	// with an ownership record nobody can attribute.
 	if err := cs.Cloud.SetVolumeMetadata(ctx, vol.ID,
 		map[string]string{attachmentKey: attachmentID}); err != nil {
-		klog.Warningf("CreateVolume: failed to persist %s on volume %s: %v; "+
-			"publish will recover by listing attachment records", attachmentKey, vol.ID, err)
+		rollbackErr := cs.rollbackAttachment(ctx, vol.ID, attachmentID,
+			status.Errorf(codes.Aborted,
+				"created volume %s and attachment record %s but could not persist the attachment ID "+
+					"in volume metadata: %v", vol.ID, attachmentID, err))
+		// The volume is freshly created and empty, so discarding it is safe and
+		// leaves nothing for the retry to reconcile.
+		return nil, cleanup(rollbackErr)
 	}
 
 	attachmentRecordsCreated.WithLabelValues(attachReasonCreateVolume).Inc()
@@ -230,6 +247,43 @@ func (cs *controllerServer) CreateVolume(ctx context.Context,
 			VolumeContext: map[string]string{metaKeySuffixAttachmentID: attachmentID},
 		},
 	}, nil
+}
+
+// ensureReservation reconciles the reservation for a volume found by name.
+//
+// A volume that exists without a persisted attachment ID is the "volume created,
+// reservation not created" boundary. Returning it as-is would report success for
+// an unreserved volume, and because a listed record is never adopted, the volume
+// would then fail closed at publish. Reconciling here is what makes a retry after
+// a partial create converge.
+func (cs *controllerServer) ensureReservation(ctx context.Context,
+	vol *volumes.Volume, attachmentKey string) (string, error) {
+	if id := vol.Metadata[attachmentKey]; id != "" {
+		return id, nil
+	}
+
+	records, err := cs.Cloud.ListAttachmentsByVolume(ctx, vol.ID)
+	if err != nil {
+		return "", status.Errorf(codes.Internal,
+			"failed to list attachment records for volume %s: %v", vol.ID, err)
+	}
+	if len(records) > 0 {
+		// Same reasoning as resolveMissingAttachment: an unattributable record
+		// must not be adopted.
+		ids := make([]string, 0, len(records))
+		for _, r := range records {
+			ids = append(ids, r.ID)
+		}
+		duplicateAttachmentRecords.WithLabelValues().Inc()
+		return "", status.Errorf(codes.FailedPrecondition,
+			"volume %q already exists with no attachment ID in its metadata but %d attachment "+
+				"record(s) present (%v); the driver will not adopt an unattributable record. "+
+				"Operator resolution is required; see the operator runbook.",
+			vol.Name, len(records), ids)
+	}
+
+	klog.V(2).Infof("CreateVolume: existing volume %s has no reservation, creating one", vol.ID)
+	return cs.createAndPersistAttachment(ctx, vol.ID, attachmentKey, attachReasonOnDemand)
 }
 
 // ── DeleteVolume ─────────────────────────────────────────────────────────────
@@ -269,10 +323,16 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context,
 		}
 	}
 
-	// Wait for the volume to leave in-use/reserved before deciding anything
-	// else. Deleting a Cinder volume whose RBD image is still mapped by a
-	// kernel client risks data corruption, not merely an API error, so a
-	// retryable Aborted is returned instead of proceeding hopefully.
+	// Wait for the volume to leave in-use/reserved before touching anything
+	// else.
+	//
+	// Note what this does and does not prove. Cinder status reflects attachment
+	// RECORDS, not kernel state: if ControllerUnpublishVolume succeeded while
+	// NodeUnstageVolume did not — an unreachable node, a force detach — the
+	// volume reads available while a worker still holds a krbd mapping and the
+	// Ceph exclusive lock. So this is a necessary precondition for releasing the
+	// volume, not evidence that every node has released it. Proving that
+	// requires the cross-node no-map check still open as Q8.
 	if err := cs.Cloud.WaitVolumeTargetStatus(ctx, volumeID,
 		[]string{openstack.VolumeAvailableStatus}, vopts.DetachTimeout); err != nil {
 		return nil, status.Errorf(codes.Aborted,
@@ -280,16 +340,24 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context,
 			volumeID, openstack.VolumeAvailableStatus, err)
 	}
 
-	if vopts.ShouldDeleteVolume(vol.Metadata[cleanupKey]) {
-		if err := cs.Cloud.DeleteVolume(ctx, volumeID); err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to delete volume %s: %v", volumeID, err)
-		}
-		volumesDeleted.WithLabelValues().Inc()
-		klog.V(2).Infof("DeleteVolume: deleted Cinder volume %s (explicit cleanup)", volumeID)
-		return &csi.DeleteVolumeResponse{}, nil
+	// Retain-only. Physical deletion of the Cinder volume is deliberately not
+	// performed by this driver:
+	//
+	//   * The migration contract requires the volume to survive PVC deletion so
+	//     the Blueprint can attach it to the target VM.
+	//   * The controller cannot prove that no worker still holds a kernel RBD
+	//     mapping (see the note above), and deleting an image out from under a
+	//     live mapping is a data-corruption path rather than an error.
+	//
+	// Because delete-volume-mode is rejected at startup, this is the only
+	// reachable path. A per-volume cleanupVolume request is reported and ignored
+	// rather than failing: retain always succeeds, so nothing is left stuck.
+	if strings.EqualFold(strings.TrimSpace(vol.Metadata[cleanupKey]), "true") {
+		klog.Warningf("DeleteVolume: volume %s requests %s=true, but this driver retains volumes "+
+			"only; the Cinder volume is being kept. Delete it out of band once you have confirmed "+
+			"no node holds a mapping.", volumeID, cleanupKey)
 	}
 
-	// Retain: strip CSI ownership only, leaving the volume available.
 	if err := cs.Cloud.DeleteVolumeMetadata(ctx, volumeID, []string{attachmentKey, cleanupKey}); err != nil {
 		klog.Warningf("DeleteVolume: failed to strip CSI metadata from retained volume %s: %v",
 			volumeID, err)
@@ -350,27 +418,45 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context,
 
 	connector := &openstack.AttachmentConnector{Host: host}
 
-	connInfo, err := cs.Cloud.UpdateAttachmentConnector(ctx, attachmentID, connector)
-	if err != nil {
-		if !cpoerrors.IsNotFound(err) {
-			return nil, status.Errorf(codes.Internal,
-				"failed to update attachment record %s for volume %s: %v", attachmentID, volumeID, err)
-		}
-		// The record was deleted behind our back. Create a replacement and
-		// retry exactly once: retrying indefinitely would mask a backend that
-		// deletes records as fast as we create them.
-		klog.V(2).Infof("ControllerPublishVolume: attachment record %s is gone, creating a replacement",
-			attachmentID)
-		attachmentID, err = cs.createAndPersistAttachment(ctx, volumeID, attachmentKey)
-		if err != nil {
-			return nil, err
-		}
+	// Recovery for a prior attempt whose response was lost: if the record
+	// already carries usable connection information, reuse it instead of
+	// updating again. A second update on a record that Cinder has already moved
+	// to attached/in-use can be rejected outright, which would strand a volume
+	// that is in fact correctly attached.
+	connInfo, reused := cs.reuseStoredConnection(ctx, attachmentID)
+
+	if !reused {
 		connInfo, err = cs.Cloud.UpdateAttachmentConnector(ctx, attachmentID, connector)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal,
-				"failed to update replacement attachment record %s for volume %s: %v",
-				attachmentID, volumeID, err)
+			if !cpoerrors.IsNotFound(err) {
+				return nil, status.Errorf(codes.Internal,
+					"failed to update attachment record %s for volume %s: %v", attachmentID, volumeID, err)
+			}
+			// The record was deleted behind our back. Create a replacement and
+			// retry exactly once: retrying indefinitely would mask a backend that
+			// deletes records as fast as we create them.
+			klog.V(2).Infof("ControllerPublishVolume: attachment record %s is gone, creating a replacement",
+				attachmentID)
+			attachmentID, err = cs.createAndPersistAttachment(ctx, volumeID, attachmentKey,
+				attachReasonReplacement)
+			if err != nil {
+				return nil, err
+			}
+			connInfo, err = cs.Cloud.UpdateAttachmentConnector(ctx, attachmentID, connector)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal,
+					"failed to update replacement attachment record %s for volume %s: %v",
+					attachmentID, volumeID, err)
+			}
 		}
+	}
+
+	// Validate BEFORE completing. Completion advances the record to in-use, and
+	// Cinder can refuse a later update on a completed record — so completing
+	// first would make an unusable attachment hard to retry out of.
+	if err := ValidateRBDConnectionInfo(connInfo, cs.Cloud.GetRBDOpts()); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"unusable RBD connection information for volume %s: %v", volumeID, err)
 	}
 
 	// Completion moves the volume to in-use and needs microversion 3.44. It is
@@ -378,11 +464,6 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context,
 	if err := cs.Cloud.CompleteAttachment(ctx, attachmentID); err != nil {
 		klog.V(3).Infof("ControllerPublishVolume: completion of attachment record %s skipped or failed: %v",
 			attachmentID, err)
-	}
-
-	if err := ValidateRBDConnectionInfo(connInfo, cs.Cloud.GetRBDOpts()); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"unusable RBD connection information for volume %s: %v", volumeID, err)
 	}
 
 	klog.V(2).Infof("ControllerPublishVolume: volume %s published to node %s via attachment record %s (%s/%s@%s)",
@@ -393,11 +474,53 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context,
 	}, nil
 }
 
-// resolveMissingAttachment recovers when volume metadata carries no attachment
-// ID: either a reservation exists that we lost track of, or none exists.
+// reuseStoredConnection returns the connection information already recorded on
+// an attachment, when it is present and usable.
 //
-// Listing first is what prevents duplicate records. Creating unconditionally
-// would leave the earlier reservation holding the volume forever.
+// This is the recovery path for "connector update succeeded, CSI response lost".
+// Falling through to a fresh update is always safe, so any doubt returns false.
+func (cs *controllerServer) reuseStoredConnection(ctx context.Context,
+	attachmentID string) (*openstack.RBDConnectionInfo, bool) {
+	att, err := cs.Cloud.GetAttachment(ctx, attachmentID)
+	if err != nil {
+		// Includes NotFound: the update path handles a stale record by
+		// replacing it, so nothing is decided here.
+		klog.V(4).Infof("ControllerPublishVolume: attachment record %s not readable for reuse: %v",
+			attachmentID, err)
+		return nil, false
+	}
+	if att.ConnectionInfo == nil {
+		// A reserved record legitimately has none yet.
+		return nil, false
+	}
+	if err := ValidateRBDConnectionInfo(att.ConnectionInfo, cs.Cloud.GetRBDOpts()); err != nil {
+		// Stored information is unusable. An update may return corrected
+		// information, so try that rather than failing here.
+		klog.V(3).Infof("ControllerPublishVolume: stored connection information on record %s "+
+			"is unusable (%v); re-updating the connector", attachmentID, err)
+		return nil, false
+	}
+
+	// Reuse is sound here only because RBD connection information is
+	// host-independent: pool, image, monitors and FSID do not vary by connector
+	// host. Do NOT copy this pattern into a driver whose connection information
+	// is per-initiator, such as the iSCSI sibling, where reusing a record
+	// attached to another host would hand back the wrong target.
+	klog.V(2).Infof("ControllerPublishVolume: reusing stored connection information on record %s",
+		attachmentID)
+	return att.ConnectionInfo, true
+}
+
+// resolveMissingAttachment decides what to do when volume metadata carries no
+// attachment ID.
+//
+// Only the zero-record case may proceed. A record found by listing is NOT
+// adopted: a connector-less reserved attachment carries no ownership marker —
+// its fields are id, volume_uuid, status and a nil instance, none of which the
+// driver can stamp or read back to prove authorship. "Exactly one record exists"
+// is evidence of a record, not of ownership; a second driver deployment against
+// the same Cinder project, or an operator running the CLI, produces the same
+// shape. Adopting it could attach a record another actor owns.
 func (cs *controllerServer) resolveMissingAttachment(ctx context.Context,
 	volumeID, attachmentKey string) (string, error) {
 	records, err := cs.Cloud.ListAttachmentsByVolume(ctx, volumeID)
@@ -406,50 +529,69 @@ func (cs *controllerServer) resolveMissingAttachment(ctx context.Context,
 			"failed to list attachment records for volume %s: %v", volumeID, err)
 	}
 
-	switch len(records) {
-	case 0:
+	if len(records) == 0 {
 		klog.V(2).Infof("ControllerPublishVolume: volume %s has no attachment record, creating one", volumeID)
-		return cs.createAndPersistAttachment(ctx, volumeID, attachmentKey)
-	case 1:
-		adopted := records[0].ID
-		attachmentRecordsCreated.WithLabelValues(attachReasonAdopted).Inc()
-		klog.V(2).Infof("ControllerPublishVolume: adopting existing attachment record %s for volume %s "+
-			"and restoring its metadata", adopted, volumeID)
-		if err := cs.Cloud.SetVolumeMetadata(ctx, volumeID,
-			map[string]string{attachmentKey: adopted}); err != nil {
-			klog.Warningf("ControllerPublishVolume: failed to restore %s on volume %s: %v",
-				attachmentKey, volumeID, err)
-		}
-		return adopted, nil
-	default:
-		// Choosing arbitrarily could attach a record another actor owns, so
-		// this requires operator resolution and no record is mutated.
-		ids := make([]string, 0, len(records))
-		for _, r := range records {
-			ids = append(ids, r.ID)
-		}
-		duplicateAttachmentRecords.WithLabelValues().Inc()
-		return "", status.Errorf(codes.FailedPrecondition,
-			"volume %s has %d attachment records (%v); refusing to guess which one to use — "+
-				"operator resolution required", volumeID, len(records), ids)
+		return cs.createAndPersistAttachment(ctx, volumeID, attachmentKey, attachReasonOnDemand)
 	}
+
+	// Fail closed. This is an operator-resolution boundary, not a recoverable
+	// one; see the operator runbook.
+	ids := make([]string, 0, len(records))
+	for _, r := range records {
+		ids = append(ids, r.ID)
+	}
+	duplicateAttachmentRecords.WithLabelValues().Inc()
+	return "", status.Errorf(codes.FailedPrecondition,
+		"volume %s has no attachment ID in its metadata but %d attachment record(s) exist (%v). "+
+			"A connector-less Cinder attachment carries no ownership marker, so the driver will not "+
+			"adopt one. Operator resolution is required; see the operator runbook.",
+		volumeID, len(records), ids)
 }
 
 // createAndPersistAttachment creates a reserved record and stores its ID.
+//
+// Persisting the ID is fatal: without it the record is unattributable, and
+// because a listed record is never adopted, the volume would be permanently
+// unusable. On failure the record is rolled back so the retry starts clean.
 func (cs *controllerServer) createAndPersistAttachment(ctx context.Context,
-	volumeID, attachmentKey string) (string, error) {
+	volumeID, attachmentKey, reason string) (string, error) {
 	attachmentID, err := cs.Cloud.CreateAttachment(ctx, volumeID)
 	if err != nil {
 		return "", status.Errorf(codes.Internal,
 			"failed to create attachment record for volume %s: %v", volumeID, err)
 	}
+
 	if err := cs.Cloud.SetVolumeMetadata(ctx, volumeID,
 		map[string]string{attachmentKey: attachmentID}); err != nil {
-		// Not fatal: the next publish recovers by listing records.
-		klog.Warningf("ControllerPublishVolume: failed to persist %s on volume %s: %v",
-			attachmentKey, volumeID, err)
+		return "", cs.rollbackAttachment(ctx, volumeID, attachmentID,
+			status.Errorf(codes.Aborted,
+				"created attachment record %s for volume %s but could not persist its ID in volume "+
+					"metadata (%v); rolled back so the retry starts clean", attachmentID, volumeID, err))
 	}
+
+	attachmentRecordsCreated.WithLabelValues(reason).Inc()
 	return attachmentID, nil
+}
+
+// rollbackAttachment deletes a record whose ownership could not be recorded.
+//
+// If the deletion cannot be confirmed, the returned error says so explicitly:
+// an unattributable record is left behind, and the next publish will fail closed
+// on it rather than adopt it. That is the intended outcome — it is visible and
+// requires a decision, instead of silently attaching a record nobody owns.
+func (cs *controllerServer) rollbackAttachment(ctx context.Context,
+	volumeID, attachmentID string, cause error) error {
+	if delErr := cs.Cloud.DeleteAttachment(ctx, attachmentID); delErr != nil {
+		klog.Errorf("ControllerPublishVolume: could not roll back attachment record %s "+
+			"for volume %s: %v", attachmentID, volumeID, delErr)
+		return status.Errorf(codes.FailedPrecondition,
+			"%s; additionally, the record could not be deleted (%v), so volume %s now has an "+
+				"unattributable attachment record. Operator resolution is required; "+
+				"see the operator runbook.",
+			status.Convert(cause).Message(), delErr, volumeID)
+	}
+	attachmentRecordsDeleted.WithLabelValues().Inc()
+	return cause
 }
 
 // ── ControllerUnpublishVolume ────────────────────────────────────────────────
