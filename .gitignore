@@ -141,6 +141,7 @@ zz_generated.openapi.go
 /k8s-keystone-auth
 /cinder-csi-plugin
 /cinder-iscsi-csi-plugin
+/cinder-rbd-csi-plugin
 /octavia-ingress-controller
 /client-keystone-auth
 /barbican-kms-plugin

@@ -115,6 +115,14 @@ func codeOf(t *testing.T, err error) codes.Code {
 	return status.Convert(err).Code()
 }
 
+// expectNoStoredConnection makes the reuse probe find a reserved record that has
+// no connection information yet, which is the normal first-publish state. Tests
+// exercising the connector-update path use this so the probe does not short out.
+func expectNoStoredConnection(cloud *openstack.OpenStackRBDMock) {
+	cloud.On("GetAttachment", mock.Anything, mock.Anything).
+		Return(&openstack.Attachment{Status: "reserved"}, nil).Maybe()
+}
+
 // ── Block-only enforcement ───────────────────────────────────────────────────
 
 // Filesystem mode and multi-writer must be rejected at every capability-bearing
@@ -331,9 +339,10 @@ func TestCreateVolume_RoundsUpToWholeGiB(t *testing.T) {
 	cloud.AssertExpectations(t)
 }
 
-// A failed metadata write must not fail the RPC: publish recovers by listing
-// attachment records, whereas failing here would leak the record just created.
-func TestCreateVolume_MetadataWriteFailureIsNotFatal(t *testing.T) {
+// Persisting the attachment ID is the only record of driver ownership, and a
+// listed record is never adopted — so a failed write leaves an unusable volume.
+// It must be fatal, with both the record and the volume rolled back.
+func TestCreateVolume_MetadataWriteFailureIsFatalAndRollsBack(t *testing.T) {
 	cs, cloud := newTestControllerServer(t)
 	ctx := context.Background()
 
@@ -345,14 +354,41 @@ func TestCreateVolume_MetadataWriteFailureIsNotFatal(t *testing.T) {
 	cloud.On("CreateAttachment", ctx, testVolumeID).Return(testAttachmentID, nil)
 	cloud.On("SetVolumeMetadata", ctx, testVolumeID, mock.Anything).
 		Return(assert.AnError)
+	cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(nil)
+	cloud.On("DeleteVolume", ctx, testVolumeID).Return(nil)
 
-	resp, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
+	_, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
 		Name:               "pvc-1",
 		VolumeCapabilities: []*csi.VolumeCapability{blockCapability()},
 	})
-	require.NoError(t, err)
-	assert.Equal(t, testVolumeID, resp.Volume.VolumeId)
-	cloud.AssertNotCalled(t, "DeleteVolume")
+	assert.Equal(t, codes.Aborted, codeOf(t, err))
+	// Both halves of the ownership claim are withdrawn, in that order.
+	cloud.AssertCalled(t, "DeleteAttachment", ctx, testAttachmentID)
+	cloud.AssertCalled(t, "DeleteVolume", ctx, testVolumeID)
+}
+
+// When rollback itself cannot be confirmed, the error must say so: an
+// unattributable record is left behind and the operator has to resolve it.
+func TestCreateVolume_UnconfirmedRollbackIsSurfaced(t *testing.T) {
+	cs, cloud := newTestControllerServer(t)
+	ctx := context.Background()
+
+	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+	cloud.On("GetVolumesByName", ctx, "pvc-1").Return([]volumes.Volume{}, nil)
+	cloud.On("CreateVolume", ctx, mock.Anything, nil).
+		Return(&volumes.Volume{ID: testVolumeID, Size: 1}, nil)
+	cloud.On("WaitVolumeTargetStatus", ctx, testVolumeID, mock.Anything, mock.Anything).Return(nil)
+	cloud.On("CreateAttachment", ctx, testVolumeID).Return(testAttachmentID, nil)
+	cloud.On("SetVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(assert.AnError)
+	cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(assert.AnError)
+	cloud.On("DeleteVolume", ctx, testVolumeID).Return(nil)
+
+	_, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "pvc-1",
+		VolumeCapabilities: []*csi.VolumeCapability{blockCapability()},
+	})
+	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
+	assert.Contains(t, status.Convert(err).Message(), "unattributable")
 }
 
 // A failure after the volume exists must attempt cleanup so retries do not
@@ -439,7 +475,10 @@ func TestDeleteVolume_RetainsByDefault(t *testing.T) {
 	cloud.AssertNotCalled(t, "DeleteVolume")
 }
 
-func TestDeleteVolume_PerVolumeOverrideDeletes(t *testing.T) {
+// A per-volume cleanup request is reported and ignored: the volume is retained
+// regardless. Failing the RPC instead would put the PV in a delete loop that can
+// never complete, so retain-only always succeeds.
+func TestDeleteVolume_PerVolumeCleanupRequestIsIgnored(t *testing.T) {
 	cs, cloud := newTestControllerServer(t)
 	ctx := context.Background()
 
@@ -454,29 +493,35 @@ func TestDeleteVolume_PerVolumeOverrideDeletes(t *testing.T) {
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
 	cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(nil)
 	cloud.On("WaitVolumeTargetStatus", ctx, testVolumeID, mock.Anything, mock.Anything).Return(nil)
-	cloud.On("DeleteVolume", ctx, testVolumeID).Return(nil)
+	cloud.On("DeleteVolumeMetadata", ctx, testVolumeID,
+		[]string{attachmentMetaKey, cleanupMetaKey}).Return(nil)
 
 	_, err := cs.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: testVolumeID})
 	require.NoError(t, err)
 	cloud.AssertExpectations(t)
+	cloud.AssertNotCalled(t, "DeleteVolume")
 }
 
-func TestDeleteVolume_DriverConfigDeleteMode(t *testing.T) {
-	cs, cloud := newTestControllerServer(t)
-	ctx := context.Background()
+// Even with a truthy cleanup flag in any casing, the Cinder volume survives.
+func TestDeleteVolume_NeverDeletesPhysicalVolume(t *testing.T) {
+	for _, cleanup := range []string{"true", "TRUE", " True ", "false", ""} {
+		t.Run("cleanup="+cleanup, func(t *testing.T) {
+			cs, cloud := newTestControllerServer(t)
+			ctx := context.Background()
 
-	vopts := defaultVolumeOpts(t)
-	vopts.DeleteVolumeMode = openstack.DeleteVolumeModeDelete
-	cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
-		ID: testVolumeID, Status: "available", Metadata: map[string]string{},
-	}, nil)
-	cloud.On("GetVolumeOpts").Return(vopts)
-	cloud.On("WaitVolumeTargetStatus", ctx, testVolumeID, mock.Anything, mock.Anything).Return(nil)
-	cloud.On("DeleteVolume", ctx, testVolumeID).Return(nil)
+			cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
+				ID: testVolumeID, Status: "available",
+				Metadata: map[string]string{cleanupMetaKey: cleanup},
+			}, nil)
+			cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+			cloud.On("WaitVolumeTargetStatus", ctx, testVolumeID, mock.Anything, mock.Anything).Return(nil)
+			cloud.On("DeleteVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(nil)
 
-	_, err := cs.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: testVolumeID})
-	require.NoError(t, err)
-	cloud.AssertExpectations(t)
+			_, err := cs.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: testVolumeID})
+			require.NoError(t, err)
+			cloud.AssertNotCalled(t, "DeleteVolume")
+		})
+	}
 }
 
 // Deleting a Cinder volume whose image may still be mapped risks corruption,
@@ -529,6 +574,7 @@ func TestControllerPublishVolume_Success(t *testing.T) {
 	}, nil)
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
 	cloud.On("GetRBDOpts").Return(defaultRBDOpts(t))
+	expectNoStoredConnection(cloud)
 	cloud.On("UpdateAttachmentConnector", ctx, testAttachmentID,
 		mock.MatchedBy(func(c *openstack.AttachmentConnector) bool {
 			// The connector carries only host: measured as the sole requirement.
@@ -565,6 +611,7 @@ func TestControllerPublishVolume_PublishContextHasNoSecrets(t *testing.T) {
 	}, nil)
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
 	cloud.On("GetRBDOpts").Return(defaultRBDOpts(t))
+	expectNoStoredConnection(cloud)
 	cloud.On("UpdateAttachmentConnector", ctx, testAttachmentID, mock.Anything).
 		Return(labConnectionInfo(), nil)
 	cloud.On("CompleteAttachment", ctx, testAttachmentID).Return(nil)
@@ -583,9 +630,12 @@ func TestControllerPublishVolume_PublishContextHasNoSecrets(t *testing.T) {
 	assert.NotContains(t, resp.PublishContext, "keyring")
 }
 
-// Recovery: metadata lost, exactly one record exists. It must be adopted rather
-// than duplicated, and the metadata restored.
-func TestControllerPublishVolume_AdoptsExistingRecordWhenMetadataMissing(t *testing.T) {
+// Metadata lost but a record exists. A connector-less Cinder attachment carries
+// no ownership marker — nothing in it can be stamped or read back to prove this
+// driver created it — so "exactly one record" is evidence of a record, not of
+// ownership. Adopting it could attach a record another actor owns, so the driver
+// refuses and mutates nothing.
+func TestControllerPublishVolume_RefusesToAdoptListedRecord(t *testing.T) {
 	cs, cloud := newTestControllerServer(t)
 	ctx := context.Background()
 
@@ -593,22 +643,19 @@ func TestControllerPublishVolume_AdoptsExistingRecordWhenMetadataMissing(t *test
 		ID: testVolumeID, Metadata: map[string]string{},
 	}, nil)
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
-	cloud.On("GetRBDOpts").Return(defaultRBDOpts(t))
 	cloud.On("ListAttachmentsByVolume", ctx, testVolumeID).Return([]openstack.Attachment{
 		{ID: testAttachmentID, VolumeID: testVolumeID, Status: "reserved"},
 	}, nil)
-	cloud.On("SetVolumeMetadata", ctx, testVolumeID,
-		map[string]string{attachmentMetaKey: testAttachmentID}).Return(nil)
-	cloud.On("UpdateAttachmentConnector", ctx, testAttachmentID, mock.Anything).
-		Return(labConnectionInfo(), nil)
-	cloud.On("CompleteAttachment", ctx, testAttachmentID).Return(nil)
 
 	_, err := cs.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
 		VolumeId: testVolumeID, NodeId: testNodeID, VolumeCapability: blockCapability(),
 	})
-	require.NoError(t, err)
-	cloud.AssertExpectations(t)
+	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
+	assert.Contains(t, status.Convert(err).Message(), "ownership marker")
 	cloud.AssertNotCalled(t, "CreateAttachment")
+	cloud.AssertNotCalled(t, "SetVolumeMetadata")
+	cloud.AssertNotCalled(t, "UpdateAttachmentConnector")
+	cloud.AssertNotCalled(t, "DeleteAttachment")
 }
 
 func TestControllerPublishVolume_CreatesRecordWhenNoneExists(t *testing.T) {
@@ -620,6 +667,7 @@ func TestControllerPublishVolume_CreatesRecordWhenNoneExists(t *testing.T) {
 	}, nil)
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
 	cloud.On("GetRBDOpts").Return(defaultRBDOpts(t))
+	expectNoStoredConnection(cloud)
 	cloud.On("ListAttachmentsByVolume", ctx, testVolumeID).Return([]openstack.Attachment{}, nil)
 	cloud.On("CreateAttachment", ctx, testVolumeID).Return(testAttachmentID, nil)
 	cloud.On("SetVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(nil)
@@ -668,6 +716,7 @@ func TestControllerPublishVolume_StaleRecordReplacedAndRetriedOnce(t *testing.T)
 	}, nil)
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
 	cloud.On("GetRBDOpts").Return(defaultRBDOpts(t))
+	expectNoStoredConnection(cloud)
 	cloud.On("UpdateAttachmentConnector", ctx, "att-stale", mock.Anything).
 		Return((*openstack.RBDConnectionInfo)(nil), cpoerrors.ErrNotFound).Once()
 	cloud.On("CreateAttachment", ctx, testVolumeID).Return(testAttachmentID, nil).Once()
@@ -695,6 +744,7 @@ func TestControllerPublishVolume_SecondFailureIsNotRetried(t *testing.T) {
 		ID: testVolumeID, Metadata: map[string]string{attachmentMetaKey: "att-stale"},
 	}, nil)
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+	expectNoStoredConnection(cloud)
 	cloud.On("UpdateAttachmentConnector", ctx, "att-stale", mock.Anything).
 		Return((*openstack.RBDConnectionInfo)(nil), cpoerrors.ErrNotFound).Once()
 	cloud.On("CreateAttachment", ctx, testVolumeID).Return("att-new", nil).Once()
@@ -720,6 +770,7 @@ func TestControllerPublishVolume_CompletionFailureIsNotFatal(t *testing.T) {
 	}, nil)
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
 	cloud.On("GetRBDOpts").Return(defaultRBDOpts(t))
+	expectNoStoredConnection(cloud)
 	cloud.On("UpdateAttachmentConnector", ctx, testAttachmentID, mock.Anything).
 		Return(labConnectionInfo(), nil)
 	cloud.On("CompleteAttachment", ctx, testAttachmentID).Return(assert.AnError)
@@ -744,6 +795,7 @@ func TestControllerPublishVolume_FSIDMismatchFailsPrecondition(t *testing.T) {
 	}, nil)
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
 	cloud.On("GetRBDOpts").Return(ropts)
+	expectNoStoredConnection(cloud)
 	cloud.On("UpdateAttachmentConnector", ctx, testAttachmentID, mock.Anything).
 		Return(labConnectionInfo(), nil)
 	cloud.On("CompleteAttachment", ctx, testAttachmentID).Return(nil)
@@ -752,6 +804,88 @@ func TestControllerPublishVolume_FSIDMismatchFailsPrecondition(t *testing.T) {
 		VolumeId: testVolumeID, NodeId: testNodeID, VolumeCapability: blockCapability(),
 	})
 	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
+}
+
+// Validation must precede completion.
+//
+// Completion advances the record to in-use, and Cinder can refuse a later update
+// on a completed record — so completing first would leave a volume with unusable
+// connection information that retries cannot update out of. Ordering is the whole
+// guarantee here, so it is asserted directly rather than inferred from the error.
+func TestControllerPublishVolume_ValidatesBeforeCompleting(t *testing.T) {
+	cs, cloud := newTestControllerServer(t)
+	ctx := context.Background()
+
+	ropts := defaultRBDOpts(t)
+	ropts.ExpectedFSID = "a-totally-different-fsid"
+
+	cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
+		ID: testVolumeID, Metadata: map[string]string{attachmentMetaKey: testAttachmentID},
+	}, nil)
+	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+	cloud.On("GetRBDOpts").Return(ropts)
+	expectNoStoredConnection(cloud)
+	cloud.On("UpdateAttachmentConnector", ctx, testAttachmentID, mock.Anything).
+		Return(labConnectionInfo(), nil)
+
+	_, err := cs.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: testVolumeID, NodeId: testNodeID, VolumeCapability: blockCapability(),
+	})
+	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
+	cloud.AssertNotCalled(t, "CompleteAttachment")
+}
+
+// Stored connection information that fails validation must not be trusted; the
+// connector update runs instead, since it may return corrected information.
+func TestControllerPublishVolume_UnusableStoredConnectionFallsBackToUpdate(t *testing.T) {
+	cs, cloud := newTestControllerServer(t)
+	ctx := context.Background()
+
+	// An empty pool is invalid regardless of configuration, unlike an FSID
+	// mismatch which is only checked when expected-fsid is set.
+	corrupt := labConnectionInfo()
+	corrupt.Pool = ""
+
+	cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
+		ID: testVolumeID, Metadata: map[string]string{attachmentMetaKey: testAttachmentID},
+	}, nil)
+	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+	cloud.On("GetRBDOpts").Return(defaultRBDOpts(t))
+	cloud.On("GetAttachment", ctx, testAttachmentID).Return(&openstack.Attachment{
+		ID: testAttachmentID, Status: "attached", ConnectionInfo: corrupt,
+	}, nil).Once()
+	cloud.On("UpdateAttachmentConnector", ctx, testAttachmentID, mock.Anything).
+		Return(labConnectionInfo(), nil).Once()
+	cloud.On("CompleteAttachment", ctx, testAttachmentID).Return(nil)
+
+	_, err := cs.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: testVolumeID, NodeId: testNodeID, VolumeCapability: blockCapability(),
+	})
+	require.NoError(t, err)
+	cloud.AssertNumberOfCalls(t, "UpdateAttachmentConnector", 1)
+}
+
+// Rolling back a record whose ID could not be persisted is what keeps the next
+// publish from finding an unattributable record.
+func TestControllerPublishVolume_RollsBackWhenMetadataWriteFails(t *testing.T) {
+	cs, cloud := newTestControllerServer(t)
+	ctx := context.Background()
+
+	cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
+		ID: testVolumeID, Metadata: map[string]string{},
+	}, nil)
+	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+	cloud.On("ListAttachmentsByVolume", ctx, testVolumeID).Return([]openstack.Attachment{}, nil)
+	cloud.On("CreateAttachment", ctx, testVolumeID).Return(testAttachmentID, nil).Once()
+	cloud.On("SetVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(assert.AnError).Once()
+	cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(nil).Once()
+
+	_, err := cs.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: testVolumeID, NodeId: testNodeID, VolumeCapability: blockCapability(),
+	})
+	assert.Equal(t, codes.Aborted, codeOf(t, err))
+	cloud.AssertCalled(t, "DeleteAttachment", ctx, testAttachmentID)
+	cloud.AssertNotCalled(t, "UpdateAttachmentConnector")
 }
 
 func TestControllerPublishVolume_VolumeNotFound(t *testing.T) {

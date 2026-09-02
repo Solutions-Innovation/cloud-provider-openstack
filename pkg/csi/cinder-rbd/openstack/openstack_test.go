@@ -162,29 +162,29 @@ func TestVolumeOpts_Validate_RejectsUnknownMode(t *testing.T) {
 	assert.Contains(t, err.Error(), "delete-volume-mode")
 }
 
-func TestVolumeOpts_ShouldDeleteVolume(t *testing.T) {
-	retain := VolumeOpts{DeleteVolumeMode: DeleteVolumeModeRetain}
-	del := VolumeOpts{DeleteVolumeMode: DeleteVolumeModeDelete}
+// Retain-only is enforced at startup rather than by failing DeleteVolume.
+// Rejecting the RPC would leave the PersistentVolume in a delete loop that never
+// completes; rejecting the configuration tells the operator immediately and
+// strands nothing.
+func TestVolumeOpts_Validate_RejectsDeleteMode(t *testing.T) {
+	o := VolumeOpts{DeleteVolumeMode: DeleteVolumeModeDelete}
+	err := o.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not implemented")
+	assert.Contains(t, err.Error(), DeleteVolumeModeRetain)
+}
 
-	for _, tc := range []struct {
-		name      string
-		opts      VolumeOpts
-		perVolume string
-		want      bool
-	}{
-		{"retain default", retain, "", false},
-		{"retain with per-volume true", retain, "true", true},
-		{"retain with per-volume TRUE", retain, "TRUE", true},
-		{"retain with padded true", retain, "  true  ", true},
-		{"retain with per-volume false", retain, "false", false},
-		{"retain with garbage", retain, "yes", false},
-		{"driver delete mode", del, "", true},
-		{"driver delete mode, per-volume false does not save it", del, "false", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, tc.opts.ShouldDeleteVolume(tc.perVolume))
-		})
-	}
+func TestVolumeOpts_Validate_AcceptsRetain(t *testing.T) {
+	o := VolumeOpts{DeleteVolumeMode: DeleteVolumeModeRetain}
+	require.NoError(t, o.Validate())
+}
+
+// ApplyDefaults must produce a configuration that Validate accepts, or an
+// operator supplying no [Volume] section at all cannot start the driver.
+func TestVolumeOpts_DefaultsAreValid(t *testing.T) {
+	var o VolumeOpts
+	require.NoError(t, o.ApplyDefaults())
+	require.NoError(t, o.Validate())
 }
 
 func TestMonAddr_String(t *testing.T) {
@@ -246,7 +246,7 @@ func TestNoDeadConfigFields(t *testing.T) {
 		"DetachTimeout":     "DeleteVolume / ControllerUnpublishVolume wait (phase 2)",
 		"DefaultVolumeType": "CreateVolume volume type resolution (phase 2)",
 		"MetadataPrefix":    "metadataKey",
-		"DeleteVolumeMode":  "VolumeOpts.ShouldDeleteVolume",
+		"DeleteVolumeMode":  "VolumeOpts.Validate (retain-only enforcement)",
 	}
 
 	check := func(t *testing.T, typ reflect.Type, readers map[string]string, section string) {

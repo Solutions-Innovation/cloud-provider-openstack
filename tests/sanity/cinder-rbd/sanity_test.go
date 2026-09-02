@@ -137,9 +137,11 @@ func sanityVolumeOpts(t *testing.T) openstack.VolumeOpts {
 	if err := o.ApplyDefaults(); err != nil {
 		t.Fatalf("apply [Volume] defaults: %v", err)
 	}
-	// The sanity suite expects DeleteVolume to actually remove the volume;
-	// production defaults to retain for migration handoff.
-	o.DeleteVolumeMode = openstack.DeleteVolumeModeDelete
+	// Retain is the only supported mode: the driver cannot prove that no node
+	// still holds a kernel RBD mapping, so it never destroys the Cinder volume.
+	// The suite is run against that real behaviour rather than a relaxed variant,
+	// so any conformance cost of retain-only shows up here.
+	o.DeleteVolumeMode = openstack.DeleteVolumeModeRetain
 	o.DefaultVolumeType = "ceph-rook-store"
 
 	if err := o.Validate(); err != nil {

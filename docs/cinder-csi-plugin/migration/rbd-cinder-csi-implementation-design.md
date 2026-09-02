@@ -1296,9 +1296,9 @@ Input: volume_id
 ├─ 3. if attachmentID != "": cloud.DeleteAttachment(attachmentID)   (404 tolerated)
 ├─ 4. Wait until the volume leaves in-use/reserved
 │       cloud.WaitVolumeTargetStatus(id, ["available","error"], VolumeOpts.DetachTimeout)
-├─ 5. if cleanupVolume=="true" or DeleteVolumeMode=="delete":
-│       return FailedPrecondition; automatic physical deletion is disabled
-│       until Q8 defines a cross-node proof that no krbd map remains
+├─ 5. if cleanupVolume=="true": log a warning and ignore it
+│       retain always succeeds; DeleteVolumeMode=="delete" is unreachable
+│       because VolumeOpts.Validate rejects it at startup
 ├─ 6. RETAIN: cloud.DeleteVolumeMetadata(id, ["csi.rbd.attachment_id",
 │            "csi.rbd.cleanupVolume"])   # strip CSI ownership only
 │
@@ -1312,6 +1312,28 @@ as a map proxy would make forced-detach and unreachable-node paths unsafe.
 Physical deletion remains an operator/Blueprint action after independent map
 verification until Q8 is closed. `DetachTimeout` — dead config in the baseline
 — is read here.
+
+**Where retain-only is enforced.** The obvious reading of "block deletion" is to
+reject the `DeleteVolume` RPC with `FailedPrecondition`. That is wrong here.
+`DeleteVolume` is driven by `external-provisioner` on PVC deletion and is retried
+forever; failing it would leave the PersistentVolume in a `Terminating` delete
+loop that can never complete, and would need manual finalizer removal on every
+volume. That converts a rare correctness risk into a guaranteed operational one.
+
+Enforcement therefore happens where an unsafe request can be refused *without*
+stranding anything, and only retain remains representable at the point of use
+(decision D-6):
+
+| Surface | Mechanism | Failure mode |
+|---|---|---|
+| Chart | `_validate.tpl` rejects `deleteVolumeMode != retain` | render-time error with an explanation |
+| Driver startup | `VolumeOpts.Validate` rejects `delete` | controller refuses to start |
+| Per-volume metadata | `cleanupVolume=true` logged and ignored | none; retain succeeds |
+| `DeleteVolume` RPC | no deletion path exists in the code | none |
+
+The per-volume key is read but not honoured rather than removed outright, so an
+operator who set it on a volume during the iSCSI workflow gets a warning naming
+the volume instead of silence.
 
 Retain path handoff (unchanged from the iSCSI workflow):
 
@@ -1939,7 +1961,13 @@ RBD-specific series to add (P§12): **[P]**
 | `cinder_rbd_csi_isolated_mappings` | gauge | — |
 | `cinder_rbd_csi_orphaned_staging_records` | gauge | — |
 | `cinder_rbd_csi_staged_volumes` | gauge | — |
-| `cinder_rbd_csi_volumes_retained_total` / `_deleted_total` | counter | — |
+| `cinder_rbd_csi_volumes_retained_total` | counter | — |
+
+There is deliberately no `cinder_rbd_csi_volumes_deleted_total`: the driver never
+deletes a Cinder volume (D-13/D-14), and a series that can never increment is
+worse than its absence — it invites an alert on a condition that cannot occur.
+For the same reason `attachment_records_created_total` has no `adopted` reason
+label; adoption does not exist (D-7).
 
 Permitted identifiers in logs and metrics (P§12): CSI volume ID, Cinder volume
 UUID, Cinder attachment ID, node ID, Ceph cluster FSID, pool, image, device path,
@@ -2532,6 +2560,10 @@ re-litigate them:
 | D-11 | Persist a node-scoped `map-pending` intent before `rbd device map` | kernel/sysfs proves map identity, while the intent proves driver ownership across crashes |
 | D-12 | Validate normalized connection information before optional completion | malformed connection data must not advance the Cinder attachment state |
 | D-13 | Ship retain-only deletion until Q8 closes | Cinder status does not prove that every host has released its krbd map |
+| D-14 | Enforce retain-only at chart render and driver startup, **not** by failing the `DeleteVolume` RPC | `DeleteVolume` is retried forever by `external-provisioner`; rejecting it would leave every PV in an unresolvable delete loop needing manual finalizer removal. Rejecting the configuration refuses the unsafe request without stranding anything (an application of D-6) |
+| D-15 | Persisting the attachment ID is fatal in both `CreateVolume` and `ControllerPublishVolume`, with rollback of the record (and, in `CreateVolume`, the new volume) | coupled to D-7: with no adoption of listed records, an unpersisted ID leaves a permanently unusable volume, so reporting success would be wrong. Rollback of the freshly created volume is safe because it is empty and unattached |
+| D-16 | Reusing stored `connection_info` (§6.10 step 6) is sound only because RBD connection information is host-independent | pool, image, monitors and FSID do not vary by connector host. This must **not** be copied into the iSCSI sibling, whose connection information is per-initiator: reusing a record attached to another host would return the wrong target |
+| D-17 | `cleanupVolume=true` is read and ignored with a warning rather than removed from the metadata contract | an operator who set the key during the iSCSI workflow gets a message naming the volume instead of silence |
 
 ---
 
@@ -2546,7 +2578,7 @@ metadata csi.attachment_id                metadata csi.rbd.attachment_id     ←
 on-demand record creation                 on-demand record creation          ← same
 404 ⇒ replace + retry once                404 ⇒ replace + retry once         ← same
 delete record on unpublish                delete record on unpublish         ← same
-retain volume by default                  retain volume by default           ← same
+retain volume by default                  retain volume ALWAYS               ← stricter
 block-only, SINGLE_NODE_WRITER            block-only, SINGLE_NODE_WRITER     ← same
 CDI StorageProfile required               CDI StorageProfile required        ← same
 ─────────────────────────────────────────────────────────────────────────────

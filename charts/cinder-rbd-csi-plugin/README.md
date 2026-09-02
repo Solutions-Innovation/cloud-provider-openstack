@@ -70,17 +70,30 @@ because the failure mode is a silent loss of safety, not a visible error.
 | `cephCredential.secretName` | The node plugin reads its key from this projected Secret. |
 | `driverConfig.rbd.exclusive` | Must be `true`. A writable non-exclusive mapping permits a second writer and defeats the Ceph exclusive lock. |
 | `driverConfig.rbd.mounter` | Must be `krbd`. Nothing else is implemented. |
-| `driverConfig.volume.deleteVolumeMode` | Must be `retain` or `delete`. A typo such as `delet` would otherwise read as retain. |
+| `driverConfig.volume.deleteVolumeMode` | Must be `retain`. See [Volume retention](#volume-retention). |
 
 ## Volume retention
 
-`driverConfig.volume.deleteVolumeMode` defaults to **`retain`**: deleting a PVC
-removes the driver's metadata and the attachment record but **keeps the Cinder
-volume**, because the migration Blueprint needs it to build the target VM.
+`driverConfig.volume.deleteVolumeMode` must be **`retain`**, and that is the only
+mode this driver implements. Deleting a PVC removes the driver's metadata and the
+attachment record but **keeps the Cinder volume**, both because the migration
+Blueprint needs it to build the target VM and because the controller cannot prove
+the volume is safe to destroy.
 
-Set it to `delete` only if you want PVC deletion to destroy the volume. A single
-volume can override the default with the metadata key
-`csi.rbd.cleanupVolume=true`.
+Cinder reports a volume as `available` based on its attachment *records*, not on
+kernel state. After a force detach, or while a node is unreachable, a volume can
+read `available` while a worker still holds a kernel RBD mapping and the Ceph
+exclusive lock. Deleting the image at that point corrupts data rather than
+returning an error, so automatic deletion is withheld until a cross-node
+no-mapping check exists.
+
+Both the chart and the driver refuse `delete` — the chart at render time, the
+driver at startup. The per-volume metadata key `csi.rbd.cleanupVolume=true` is
+still read, but it only logs a warning and is ignored; retain always succeeds, so
+no PersistentVolume is left stuck in deletion.
+
+To reclaim a retained volume, confirm no node holds a mapping and then delete it
+out of band; see the operator runbook.
 
 ## Security
 

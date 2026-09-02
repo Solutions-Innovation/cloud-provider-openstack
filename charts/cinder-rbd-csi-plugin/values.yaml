@@ -158,8 +158,10 @@ driverConfig:
     # Read from the StorageClass at runtime; this is only the fallback.
     defaultVolumeType: ceph-rook-store
     metadataPrefix: csi.rbd
-    # retain keeps the Cinder volume after PVC deletion so the migration
-    # Blueprint can attach it to the target VM. Change with care.
+    # retain is the only supported mode, and the chart refuses anything else.
+    # The Cinder volume survives PVC deletion because the migration Blueprint
+    # needs it, and because the controller cannot prove no node still holds a
+    # kernel RBD mapping. See "Volume retention" in the chart README.
     deleteVolumeMode: retain
 
 # Operator-managed Ceph credential.

@@ -105,12 +105,6 @@ var (
 			Name: "cinder_rbd_csi_volumes_retained_total",
 			Help: "Number of Cinder volumes retained on PVC deletion for migration handoff.",
 		}, []string{})
-
-	volumesDeleted = metrics.NewCounterVec(
-		&metrics.CounterOpts{
-			Name: "cinder_rbd_csi_volumes_deleted_total",
-			Help: "Number of Cinder volumes deleted on PVC deletion under an explicit cleanup policy.",
-		}, []string{})
 )
 
 // Reasons for attachment record creation, used as a metric label. The set is
@@ -119,7 +113,6 @@ const (
 	attachReasonCreateVolume = "create_volume"
 	attachReasonOnDemand     = "on_demand"
 	attachReasonReplacement  = "replacement"
-	attachReasonAdopted      = "adopted"
 )
 
 // Results used as the map/unmap histogram label.
@@ -150,7 +143,6 @@ func RegisterDriverMetrics() {
 			unrecognizedMappings,
 			stagedVolumes,
 			volumesRetained,
-			volumesDeleted,
 		)
 	})
 }

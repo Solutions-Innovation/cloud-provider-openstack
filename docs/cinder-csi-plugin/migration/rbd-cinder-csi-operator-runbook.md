@@ -170,18 +170,36 @@ makes unmapping unsafe.
 
 ---
 
-## 2. Duplicate or conflicting Cinder attachment records
+## 2. Attachment record the driver will not claim
 
-**Symptom.** `ControllerPublishVolume` fails with:
+**Symptom.** `ControllerPublishVolume` or `CreateVolume` fails with one of:
 
 ```
-volume <id> has N attachment records (<ids>); refusing to guess which one to use
-— operator resolution required
+volume <id> has no attachment ID in its metadata but N attachment record(s)
+exist (<ids>). A connector-less Cinder attachment carries no ownership marker,
+so the driver will not adopt one. Operator resolution is required
 ```
 
-**What it means.** The driver found more than one attachment record for a volume
-whose metadata carried no attachment ID. Picking one could attach a record
-another actor owns.
+```
+volume <id> ... could not persist the attachment ID ...; additionally, the record
+could not be deleted (...), so volume <id> now has an unattributable attachment
+record. Operator resolution is required
+```
+
+**What it means.** The volume's metadata carries no attachment ID, but at least
+one attachment record exists in Cinder. **One record is enough to trigger this**
+— the driver never adopts a record it cannot prove it created.
+
+The reason is that a reserved, connector-less Cinder attachment has no field the
+driver can stamp and read back: it holds `id`, `volume_uuid`, `status` and a null
+`instance`, none of which identifies an author. So "exactly one record exists" is
+evidence of a record, not of ownership — a second driver deployment against the
+same Cinder project, or an operator using the CLI, produces an identical shape.
+Claiming it could attach a record another actor owns.
+
+Deciding ownership needs information the driver does not have and you do, which
+is why this is a human step. Writing the ID into volume metadata (step 4) *is*
+the ownership assertion.
 
 ### Diagnosis
 
@@ -213,7 +231,7 @@ For each record note `id`, `status`, and `instance`. Then decide:
    targets a Nova-attached volume before continuing.
 2. Otherwise, identify which record corresponds to the running migration pod by
    matching the node in the pod's `VolumeAttachment` against the record.
-3. Delete the surplus records:
+3. Delete every record you are not keeping:
 
    ```bash
    curl -s -o /dev/null -w '%{http_code}\n' -X DELETE \
@@ -221,8 +239,13 @@ For each record note `id`, `status`, and `instance`. Then decide:
      "$BASE/attachments/<surplus-attachment-id>"
    ```
 
-4. Write the surviving record's ID into the volume metadata so the driver adopts
-   it rather than creating another:
+   If no record should survive — the common case after a failed `CreateVolume`
+   rollback, where the volume is new and unused — delete them all and skip
+   step 4. The driver then creates a fresh record on the next attempt.
+
+4. Otherwise write the surviving record's ID into the volume metadata. This is
+   the point at which you assert ownership on the driver's behalf, so be sure the
+   record is the one the migration pod is using:
 
    ```bash
    openstack volume set --property csi.rbd.attachment_id=<surviving-id> <volume-id>
@@ -443,7 +466,61 @@ plugin running but staging will fail. Check that `[RBD] runtime-dir` and
 
 ---
 
-## 8. What never to do
+## 8. Reclaiming a retained Cinder volume
+
+The driver never deletes a Cinder volume. After a PVC is deleted the volume
+remains `available` with the driver's metadata stripped, ready for the migration
+Blueprint. When a volume is genuinely finished with, deletion is a deliberate
+operator action.
+
+**Why this is not automated.** Cinder reports `available` once no attachment
+*record* remains, which is not the same as no *kernel mapping* remaining. After a
+force detach, or while a node is unreachable, `ControllerUnpublishVolume` can
+succeed while a worker still holds a krbd mapping and the Ceph exclusive lock.
+Deleting the image then corrupts data rather than returning an error. The
+controller has no cross-node view that would let it rule this out — that gap is
+open contract Q8.
+
+So the check the controller cannot perform, you perform here.
+
+### Confirm no node maps the image
+
+The volume ID is the RBD image name. Check every node, not just the one you
+expect:
+
+```bash
+VOL=<volume-id>
+for n in $(kubectl get nodes -o name | cut -d/ -f2); do
+  echo "== $n"
+  kubectl debug node/$n -it --image=busybox -- \
+    sh -c 'grep -l '"$VOL"' /sys/bus/rbd/devices/*/name 2>/dev/null || echo "  no mapping"'
+done
+```
+
+Then confirm Ceph agrees that nothing holds the lock or is watching:
+
+```bash
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd status cinder-volumes/${VOL}
+```
+
+`Watchers: none` and no listed locker means no live client. A watcher you cannot
+account for means **stop**; find its host before going further.
+
+### Delete
+
+```bash
+source /var/home/sysadmin/openrc.os
+openstack volume show -f value -c status ${VOL}   # expect: available
+openstack volume delete ${VOL}
+```
+
+If deletion fails with a "volume is busy" style error, Cinder still sees a
+consumer. Do not force it; return to the check above.
+
+---
+
+## 9. What never to do
 
 1. **Never `rbd device unmap` a device without first reading its
    `cluster_fsid`, `pool` and `name` from sysfs.** Device numbers are reused;
@@ -455,9 +532,13 @@ plugin running but staging will fail. Check that `[RBD] runtime-dir` and
    driver rejects it at startup and the chart refuses to render it, deliberately.
 5. **Never copy a keyring, or the `userKey` value, into a ticket or log.**
 6. **Never delete a Cinder volume to clear a stuck PVC** without checking whether
-   the migration Blueprint still needs it. The driver retains volumes by design
-   so the target VM can be built from them.
-7. **Never edit a staging record to "fix" a device path.** Delete it and let the
+   the migration Blueprint still needs it *and* confirming no node still maps it
+   (§8). The driver retains volumes by design so the target VM can be built from
+   them.
+7. **Never expect `[Volume] delete-volume-mode = delete` to work.** The driver
+   rejects it at startup and the chart refuses to render it. Reclaim retained
+   volumes with the procedure in §8.
+8. **Never edit a staging record to "fix" a device path.** Delete it and let the
    driver reconcile; a hand-edited record can authorize an unmap of the wrong
    device.
 
@@ -473,4 +554,4 @@ plugin running but staging will fail. Check that `[RBD] runtime-dir` and
 | `/run/cinder-rbd-csi/<volume-id>/ceph.conf` | per-volume config, no secrets | yes, while unmapped |
 | `/run/cinder-rbd-csi/<volume-id>/keyring` | **Ceph key**, mode 0400 | yes, while unmapped; shred rather than `rm` if the runtime dir is disk-backed |
 | Cinder volume metadata `csi.rbd.attachment_id` | current attachment record ID | no — the driver's only source of truth |
-| Cinder volume metadata `csi.rbd.cleanupVolume` | per-volume delete override | yes, changes deletion policy |
+| Cinder volume metadata `csi.rbd.cleanupVolume` | legacy per-volume delete request | yes — read but ignored; the driver never deletes a Cinder volume |

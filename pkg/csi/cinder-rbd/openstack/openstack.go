@@ -117,8 +117,11 @@ const (
 	VolumeAttachingStatus = "attaching"
 )
 
-// Delete-volume modes. Retain is the default: the migration Blueprint needs
-// the Cinder volume to survive PVC deletion.
+// Delete-volume modes.
+//
+// Only retain is implemented: the migration Blueprint needs the Cinder volume to
+// survive PVC deletion. delete is still recognised so that configuring it can be
+// rejected with an explanation at startup rather than silently misread as retain.
 const (
 	DeleteVolumeModeRetain = "retain"
 	DeleteVolumeModeDelete = "delete"
@@ -400,26 +403,32 @@ func (o *VolumeOpts) ApplyDefaults() error {
 	return nil
 }
 
-// Validate rejects an unknown delete-volume-mode. The baseline treats any
-// non-"delete" value as retain, which silently accepts typos such as
-// "delet" — here they are rejected instead.
+// Validate rejects delete-volume-mode values this driver does not implement.
+//
+// Only retain is supported, and that is enforced here — at startup — rather than
+// by failing DeleteVolume. Failing the RPC would leave the PersistentVolume in a
+// delete loop that never completes, converting a rare correctness risk into a
+// guaranteed operational one. Rejecting the configuration tells the operator
+// immediately and strands nothing.
+//
+// Physical deletion is withheld because the controller cannot prove that no
+// worker still holds a kernel RBD mapping: Cinder's available status reflects
+// attachment records, not kernel state. Re-enabling it requires the cross-node
+// no-map proof tracked as Q8.
 func (o VolumeOpts) Validate() error {
 	switch o.DeleteVolumeMode {
-	case DeleteVolumeModeRetain, DeleteVolumeModeDelete:
+	case DeleteVolumeModeRetain:
+	case DeleteVolumeModeDelete:
+		return fmt.Errorf("[Volume] delete-volume-mode: %q is not implemented by this driver; "+
+			"only %q is supported. The controller cannot prove that every node has released its "+
+			"kernel RBD mapping, so automatic deletion of the Cinder volume is withheld. Delete "+
+			"volumes out of band once no node holds a mapping",
+			DeleteVolumeModeDelete, DeleteVolumeModeRetain)
 	default:
-		return fmt.Errorf("[Volume] delete-volume-mode: must be %q or %q, got %q",
-			DeleteVolumeModeRetain, DeleteVolumeModeDelete, o.DeleteVolumeMode)
+		return fmt.Errorf("[Volume] delete-volume-mode: must be %q, got %q",
+			DeleteVolumeModeRetain, o.DeleteVolumeMode)
 	}
 	return nil
-}
-
-// ShouldDeleteVolume reports whether DeleteVolume destroys the Cinder volume.
-// Precedence: per-volume metadata override, then driver configuration.
-func (o VolumeOpts) ShouldDeleteVolume(perVolumeCleanup string) bool {
-	if strings.EqualFold(strings.TrimSpace(perVolumeCleanup), "true") {
-		return true
-	}
-	return o.DeleteVolumeMode == DeleteVolumeModeDelete
 }
 
 // ── Provider ─────────────────────────────────────────────────────────────────
