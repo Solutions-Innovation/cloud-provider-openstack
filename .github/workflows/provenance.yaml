@@ -1,0 +1,28 @@
+name: Verify Repository Provenance
+
+# Runs on every pull request, with no paths filter.
+#
+# The existing chart workflow is scoped to charts/**, which is why an accidental
+# replacement of the repo-root LICENSE and README.md went unnoticed for five
+# months: no workflow looked at those files, and build, test and lint are all
+# blind to provenance.
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit SHA rather than a mutable tag, matching the rest of
+      # the workflows in this repository.
+      - name: Checkout
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744
+
+      - name: Verify LICENSE and README belong to this project
+        run: bash hack/verify-repo-provenance.sh
