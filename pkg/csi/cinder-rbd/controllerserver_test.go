@@ -1002,7 +1002,10 @@ func TestControllerUnpublishVolume_VolumeNotFoundIsSuccess(t *testing.T) {
 
 // Clearing metadata is best effort: the record is already gone, which is what
 // released the volume, and a stale key is recovered from on the next publish.
-func TestControllerUnpublishVolume_MetadataClearFailureIsNotFatal(t *testing.T) {
+// Clearing the attachment ID is fatal: the key is the driver's authoritative
+// ownership record, and the migration handoff reads it. The retry converges
+// because deleting an already-deleted record now succeeds.
+func TestControllerUnpublishVolume_MetadataClearFailureIsRetryable(t *testing.T) {
 	cs, cloud := newTestControllerServer(t)
 	ctx := context.Background()
 
@@ -1010,14 +1013,106 @@ func TestControllerUnpublishVolume_MetadataClearFailureIsNotFatal(t *testing.T) 
 		ID: testVolumeID, Metadata: map[string]string{attachmentMetaKey: testAttachmentID},
 	}, nil)
 	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
-	cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(nil)
-	cloud.On("DeleteVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(assert.AnError)
-	cloud.On("WaitVolumeTargetStatus", ctx, testVolumeID, mock.Anything, mock.Anything).Return(nil)
+	cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(nil).Once()
+	cloud.On("DeleteVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(assert.AnError).Once()
 
 	_, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{
 		VolumeId: testVolumeID, NodeId: testNodeID,
 	})
-	require.NoError(t, err)
+	assert.Equal(t, codes.Aborted, codeOf(t, err))
+	// The wait is never reached: the volume is not released until its metadata is.
+	cloud.AssertNotCalled(t, "WaitVolumeTargetStatus")
+}
+
+// The retry after a failed metadata clear must converge. On the second attempt
+// the record is already gone — that 404 must not become a permanent failure.
+func TestControllerUnpublishVolume_RetryAfterMetadataFailureConverges(t *testing.T) {
+	cs, cloud := newTestControllerServer(t)
+	ctx := context.Background()
+
+	cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
+		ID: testVolumeID, Metadata: map[string]string{attachmentMetaKey: testAttachmentID},
+	}, nil)
+	cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+	cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(nil).Once()
+	cloud.On("DeleteVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(assert.AnError).Once()
+
+	_, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: testVolumeID, NodeId: testNodeID,
+	})
+	require.Error(t, err)
+
+	// Second attempt: metadata still names the deleted record.
+	cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(cpoerrors.ErrNotFound).Once()
+	cloud.On("DeleteVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(nil).Once()
+	cloud.On("WaitVolumeTargetStatus", ctx, testVolumeID, mock.Anything, mock.Anything).Return(nil)
+
+	_, err = cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: testVolumeID, NodeId: testNodeID,
+	})
+	require.NoError(t, err, "a record that is already gone must not block the retry")
+	cloud.AssertExpectations(t)
+}
+
+// A missing record already satisfies the delete goal, in both RPCs that remove
+// one. Returning an error would make the sidecar retry forever.
+func TestDeleteAttachment_NotFoundIsSuccess(t *testing.T) {
+	t.Run("DeleteVolume", func(t *testing.T) {
+		cs, cloud := newTestControllerServer(t)
+		ctx := context.Background()
+
+		cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
+			ID: testVolumeID, Status: "available",
+			Metadata: map[string]string{attachmentMetaKey: testAttachmentID},
+		}, nil)
+		cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+		cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(cpoerrors.ErrNotFound)
+		cloud.On("WaitVolumeTargetStatus", ctx, testVolumeID, mock.Anything, mock.Anything).Return(nil)
+		cloud.On("DeleteVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(nil)
+
+		_, err := cs.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: testVolumeID})
+		require.NoError(t, err)
+	})
+
+	t.Run("ControllerUnpublishVolume", func(t *testing.T) {
+		cs, cloud := newTestControllerServer(t)
+		ctx := context.Background()
+
+		cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
+			ID: testVolumeID, Metadata: map[string]string{attachmentMetaKey: testAttachmentID},
+		}, nil)
+		cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+		cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(cpoerrors.ErrNotFound)
+		cloud.On("DeleteVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(nil)
+		cloud.On("WaitVolumeTargetStatus", ctx, testVolumeID, mock.Anything, mock.Anything).Return(nil)
+
+		_, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{
+			VolumeId: testVolumeID, NodeId: testNodeID,
+		})
+		require.NoError(t, err)
+	})
+
+	// Rollback: a record already gone means the rollback goal is met, so the
+	// caller must not be told an unattributable record was left behind.
+	t.Run("publish rollback", func(t *testing.T) {
+		cs, cloud := newTestControllerServer(t)
+		ctx := context.Background()
+
+		cloud.On("GetVolume", ctx, testVolumeID).Return(&volumes.Volume{
+			ID: testVolumeID, Metadata: map[string]string{},
+		}, nil)
+		cloud.On("GetVolumeOpts").Return(defaultVolumeOpts(t))
+		cloud.On("ListAttachmentsByVolume", ctx, testVolumeID).Return([]openstack.Attachment{}, nil)
+		cloud.On("CreateAttachment", ctx, testVolumeID).Return(testAttachmentID, nil)
+		cloud.On("SetVolumeMetadata", ctx, testVolumeID, mock.Anything).Return(assert.AnError)
+		cloud.On("DeleteAttachment", ctx, testAttachmentID).Return(cpoerrors.ErrNotFound)
+
+		_, err := cs.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+			VolumeId: testVolumeID, NodeId: testNodeID, VolumeCapability: blockCapability(),
+		})
+		assert.Equal(t, codes.Aborted, codeOf(t, err))
+		assert.NotContains(t, status.Convert(err).Message(), "unattributable")
+	})
 }
 
 // ── Capability RPCs ──────────────────────────────────────────────────────────

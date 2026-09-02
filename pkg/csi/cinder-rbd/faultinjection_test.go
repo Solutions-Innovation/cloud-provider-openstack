@@ -252,15 +252,17 @@ func TestFault_UnconfirmedRollbackLeavesVolumeFailingClosed(t *testing.T) {
 
 // §9.2 row 4: map succeeded, staging record write failed.
 //
-// The next stage must adopt the live mapping by pool/image rather than attempt a
-// second map, which the exclusive lock would deny.
-func TestFault_MapSucceededRecordWriteFailed_NextStageAdopts(t *testing.T) {
+// The mapping must be rolled back, not left for a later stage to adopt. Ownership
+// now rests on the pre-map intent, and a mapping whose completed record never
+// landed has had nothing verify its size or record its device for unstage.
+// Leaving it live would mean a later stage reuses a mapping the driver never
+// finished validating.
+func TestFault_MapSucceededRecordWriteFailed_RollsBackTheMap(t *testing.T) {
 	f := newNodeFixture(t)
 	dev := mappedDevice(5)
 	createFakeDevice(t, &dev)
 
-	// Make the state directory unwritable so the index write fails, then make
-	// the staging path a file so the staging write fails too.
+	// Make the staging path a file so the record write fails.
 	require.NoError(t, os.MkdirAll(filepath.Dir(f.staging), 0o755))
 	require.NoError(t, os.WriteFile(f.staging, []byte("not a directory"), 0o600))
 
@@ -270,6 +272,9 @@ func TestFault_MapSucceededRecordWriteFailed_NextStageAdopts(t *testing.T) {
 	f.mapper.On("VerifyIdentity", mock.Anything, dev.DevicePath, mock.Anything).Return(nil)
 	f.mapper.On("DeviceSize", mock.Anything, dev.DevicePath).Return(int64(1073741824), nil)
 	f.mapper.On("LockHolders", mock.Anything, mock.Anything).Return([]string{"client.1@ip"}, nil)
+	// Rollback: unmap, then confirm absence.
+	f.mapper.On("Unmap", mock.Anything, dev.DevicePath, mock.Anything).Return(nil).Once()
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{}, nil).Once()
 
 	_, err := f.ns.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 		VolumeId:          testVolumeID,
@@ -279,13 +284,17 @@ func TestFault_MapSucceededRecordWriteFailed_NextStageAdopts(t *testing.T) {
 	})
 	require.Error(t, err, "the RPC must fail so kubelet retries")
 
-	// The mapping must NOT have been rolled back: it is working state, and the
-	// next stage adopts it.
-	f.mapper.AssertNotCalled(t, "Unmap")
+	// Identity was verified before unmapping: a device path alone never
+	// authorizes an unmap.
+	f.mapper.AssertCalled(t, "Unmap", mock.Anything, dev.DevicePath, mock.Anything)
+	// Absence confirmed, so the ownership intent is gone and the retry maps afresh.
+	_, intentErr := f.ns.Staging.ReadIndex(testVolumeID)
+	require.Error(t, intentErr, "the intent must be removed once absence is confirmed")
 
-	// Retry with a usable staging path: the live mapping is adopted, no remap.
+	// Retry with a usable staging path: a clean map, not a reuse.
 	require.NoError(t, os.Remove(f.staging))
-	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{dev}, nil)
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{}, nil)
+	f.mapper.On("Map", mock.Anything, mock.Anything).Return(dev, nil).Once()
 
 	_, err = f.ns.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 		VolumeId:          testVolumeID,
@@ -294,8 +303,73 @@ func TestFault_MapSucceededRecordWriteFailed_NextStageAdopts(t *testing.T) {
 		PublishContext:    stagePublishContext(),
 	})
 	require.NoError(t, err)
+	f.mapper.AssertNumberOfCalls(t, "Map", 2)
+}
 
-	f.mapper.AssertNumberOfCalls(t, "Map", 1)
+// Rollback that cannot confirm absence must retain the intent, so the mapping
+// stays attributable and reconciliation can still finish the job.
+func TestFault_RollbackUnmapFailureRetainsOwnershipIntent(t *testing.T) {
+	f := newNodeFixture(t)
+	dev := mappedDevice(5)
+	createFakeDevice(t, &dev)
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(f.staging), 0o755))
+	require.NoError(t, os.WriteFile(f.staging, []byte("not a directory"), 0o600))
+
+	f.creds.On("Load", mock.Anything, "cinder").Return(NewTestCredential("cinder", redactedKey), nil)
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{}, nil).Once()
+	f.mapper.On("Map", mock.Anything, mock.Anything).Return(dev, nil).Once()
+	f.mapper.On("VerifyIdentity", mock.Anything, dev.DevicePath, mock.Anything).Return(nil)
+	f.mapper.On("DeviceSize", mock.Anything, dev.DevicePath).Return(int64(1073741824), nil)
+	f.mapper.On("LockHolders", mock.Anything, mock.Anything).Return([]string{"client.1@ip"}, nil)
+	f.mapper.On("Unmap", mock.Anything, dev.DevicePath, mock.Anything).Return(assert.AnError).Once()
+
+	_, err := f.ns.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
+		VolumeId:          testVolumeID,
+		StagingTargetPath: f.staging,
+		VolumeCapability:  blockCapability(),
+		PublishContext:    stagePublishContext(),
+	})
+	require.Error(t, err)
+	assert.Contains(t, status.Convert(err).Message(), "intent is retained")
+
+	rec, intentErr := f.ns.Staging.ReadIndex(testVolumeID)
+	require.NoError(t, intentErr, "the intent must survive a failed rollback")
+	assert.Equal(t, PhaseMapPending, rec.Phase)
+}
+
+// A rollback must never unmap on a device path alone. If the device no longer
+// verifies as the expected image, something else owns it now.
+func TestFault_RollbackRefusesUnmapOnIdentityMismatch(t *testing.T) {
+	f := newNodeFixture(t)
+	dev := mappedDevice(5)
+	createFakeDevice(t, &dev)
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(f.staging), 0o755))
+	require.NoError(t, os.WriteFile(f.staging, []byte("not a directory"), 0o600))
+
+	f.creds.On("Load", mock.Anything, "cinder").Return(NewTestCredential("cinder", redactedKey), nil)
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{}, nil).Once()
+	f.mapper.On("Map", mock.Anything, mock.Anything).Return(dev, nil).Once()
+	f.mapper.On("DeviceSize", mock.Anything, dev.DevicePath).Return(int64(1073741824), nil)
+	f.mapper.On("LockHolders", mock.Anything, mock.Anything).Return([]string{"client.1@ip"}, nil)
+	// Verification passes for the identity gate, then fails at rollback time.
+	f.mapper.On("VerifyIdentity", mock.Anything, dev.DevicePath, mock.Anything).Return(nil).Once()
+	f.mapper.On("VerifyIdentity", mock.Anything, dev.DevicePath, mock.Anything).
+		Return(assert.AnError).Once()
+
+	_, err := f.ns.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
+		VolumeId:          testVolumeID,
+		StagingTargetPath: f.staging,
+		VolumeCapability:  blockCapability(),
+		PublishContext:    stagePublishContext(),
+	})
+	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
+	f.mapper.AssertNotCalled(t, "Unmap")
+
+	rec, intentErr := f.ns.Staging.ReadIndex(testVolumeID)
+	require.NoError(t, intentErr, "the intent must survive so the mapping stays attributable")
+	assert.Equal(t, PhaseMapPending, rec.Phase)
 }
 
 // §9.2 row 5: plugin restart with a live map.
