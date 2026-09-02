@@ -30,7 +30,6 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/cloud-provider-openstack/pkg/metrics"
-	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
 	"k8s.io/klog/v2"
 )
 
@@ -209,9 +208,7 @@ func (os *OpenStackRBD) WaitVolumeTargetStatus(ctx context.Context, volumeID str
 
 // ── Volume metadata ──────────────────────────────────────────────────────────
 //
-// Cinder's metadata sub-resource is not used. Both operations are
-// read-modify-write over volumes.Update so unrelated keys survive. Key
-// prefixing is the caller's job.
+// Key prefixing is the caller's job.
 
 // SetVolumeMetadata merges keys into the volume metadata; supplied keys win on
 // conflict.
@@ -250,40 +247,25 @@ func (os *OpenStackRBD) DeleteVolumeMetadata(ctx context.Context, volumeID strin
 		return nil
 	}
 
-	vol, err := os.GetVolume(ctx, volumeID)
-	if err != nil {
-		if cpoerrors.IsNotFound(err) {
-			klog.V(3).Infof("DeleteVolumeMetadata: volume %s not found, nothing to clear", volumeID)
-			return nil
+	for _, key := range keys {
+		url := os.blockstorage.ServiceURL("volumes", volumeID, "metadata", key)
+		mc := metrics.NewMetricContext("volume", "metadata_delete")
+		resp, err := os.blockstorage.Delete(ctx, url, &gophercloud.RequestOpts{
+			OkCodes: []int{http.StatusOK},
+		})
+		_, _, err = gophercloud.ParseResponse(resp, err)
+		if mc.ObserveRequest(err) == nil {
+			continue
 		}
-		return fmt.Errorf("openstack: get volume %s for metadata delete: %w", volumeID, err)
-	}
-
-	remove := make(map[string]bool, len(keys))
-	for _, k := range keys {
-		remove[k] = true
-	}
-
-	remaining := make(map[string]string, len(vol.Metadata))
-	for k, v := range vol.Metadata {
-		if !remove[k] {
-			remaining[k] = v
+		if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
+			klog.V(4).Infof("DeleteVolumeMetadata: key %s already absent on volume %s",
+				key, volumeID)
+			continue
 		}
+		return fmt.Errorf("openstack: delete metadata key %s from volume %s: %w",
+			key, volumeID, err)
 	}
 
-	// Nothing matched: skip the write rather than issuing a no-op PUT.
-	if len(remaining) == len(vol.Metadata) {
-		klog.V(4).Infof("DeleteVolumeMetadata: no matching keys on volume %s", volumeID)
-		return nil
-	}
-
-	mc := metrics.NewMetricContext("volume", "metadata_delete")
-	_, err = volumes.Update(ctx, os.blockstorage, volumeID, volumes.UpdateOpts{Metadata: remaining}).Extract()
-	if mc.ObserveRequest(err) != nil {
-		return fmt.Errorf("openstack: delete metadata keys from volume %s: %w", volumeID, err)
-	}
-
-	klog.V(4).Infof("DeleteVolumeMetadata: removed %d key(s) from volume %s",
-		len(vol.Metadata)-len(remaining), volumeID)
+	klog.V(4).Infof("DeleteVolumeMetadata: removed %d key(s) from volume %s", len(keys), volumeID)
 	return nil
 }
