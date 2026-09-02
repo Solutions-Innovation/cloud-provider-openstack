@@ -220,6 +220,155 @@ func TestStagingStore_NextGenerationIncrements(t *testing.T) {
 	assert.Equal(t, 8, store.NextGeneration(testVolumeID))
 }
 
+// ── Ownership intent ─────────────────────────────────────────────────────────
+
+func TestStagingStore_WriteIntentRoundTrip(t *testing.T) {
+	store, _, _ := newTestStagingStore(t)
+
+	rec := newMapIntentRecord(testVolumeID, "att", labConnectionInfo(), 3)
+	require.NoError(t, store.WriteIntent(rec))
+
+	got, err := store.ReadIndex(testVolumeID)
+	require.NoError(t, err)
+	assert.Equal(t, PhaseMapPending, got.Phase)
+	assert.Equal(t, testVolumeID, got.VolumeID)
+	assert.Equal(t, 3, got.MapGeneration)
+	// The intent is written before the device exists, so it cannot name one.
+	assert.Empty(t, got.DevicePath)
+	assert.Zero(t, got.DeviceID)
+}
+
+// The intent lives in the node-scoped index because that is what startup
+// reconciliation enumerates; a kubelet staging directory may not survive a reboot.
+func TestStagingStore_WriteIntentIsNodeScoped(t *testing.T) {
+	store, _, stagingPath := newTestStagingStore(t)
+
+	require.NoError(t, store.WriteIntent(newMapIntentRecord(testVolumeID, "att", labConnectionInfo(), 1)))
+
+	_, err := store.ReadIndex(testVolumeID)
+	require.NoError(t, err)
+	_, err = store.Read(stagingPath)
+	require.Error(t, err, "the intent must not depend on the kubelet staging path")
+}
+
+func TestStagingStore_WriteIntentRejectsNonPendingPhase(t *testing.T) {
+	store, _, _ := newTestStagingStore(t)
+
+	staged := newStagingRecord(testVolumeID, "att", labConnectionInfo(), mappedDevice(5), 1, 0)
+	err := store.WriteIntent(staged)
+	require.Error(t, err, "only a map-pending record is an intent")
+	assert.Contains(t, err.Error(), string(PhaseMapPending))
+}
+
+func TestStagingRecord_ProvesOwnershipOf(t *testing.T) {
+	want := ImageIdentity{
+		ClusterFSID: testFSID, ClusterName: "ceph",
+		Pool: "cinder-volumes", Image: testVolumeID,
+	}
+	valid := newMapIntentRecord(testVolumeID, "att", labConnectionInfo(), 1)
+
+	otherImage := *valid
+	otherImage.Image = "someone-elses-image"
+
+	otherFSID := *valid
+	otherFSID.ClusterFSID = "a-different-cluster"
+
+	foreignDriver := *valid
+	foreignDriver.Driver = "rbd.csi.ceph.com"
+
+	badPhase := *valid
+	badPhase.Phase = "half-done"
+
+	noVolume := *valid
+	noVolume.VolumeID = ""
+
+	for _, tc := range []struct {
+		name     string
+		rec      *StagingRecord
+		volumeID string
+		want     bool
+	}{
+		{"valid intent", valid, testVolumeID, true},
+		{"staged record also proves ownership",
+			newStagingRecord(testVolumeID, "att", labConnectionInfo(), mappedDevice(5), 1, 0),
+			testVolumeID, true},
+		{"nil record proves nothing", nil, testVolumeID, false},
+		{"another volume's intent", valid, "some-other-volume", false},
+		{"empty volume ID", &noVolume, testVolumeID, false},
+		{"different image", &otherImage, testVolumeID, false},
+		{"different cluster", &otherFSID, testVolumeID, false},
+		{"written by another driver", &foreignDriver, testVolumeID, false},
+		{"unknown phase", &badPhase, testVolumeID, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.rec.ProvesOwnershipOf(tc.volumeID, want))
+		})
+	}
+}
+
+// An incomplete requested identity can never be matched: refusing it keeps a
+// half-populated publish context from authorizing reuse.
+func TestStagingRecord_ProvesOwnershipRejectsIncompleteIdentity(t *testing.T) {
+	rec := newMapIntentRecord(testVolumeID, "att", labConnectionInfo(), 1)
+	assert.False(t, rec.ProvesOwnershipOf(testVolumeID, ImageIdentity{Pool: "cinder-volumes"}))
+}
+
+// Records written before the phase field existed were only ever written at the
+// end of a successful stage, so they read back as staged.
+func TestStagingStore_RecordWithoutPhaseReadsAsStaged(t *testing.T) {
+	store, _, stagingPath := newTestStagingStore(t)
+
+	rec := newStagingRecord(testVolumeID, "att", labConnectionInfo(), mappedDevice(5), 1, 0)
+	require.NoError(t, store.Write(stagingPath, rec))
+
+	// Strip the phase the way an older build would have left it.
+	path := store.recordPath(stagingPath)
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(raw, &m))
+	delete(m, "phase")
+	stripped, err := json.Marshal(m)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, stripped, 0o600))
+
+	got, err := store.Read(stagingPath)
+	require.NoError(t, err)
+	assert.Equal(t, PhaseStaged, got.Phase)
+}
+
+func TestStagingStore_UnknownPhaseIsRejected(t *testing.T) {
+	store, _, stagingPath := newTestStagingStore(t)
+
+	rec := newStagingRecord(testVolumeID, "att", labConnectionInfo(), mappedDevice(5), 1, 0)
+	rec.Phase = "somewhere-in-between"
+	require.NoError(t, os.MkdirAll(stagingPath, 0o750))
+	data, err := json.Marshal(rec)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(store.recordPath(stagingPath), data, 0o600))
+
+	_, readErr := store.Read(stagingPath)
+	require.Error(t, readErr)
+	assert.Contains(t, readErr.Error(), "unknown phase")
+}
+
+// A staged record that names no device cannot authorize an unstage, so it is
+// rejected rather than silently treated as usable.
+func TestStagingStore_StagedRecordWithoutDeviceIsRejected(t *testing.T) {
+	store, _, stagingPath := newTestStagingStore(t)
+
+	rec := newStagingRecord(testVolumeID, "att", labConnectionInfo(), mappedDevice(5), 1, 0)
+	rec.DevicePath = ""
+	require.NoError(t, os.MkdirAll(stagingPath, 0o750))
+	data, err := json.Marshal(rec)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(store.recordPath(stagingPath), data, 0o600))
+
+	_, readErr := store.Read(stagingPath)
+	require.Error(t, readErr)
+	assert.Contains(t, readErr.Error(), "names no device")
+}
+
 func TestStagingRecord_Identity(t *testing.T) {
 	rec := newStagingRecord(testVolumeID, "att", labConnectionInfo(), mappedDevice(5), 1, 0)
 

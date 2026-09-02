@@ -33,3 +33,6 @@ jobs:
 
       - name: Verify cinder-iscsi chart compatibility renders
         run: bash hack/verify-cinder-iscsi-chart.sh
+
+      - name: Verify cinder-rbd chart safety guards
+        run: bash hack/verify-cinder-rbd-chart.sh

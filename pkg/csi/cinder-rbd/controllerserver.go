@@ -286,6 +286,31 @@ func (cs *controllerServer) ensureReservation(ctx context.Context,
 	return cs.createAndPersistAttachment(ctx, vol.ID, attachmentKey, attachReasonOnDemand)
 }
 
+// deleteAttachmentIdempotent removes an attachment record, treating a missing
+// record as success.
+//
+// A 404 means the goal — no such record — is already met. Reporting it as an
+// error would make DeleteVolume and ControllerUnpublishVolume unable to make
+// progress after a lost response or an operator's manual cleanup: both are
+// retried indefinitely by their sidecars, so every retry would fail on the
+// record that is already gone.
+func (cs *controllerServer) deleteAttachmentIdempotent(ctx context.Context,
+	volumeID, attachmentID string) error {
+	err := cs.Cloud.DeleteAttachment(ctx, attachmentID)
+	switch {
+	case err == nil:
+		attachmentRecordsDeleted.WithLabelValues().Inc()
+		return nil
+	case cpoerrors.IsNotFound(err):
+		// Not counted as a deletion: nothing was deleted by this call.
+		klog.V(3).Infof("attachment record %s for volume %s is already gone", attachmentID, volumeID)
+		return nil
+	default:
+		return status.Errorf(codes.Internal,
+			"failed to delete attachment record %s for volume %s: %v", attachmentID, volumeID, err)
+	}
+}
+
 // ── DeleteVolume ─────────────────────────────────────────────────────────────
 
 // DeleteVolume removes the attachment record and then either retains or deletes
@@ -317,9 +342,8 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context,
 	attachmentID := vol.Metadata[attachmentKey]
 
 	if attachmentID != "" {
-		if err := cs.Cloud.DeleteAttachment(ctx, attachmentID); err != nil {
-			return nil, status.Errorf(codes.Internal,
-				"failed to delete attachment record %s for volume %s: %v", attachmentID, volumeID, err)
+		if err := cs.deleteAttachmentIdempotent(ctx, volumeID, attachmentID); err != nil {
+			return nil, err
 		}
 	}
 
@@ -581,16 +605,18 @@ func (cs *controllerServer) createAndPersistAttachment(ctx context.Context,
 // requires a decision, instead of silently attaching a record nobody owns.
 func (cs *controllerServer) rollbackAttachment(ctx context.Context,
 	volumeID, attachmentID string, cause error) error {
-	if delErr := cs.Cloud.DeleteAttachment(ctx, attachmentID); delErr != nil {
+	// A record that is already gone satisfies the rollback, so 404 is success
+	// here too; treating it as failure would escalate a clean state to operator
+	// resolution.
+	if delErr := cs.deleteAttachmentIdempotent(ctx, volumeID, attachmentID); delErr != nil {
 		klog.Errorf("ControllerPublishVolume: could not roll back attachment record %s "+
 			"for volume %s: %v", attachmentID, volumeID, delErr)
 		return status.Errorf(codes.FailedPrecondition,
 			"%s; additionally, the record could not be deleted (%v), so volume %s now has an "+
 				"unattributable attachment record. Operator resolution is required; "+
 				"see the operator runbook.",
-			status.Convert(cause).Message(), delErr, volumeID)
+			status.Convert(cause).Message(), status.Convert(delErr).Message(), volumeID)
 	}
-	attachmentRecordsDeleted.WithLabelValues().Inc()
 	return cause
 }
 
@@ -626,18 +652,27 @@ func (cs *controllerServer) ControllerUnpublishVolume(ctx context.Context,
 
 	if attachmentID == "" {
 		klog.V(3).Infof("ControllerUnpublishVolume: volume %s has no attachment record in metadata", volumeID)
-	} else if err := cs.Cloud.DeleteAttachment(ctx, attachmentID); err != nil {
-		return nil, status.Errorf(codes.Internal,
-			"failed to delete attachment record %s for volume %s: %v", attachmentID, volumeID, err)
-	} else {
-		attachmentRecordsDeleted.WithLabelValues().Inc()
+	} else if err := cs.deleteAttachmentIdempotent(ctx, volumeID, attachmentID); err != nil {
+		return nil, err
 	}
 
+	// Clearing the metadata is fatal, not advisory.
+	//
+	// This key is the driver's authoritative ownership record. Leaving it naming
+	// a record that no longer exists means the driver's own source of truth is
+	// wrong, and the migration handoff reads that metadata. Returning an error
+	// has the attacher retry until Cinder accepts the change; the retry is safe
+	// because deleting an already-deleted record now succeeds, so the loop
+	// converges instead of failing on the missing record.
+	//
+	// Ordering is load-bearing and must not be reversed: the record is deleted
+	// first so that a failure here leaves metadata pointing at nothing, which the
+	// next publish repairs. Clearing metadata first and then failing to delete
+	// the record would strand an unattributable record that no publish may adopt.
 	if err := cs.Cloud.DeleteVolumeMetadata(ctx, volumeID, []string{attachmentKey}); err != nil {
-		// Non-fatal: the record is gone, which is what releases the volume. A
-		// stale metadata key is recovered from on the next publish.
-		klog.Warningf("ControllerUnpublishVolume: failed to clear %s on volume %s: %v",
-			attachmentKey, volumeID, err)
+		return nil, status.Errorf(codes.Aborted,
+			"detached volume %s but failed to clear %s from its metadata: %v",
+			volumeID, attachmentKey, err)
 	}
 
 	// The next migration pod must not be published while the volume is still

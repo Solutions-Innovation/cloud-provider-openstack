@@ -1506,7 +1506,9 @@ Input: volume_id, staging_target_path, target_path, volume_capability
 │
 ├─ 1. Validate; reject Mount; require Block
 ├─ 2. Idempotency: Mounter.IsLikelyNotMountPointAttach(target_path)
-├─ 3. Read the staging record; resolve device_path
+├─ 3. Read the staging record; REQUIRE phase == staged, then resolve device_path
+│       a map-pending record describes an interrupted attempt and names no
+│       device, so it must not authorize a bind mount → FailedPrecondition
 ├─ 4. mapper.VerifyIdentity(device_path, identityFromRecord)   → FailedPrecondition
 │       (a recycled /dev/rbdN must never be bind-mounted into a pod)
 ├─ 5. Mounter.MakeFile(target_path)      # replaces a kubelet-created directory
@@ -2564,6 +2566,11 @@ re-litigate them:
 | D-15 | Persisting the attachment ID is fatal in both `CreateVolume` and `ControllerPublishVolume`, with rollback of the record (and, in `CreateVolume`, the new volume) | coupled to D-7: with no adoption of listed records, an unpersisted ID leaves a permanently unusable volume, so reporting success would be wrong. Rollback of the freshly created volume is safe because it is empty and unattached |
 | D-16 | Reusing stored `connection_info` (§6.10 step 6) is sound only because RBD connection information is host-independent | pool, image, monitors and FSID do not vary by connector host. This must **not** be copied into the iSCSI sibling, whose connection information is per-initiator: reusing a record attached to another host would return the wrong target |
 | D-17 | `cleanupVolume=true` is read and ignored with a warning rather than removed from the metadata contract | an operator who set the key during the iSCSI workflow gets a message naming the volume instead of silence |
+| D-18 | A 404 from `DeleteAttachment` is success in every caller, including rollback | the goal is "no such record", which a missing record already satisfies. Both callers are retried indefinitely by their sidecars, so treating 404 as failure would make a lost response or a manual cleanup unrecoverable |
+| D-19 | Clearing `csi.rbd.attachment_id` in `ControllerUnpublishVolume` is fatal, and the record is deleted *before* it | the key is the driver's authoritative ownership record and the Blueprint handoff reads it, so a stale ID must not be concealed. The order is what makes the retry safe: a failure after deletion leaves metadata pointing at nothing (repairable on the next publish), whereas the reverse leaves an unattributable record that no publish may adopt. D-18 is a prerequisite — without 404 tolerance the retry would fail forever on the already-deleted record |
+| D-20 | Reusing a live mapping requires **both** a valid ownership intent and kernel identity verification; neither alone suffices | the intent proves authorship, the kernel proves identity. Identity alone would let the driver adopt a platform Ceph-CSI mapping of the same pool/image, since nothing in kernel or sysfs state records who created a map |
+| D-21 | A mapping whose completed record fails to persist is rolled back, not left for a later stage to reuse | with ownership resting on the intent, such a mapping would be reused despite nothing having verified its size or recorded its device for unstage |
+| D-22 | Rollback verifies identity before unmapping and refuses if it fails; the intent is removed only after absence is confirmed | device numbers are recycled, so an unverified path may be another client's device. Retaining the intent keeps the mapping attributable, and reconciliation locates it by pool/image — the only lookup that survives renumbering |
 
 ---
 

@@ -50,16 +50,51 @@ const (
 	stagingIndexDir = "staged"
 )
 
-// StagingRecord is the durable per-volume staging hint.
+// StagingPhase records how far a stage got.
 //
-// It records what the driver believes it mapped. It is explicitly NOT the source
-// of truth: the kernel and Ceph are. Its purpose is to locate expected state so
-// reconciliation can compare it against reality.
+// The phase is what turns the record into an ownership *intent* rather than a
+// mere hint. It is written before `rbd device map` and only advanced afterwards,
+// so a crash anywhere in between still leaves durable proof that this driver —
+// and not platform Ceph-CSI, which shares the same kernel path on these nodes —
+// created any mapping that is found later.
+type StagingPhase string
+
+const (
+	// PhaseMapPending means the driver is about to map, or mapped and did not
+	// finish recording. A live mapping covered by this phase is driver-owned and
+	// may be reused or rolled back.
+	PhaseMapPending StagingPhase = "map-pending"
+
+	// PhaseStaged means the map completed, passed the identity gate, and was
+	// fully recorded.
+	PhaseStaged StagingPhase = "staged"
+)
+
+// Valid reports whether the phase is one this driver writes.
+func (p StagingPhase) Valid() bool {
+	return p == PhaseMapPending || p == PhaseStaged
+}
+
+// StagingRecord is the durable per-volume staging record.
+//
+// It serves two distinct purposes, and conflating them is a mistake:
+//
+//   - As a *hint*, it records what the driver believes it mapped. It is
+//     explicitly NOT the source of truth for identity — the kernel and Ceph are.
+//   - As an *ownership intent* (see Phase), it is the only durable evidence that
+//     this driver created a mapping. Kernel state can prove what an image is; it
+//     cannot prove who mapped it.
+//
+// Both are needed to reuse a live mapping: the intent proves authorship, the
+// kernel proves identity. Neither alone is sufficient.
 //
 // It carries no credential material — only the auth_username needed to rebuild
 // a keyring path.
 type StagingRecord struct {
-	Schema        int      `json:"schema"`
+	Schema int          `json:"schema"`
+	Phase  StagingPhase `json:"phase,omitempty"`
+	// VolumeID scopes the intent. A record found under one volume ID never
+	// authorizes anything for another.
 	VolumeID      string   `json:"volume_id"`
 	AttachmentID  string   `json:"attachment_id,omitempty"`
 	ClusterName   string   `json:"cluster_name,omitempty"`
@@ -78,6 +113,27 @@ type StagingRecord struct {
 	// TargetPath records the raw-block bind target, so a restart can recreate a
 	// missing link when the pod still needs it.
 	TargetPath string `json:"target_path,omitempty"`
+}
+
+// ProvesOwnershipOf reports whether this record is valid driver ownership
+// evidence for the given volume and image identity.
+//
+// Every condition matters:
+//   - the driver name guards against a record written by something else that
+//     happens to share the state directory;
+//   - the volume ID guards against one volume's intent authorizing another's
+//     mapping;
+//   - the identity guards against an intent being reused after the volume was
+//     deleted and its ID recycled onto a different image;
+//   - the phase guards against a record shape this build does not understand.
+func (r *StagingRecord) ProvesOwnershipOf(volumeID string, want ImageIdentity) bool {
+	if r == nil || r.Driver != driverName || !r.Phase.Valid() {
+		return false
+	}
+	if r.VolumeID == "" || r.VolumeID != volumeID {
+		return false
+	}
+	return want.IsComplete() && r.Identity() == want
 }
 
 // Identity returns the ImageIdentity the record claims.
@@ -110,7 +166,36 @@ func (r *StagingRecord) MonitorAddrs() []openstack.MonAddr {
 	return out
 }
 
-// newStagingRecord builds a record from validated connection information.
+// newMapIntentRecord builds the pre-map ownership intent.
+//
+// Device fields are deliberately absent: the intent is written before the map
+// exists, so it can only claim *which image* the driver is about to map, not
+// which device it became. Identity is re-derived from the kernel afterwards.
+func newMapIntentRecord(volumeID, attachmentID string, ci *openstack.RBDConnectionInfo,
+	generation int) *StagingRecord {
+	monitors := make([]string, 0, len(ci.Monitors))
+	for _, m := range ci.Monitors {
+		monitors = append(monitors, m.String())
+	}
+	return &StagingRecord{
+		Schema:        stagingRecordSchema,
+		Phase:         PhaseMapPending,
+		VolumeID:      volumeID,
+		AttachmentID:  attachmentID,
+		ClusterName:   ci.ClusterName,
+		ClusterFSID:   ci.ClusterFSID,
+		Pool:          ci.Pool,
+		Image:         ci.Image,
+		Monitors:      monitors,
+		AuthUsername:  ci.AuthUsername,
+		Exclusive:     true,
+		MapGeneration: generation,
+		StagedAt:      time.Now().UTC().Format(time.RFC3339),
+		Driver:        driverName,
+	}
+}
+
+// newStagingRecord builds a completed record from validated connection information.
 func newStagingRecord(volumeID, attachmentID string, ci *openstack.RBDConnectionInfo,
 	dev MappedDevice, generation int, sizeBytes int64) *StagingRecord {
 	monitors := make([]string, 0, len(ci.Monitors))
@@ -119,6 +204,7 @@ func newStagingRecord(volumeID, attachmentID string, ci *openstack.RBDConnection
 	}
 	return &StagingRecord{
 		Schema:        stagingRecordSchema,
+		Phase:         PhaseStaged,
 		VolumeID:      volumeID,
 		AttachmentID:  attachmentID,
 		ClusterName:   ci.ClusterName,
@@ -154,6 +240,23 @@ func (s *stagingStore) recordPath(stagingTargetPath string) string {
 // indexPath returns the node-scoped copy for this volume.
 func (s *stagingStore) indexPath(volumeID string) string {
 	return filepath.Join(s.opts.StateDir, stagingIndexDir, volumeID+".json")
+}
+
+// WriteIntent durably persists a pre-map ownership intent.
+//
+// Only the node-scoped index is written. The intent must be findable after a
+// crash by startup reconciliation, which enumerates the index; the kubelet
+// staging directory is not a dependable place for that, since it can be absent
+// or recreated across a reboot.
+//
+// The write is synchronous and errors are returned, never logged and ignored:
+// mapping without a durable intent is precisely the state this prevents.
+func (s *stagingStore) WriteIntent(rec *StagingRecord) error {
+	if rec.Phase != PhaseMapPending {
+		return fmt.Errorf("refusing to write intent for volume %s in phase %q, want %q",
+			rec.VolumeID, rec.Phase, PhaseMapPending)
+	}
+	return s.WriteIndexOnly(rec)
 }
 
 // Write persists the record to both the staging path and the node-scoped index.
@@ -212,8 +315,23 @@ func readStagingRecordFile(path string) (*StagingRecord, error) {
 		return nil, fmt.Errorf("staging record %s has unsupported schema %d (want %d)",
 			path, rec.Schema, stagingRecordSchema)
 	}
+	// An absent phase means the record predates the phase field. Every such
+	// record was written at the end of a successful stage — that was the only
+	// place the store was called — so treating it as staged is accurate rather
+	// than merely convenient.
+	if rec.Phase == "" {
+		rec.Phase = PhaseStaged
+	}
+	if !rec.Phase.Valid() {
+		return nil, fmt.Errorf("staging record %s has unknown phase %q", path, rec.Phase)
+	}
 	if rec.VolumeID == "" || rec.Pool == "" || rec.Image == "" {
 		return nil, fmt.Errorf("staging record %s is missing required fields", path)
+	}
+	// A completed record must name the device it completed on; a map-pending one
+	// must not be trusted to, because it is written before the device exists.
+	if rec.Phase == PhaseStaged && rec.DevicePath == "" {
+		return nil, fmt.Errorf("staging record %s is %s but names no device", path, PhaseStaged)
 	}
 	return &rec, nil
 }

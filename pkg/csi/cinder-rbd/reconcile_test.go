@@ -77,6 +77,16 @@ func (f *reconcileFixture) indexRecord(t *testing.T, volumeID, pool, image, devi
 	require.NoError(t, f.staging.WriteIndexOnly(rec))
 }
 
+// indexIntent persists a map-pending ownership intent into the node index,
+// simulating a crash between `rbd device map` and the completed record.
+func (f *reconcileFixture) indexIntent(t *testing.T, volumeID, pool, image string) {
+	t.Helper()
+	ci := labConnectionInfo()
+	ci.Pool = pool
+	ci.Image = image
+	require.NoError(t, f.staging.WriteIntent(newMapIntentRecord(volumeID, testAttachmentID, ci, 1)))
+}
+
 func liveDevice(id int, pool, image string) MappedDevice {
 	return MappedDevice{
 		ID: id, Pool: pool, Image: image,
@@ -104,6 +114,75 @@ func TestReconcile_AdoptsMatchingLiveMapping(t *testing.T) {
 	assert.Zero(t, result.Isolated)
 	f.mapper.AssertNotCalled(t, "Unmap")
 	f.mapper.AssertNotCalled(t, "Map")
+}
+
+// A crash between the map and the completed record leaves a map-pending intent
+// over a live mapping. The intent proves the mapping is the driver's, so
+// reconciliation finalizes the interrupted stage instead of isolating it.
+func TestReconcile_FinalizesInterruptedMapPendingStage(t *testing.T) {
+	f := newReconcileFixture(t)
+	f.indexIntent(t, "vol-a", "cinder-volumes", "img-a")
+
+	f.mapper.On("ListMapped", mock.Anything).
+		Return([]MappedDevice{liveDevice(7, "cinder-volumes", "img-a")}, nil)
+	f.mapper.On("VerifyIdentity", mock.Anything, devicePathFromID(7), mock.Anything).Return(nil)
+
+	result, err := f.rec.Reconcile(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, result.Adopted)
+	assert.Zero(t, result.Isolated)
+	f.mapper.AssertNotCalled(t, "Unmap")
+	f.mapper.AssertNotCalled(t, "Map")
+
+	// The record is advanced to staged and given the device the kernel reports,
+	// which the intent could not have known.
+	rec, err := f.staging.ReadIndex("vol-a")
+	require.NoError(t, err)
+	assert.Equal(t, PhaseStaged, rec.Phase)
+	assert.Equal(t, devicePathFromID(7), rec.DevicePath)
+	assert.Equal(t, 7, rec.DeviceID)
+}
+
+// An intent whose mapping never materialized, or was rolled back, is discarded:
+// there is no mapping for it to orphan.
+func TestReconcile_DiscardsMapPendingIntentWithNoLiveMapping(t *testing.T) {
+	f := newReconcileFixture(t)
+	f.indexIntent(t, "vol-a", "cinder-volumes", "img-a")
+
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{}, nil)
+
+	result, err := f.rec.Reconcile(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, result.Unstaged)
+	assert.Zero(t, result.Adopted)
+	_, err = f.staging.ReadIndex("vol-a")
+	require.Error(t, err)
+}
+
+// An intent over a mapping that fails verification is isolated, not finalized:
+// authorship is proven but identity is not, and both are required.
+func TestReconcile_IsolatesMapPendingIntentOnIdentityMismatch(t *testing.T) {
+	f := newReconcileFixture(t)
+	f.indexIntent(t, "vol-a", "cinder-volumes", "img-a")
+
+	f.mapper.On("ListMapped", mock.Anything).
+		Return([]MappedDevice{liveDevice(7, "cinder-volumes", "img-a")}, nil)
+	f.mapper.On("VerifyIdentity", mock.Anything, devicePathFromID(7), mock.Anything).
+		Return(ErrIdentityMismatch)
+
+	result, err := f.rec.Reconcile(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, result.Isolated)
+	assert.Zero(t, result.Adopted)
+	f.mapper.AssertNotCalled(t, "Unmap")
+
+	// The intent survives: it is the only thing keeping the mapping attributable.
+	rec, err := f.staging.ReadIndex("vol-a")
+	require.NoError(t, err)
+	assert.Equal(t, PhaseMapPending, rec.Phase)
 }
 
 // Kernel device numbers are reused across a reboot, so an adopted record must be

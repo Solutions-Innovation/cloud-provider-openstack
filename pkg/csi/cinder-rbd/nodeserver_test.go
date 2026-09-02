@@ -30,6 +30,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder-rbd/openstack"
 	mountutil "k8s.io/cloud-provider-openstack/pkg/util/mount"
 )
@@ -115,6 +116,15 @@ func createFakeDevice(t *testing.T, dev *MappedDevice) {
 	dev.DevicePath = p
 }
 
+// writeOwnershipIntent persists a map-pending intent, simulating an attempt that
+// mapped and then died before recording completion.
+func writeOwnershipIntent(t *testing.T, f *nodeFixture, volumeID string) *StagingRecord {
+	t.Helper()
+	rec := newMapIntentRecord(volumeID, testAttachmentID, labConnectionInfo(), 1)
+	require.NoError(t, f.ns.Staging.WriteIntent(rec))
+	return rec
+}
+
 // ── NodeGetInfo ──────────────────────────────────────────────────────────────
 
 func TestNodeGetInfo_ReturnsBareHostname(t *testing.T) {
@@ -196,12 +206,14 @@ func TestNodeStageVolume_MapsExclusivelyAndRecordsState(t *testing.T) {
 	assert.Equal(t, rec.DevicePath, indexed.DevicePath)
 }
 
-// Idempotency is keyed on live kernel state. A retried stage must adopt the
-// existing mapping rather than attempt a second map, which would be denied.
-func TestNodeStageVolume_AdoptsExistingMappingWithoutRemapping(t *testing.T) {
+// Idempotency requires BOTH an ownership intent and kernel identity. With a
+// valid intent from the interrupted attempt, a retried stage reuses the mapping
+// rather than attempting a second map, which the exclusive lock would deny.
+func TestNodeStageVolume_ReusesOwnedMappingWithoutRemapping(t *testing.T) {
 	f := newNodeFixture(t)
 	dev := mappedDevice(5)
 	createFakeDevice(t, &dev)
+	writeOwnershipIntent(t, f, testVolumeID)
 
 	f.creds.On("Load", mock.Anything, "cinder").Return(NewTestCredential("cinder", redactedKey), nil)
 	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{dev}, nil)
@@ -217,6 +229,119 @@ func TestNodeStageVolume_AdoptsExistingMappingWithoutRemapping(t *testing.T) {
 	require.NoError(t, err)
 
 	f.mapper.AssertNotCalled(t, "Map")
+
+	// The reuse advances the intent to staged rather than leaving it pending.
+	rec, readErr := f.ns.Staging.ReadIndex(testVolumeID)
+	require.NoError(t, readErr)
+	assert.Equal(t, PhaseStaged, rec.Phase)
+}
+
+// A live mapping with matching identity but NO ownership intent must be isolated.
+//
+// This is the platform Ceph-CSI hazard: identity proves what an image is, never
+// who mapped it. Adopting on identity alone would let the driver hand a foreign
+// device to a migration pod.
+func TestNodeStageVolume_IsolatesMatchingMappingWithoutOwnershipIntent(t *testing.T) {
+	f := newNodeFixture(t)
+	dev := mappedDevice(5)
+	createFakeDevice(t, &dev)
+
+	f.creds.On("Load", mock.Anything, "cinder").Return(NewTestCredential("cinder", redactedKey), nil)
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{dev}, nil)
+
+	_, err := f.ns.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
+		VolumeId:          testVolumeID,
+		StagingTargetPath: f.staging,
+		VolumeCapability:  blockCapability(),
+		PublishContext:    stagePublishContext(),
+	})
+	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
+	assert.Contains(t, status.Convert(err).Message(), "ownership intent")
+
+	f.mapper.AssertNotCalled(t, "Map")
+	f.mapper.AssertNotCalled(t, "Unmap")
+	// Isolation is registered so later attempts fail fast with the same reason.
+	_, isolated := f.ns.Isolation.Get(testVolumeID)
+	assert.True(t, isolated)
+}
+
+// An intent belonging to a different volume must not authorize this one.
+func TestNodeStageVolume_IntentForAnotherVolumeDoesNotAuthorize(t *testing.T) {
+	f := newNodeFixture(t)
+	dev := mappedDevice(5)
+	createFakeDevice(t, &dev)
+	writeOwnershipIntent(t, f, "some-other-volume")
+
+	f.creds.On("Load", mock.Anything, "cinder").Return(NewTestCredential("cinder", redactedKey), nil)
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{dev}, nil)
+
+	_, err := f.ns.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
+		VolumeId:          testVolumeID,
+		StagingTargetPath: f.staging,
+		VolumeCapability:  blockCapability(),
+		PublishContext:    stagePublishContext(),
+	})
+	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
+	f.mapper.AssertNotCalled(t, "Map")
+	f.mapper.AssertNotCalled(t, "Unmap")
+}
+
+// The intent must be durable before the map call, not after it: a crash in
+// between is the whole reason it exists.
+func TestNodeStageVolume_WritesOwnershipIntentBeforeMapping(t *testing.T) {
+	f := newNodeFixture(t)
+	dev := mappedDevice(5)
+	createFakeDevice(t, &dev)
+
+	f.creds.On("Load", mock.Anything, "cinder").Return(NewTestCredential("cinder", redactedKey), nil)
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{}, nil).Once()
+	f.mapper.On("Map", mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) {
+			// Observed from inside Map: the intent is already on disk.
+			rec, err := f.ns.Staging.ReadIndex(testVolumeID)
+			require.NoError(t, err, "the ownership intent must exist before rbd device map")
+			assert.Equal(t, PhaseMapPending, rec.Phase)
+			assert.Equal(t, testVolumeID, rec.VolumeID)
+			assert.Empty(t, rec.DevicePath, "the intent cannot know the device yet")
+		}).
+		Return(dev, nil).Once()
+	f.mapper.On("VerifyIdentity", mock.Anything, dev.DevicePath, mock.Anything).Return(nil)
+	f.mapper.On("DeviceSize", mock.Anything, dev.DevicePath).Return(int64(1073741824), nil)
+	f.mapper.On("LockHolders", mock.Anything, mock.Anything).Return([]string{"client.1@ip"}, nil)
+
+	_, err := f.ns.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
+		VolumeId:          testVolumeID,
+		StagingTargetPath: f.staging,
+		VolumeCapability:  blockCapability(),
+		PublishContext:    stagePublishContext(),
+	})
+	require.NoError(t, err)
+
+	rec, err := f.ns.Staging.ReadIndex(testVolumeID)
+	require.NoError(t, err)
+	assert.Equal(t, PhaseStaged, rec.Phase, "a completed stage advances the intent")
+	assert.Equal(t, dev.DevicePath, rec.DevicePath)
+}
+
+// A map that fails without creating a mapping must not leave an intent behind.
+func TestNodeStageVolume_FailedMapDiscardsOwnershipIntent(t *testing.T) {
+	f := newNodeFixture(t)
+
+	f.creds.On("Load", mock.Anything, "cinder").Return(NewTestCredential("cinder", redactedKey), nil)
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{}, nil)
+	f.mapper.On("Map", mock.Anything, mock.Anything).
+		Return(MappedDevice{}, assert.AnError).Once()
+
+	_, err := f.ns.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
+		VolumeId:          testVolumeID,
+		StagingTargetPath: f.staging,
+		VolumeCapability:  blockCapability(),
+		PublishContext:    stagePublishContext(),
+	})
+	require.Error(t, err)
+
+	_, readErr := f.ns.Staging.ReadIndex(testVolumeID)
+	require.Error(t, readErr, "no mapping was created, so no ownership claim may remain")
 }
 
 // A device occupying the same pool/image that fails verification must be
@@ -285,18 +410,54 @@ func TestNodeStageVolume_ExclusiveLockDeniedNamesHolder(t *testing.T) {
 	assert.Contains(t, err.Error(), "client.999")
 }
 
-// A failed identity gate must roll back the mapping this call created, and must
-// remove the generated key material.
+// A gate failure that is not itself an identity problem must roll back the
+// mapping this call created, and must remove the generated key material.
 func TestNodeStageVolume_IdentityGateFailureRollsBackMapping(t *testing.T) {
 	f := newNodeFixture(t)
 	dev := mappedDevice(5)
+	createFakeDevice(t, &dev)
+
+	f.creds.On("Load", mock.Anything, "cinder").Return(NewTestCredential("cinder", redactedKey), nil)
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{}, nil).Once()
+	f.mapper.On("Map", mock.Anything, mock.Anything).Return(dev, nil)
+	f.mapper.On("VerifyIdentity", mock.Anything, dev.DevicePath, mock.Anything).Return(nil)
+	// Gate check: a non-positive size fails the gate while identity still holds.
+	f.mapper.On("DeviceSize", mock.Anything, dev.DevicePath).Return(int64(0), nil)
+	f.mapper.On("Unmap", mock.Anything, dev.DevicePath, mock.Anything).Return(nil)
+	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{}, nil)
+
+	_, err := f.ns.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
+		VolumeId:          testVolumeID,
+		StagingTargetPath: f.staging,
+		VolumeCapability:  blockCapability(),
+		PublishContext:    stagePublishContext(),
+	})
+	require.Error(t, err)
+
+	f.mapper.AssertCalled(t, "Unmap", mock.Anything, dev.DevicePath, mock.Anything)
+	// Key material must not outlive the failed attempt.
+	assert.NoDirExists(t, volumeRuntimeDir(f.opts, testVolumeID))
+	// Absence confirmed, so no ownership claim remains.
+	_, readErr := f.ns.Staging.ReadIndex(testVolumeID)
+	require.Error(t, readErr)
+}
+
+// When the gate fails *because* identity does not match, the device must not be
+// unmapped: either the kernel handed back something unexpected or the device
+// number was recycled, and in both cases the device is not ours to remove.
+//
+// The intent is kept instead, because reconciliation locates a mapping by
+// pool/image — the only lookup that survives device renumbering.
+func TestNodeStageVolume_IdentityMismatchLeavesDeviceAndRetainsIntent(t *testing.T) {
+	f := newNodeFixture(t)
+	dev := mappedDevice(5)
+	createFakeDevice(t, &dev)
 
 	f.creds.On("Load", mock.Anything, "cinder").Return(NewTestCredential("cinder", redactedKey), nil)
 	f.mapper.On("ListMapped", mock.Anything).Return([]MappedDevice{}, nil).Once()
 	f.mapper.On("Map", mock.Anything, mock.Anything).Return(dev, nil)
 	f.mapper.On("VerifyIdentity", mock.Anything, dev.DevicePath, mock.Anything).
 		Return(ErrIdentityMismatch)
-	f.mapper.On("Unmap", mock.Anything, dev.DevicePath, mock.Anything).Return(nil)
 
 	_, err := f.ns.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 		VolumeId:          testVolumeID,
@@ -306,9 +467,12 @@ func TestNodeStageVolume_IdentityGateFailureRollsBackMapping(t *testing.T) {
 	})
 	assert.Equal(t, codes.FailedPrecondition, codeOf(t, err))
 
-	f.mapper.AssertCalled(t, "Unmap", mock.Anything, dev.DevicePath, mock.Anything)
-	// Key material must not outlive the failed attempt.
+	f.mapper.AssertNotCalled(t, "Unmap")
 	assert.NoDirExists(t, volumeRuntimeDir(f.opts, testVolumeID))
+
+	rec, readErr := f.ns.Staging.ReadIndex(testVolumeID)
+	require.NoError(t, readErr, "the intent must survive so the mapping stays attributable")
+	assert.Equal(t, PhaseMapPending, rec.Phase)
 }
 
 func TestNodeStageVolume_RejectsInvalidRequests(t *testing.T) {

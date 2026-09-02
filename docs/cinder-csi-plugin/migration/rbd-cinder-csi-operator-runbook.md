@@ -54,13 +54,26 @@ message on **stderr with exit status 0 is harmless noise**, not a failure.
 ### The driver's own state
 
 ```bash
-# Node-scoped staging index: one file per staged volume.
+# Node-scoped ownership index: one file per volume the driver has mapped or is
+# about to map. Check "phase" first.
 ls -l /var/lib/cinder-rbd-csi/staged/
 cat /var/lib/cinder-rbd-csi/staged/<volume-id>.json
 
 # Generated Ceph config and keyring, per volume. The keyring is mode 0400.
 ls -l /run/cinder-rbd-csi/<volume-id>/
 ```
+
+The `phase` field is what makes these files ownership evidence rather than a
+cache:
+
+| `phase` | Meaning |
+|---|---|
+| `map-pending` | written *before* `rbd device map`. Either a map is in flight, or one completed and something interrupted the driver before it finished recording. Startup reconciliation finalizes it if the mapping is live, discards it if not. |
+| `staged` | the map completed and passed the identity gate. |
+
+Nothing in kernel or sysfs state records *who* created a mapping, so this file is
+the only proof the driver owns one. Treat it as state, not as a cache — see §1e
+before deleting any of it.
 
 Never paste the contents of a `keyring` file into a ticket, log, or chat.
 
@@ -78,24 +91,47 @@ Never paste the contents of a `keyring` file into a ticket, log, or chat.
 
 ## 1. Isolated mapping
 
-**Symptom.** `NodeStageVolume` fails with:
+**Symptom.** `NodeStageVolume` fails with one of:
 
 ```
 volume <id> is isolated on this node and will not be served: device /dev/rbdN
 occupies <pool>/<image> but failed identity verification ...
 ```
 
+```
+device /dev/rbdN maps <pool>/<image> but no valid driver ownership intent covers
+it (intent present: false); it may belong to another Ceph client, so it is
+neither adopted nor unmapped
+```
+
 and `cinder_rbd_csi_isolated_mappings` is non-zero. The pod stays in
 `ContainerCreating`.
 
 **What it means.** A live kernel mapping occupies the pool and image the driver
-expected, but its identity does not match — most often the cluster FSID differs,
-or sysfs and `rbd device list` disagree. The driver has **not** adopted it and
-has **not** unmapped it.
+expected, but one of the two things required to reuse it is missing:
 
-**Why the driver stops.** Adopting the device could expose an unrelated image to
-the pod. Unmapping it could fault whichever client actually owns it. Neither is
+| Missing | Meaning |
+|---|---|
+| *identity* — first message | the device is not the image the driver expected; usually the cluster FSID differs, or sysfs and `rbd device list` disagree |
+| *ownership* — second message | the image matches, but nothing proves this driver mapped it. There is no `map-pending`/`staged` record under `/var/lib/cinder-rbd-csi/staged/<volume-id>.json`, or the one there names a different volume or image |
+
+The driver has **not** adopted it and has **not** unmapped it in either case.
+
+**Why the driver stops.** Kernel and sysfs state can prove *what* an image is;
+nothing in them records *who* mapped it. Platform Ceph-CSI maps through the same
+kernel interface on these nodes, so a matching pool/image is not evidence of
+ownership. Adopting the device could hand an unrelated image to the pod;
+unmapping it could fault whichever client actually owns it. Neither is
 recoverable automatically.
+
+An ownership failure most often means one of:
+
+- the volume was staged by an **older build** whose state directory was wiped, or
+  `[RBD] state-dir` was changed or is not persistent across restarts;
+- a **rollback could not confirm absence**, so a real driver mapping exists with
+  its intent deliberately retained (see §1e — this case is *not* an error to
+  clear by hand);
+- the mapping genuinely belongs to **another client**.
 
 ### Diagnosis
 
@@ -121,6 +157,7 @@ Compare the three. The likely cases:
 | pool/image match but `image_id` differs | the Cinder volume was deleted and recreated under the same name | §1b |
 | the device is in `kube-rbd` | platform Ceph-CSI mapping; the record is stale | §1c |
 | sysfs and `rbd device list` disagree | kernel state is inconsistent | §1d |
+| no record file, or it names another volume/image | ownership cannot be proven | §1e |
 
 ### 1a. FSID mismatch
 
@@ -149,6 +186,11 @@ cat /sys/bus/rbd/devices/$N/image_id
 rm /var/lib/cinder-rbd-csi/staged/<volume-id>.json
 ```
 
+Removing the record is safe here only because the image it names is confirmed
+absent, so the record is not ownership evidence for anything live. Never remove a
+record whose image *is* mapped: that is the driver's proof of ownership, and
+without it the mapping becomes unattributable (§1e).
+
 Then delete the pod so kubelet retries staging. The isolation set is in-memory,
 so restarting the node plugin also clears it:
 
@@ -167,6 +209,52 @@ sysfs and the CLI disagreeing indicates a kernel or udev problem rather than a
 driver one. Drain the node and reboot it. Do not attempt a manual unmap: the
 device identity cannot be established, which is precisely the condition that
 makes unmapping unsafe.
+
+### 1e. Mapping with no ownership intent
+
+First establish whether the mapping is the driver's. Check the pool before
+anything else:
+
+```bash
+N=<device-number-from-the-error>
+cat /sys/bus/rbd/devices/$N/pool        # kube-rbd ⇒ platform Ceph-CSI, see §1c
+ls -l /var/lib/cinder-rbd-csi/staged/   # what the driver has recorded
+```
+
+Then check whether a rollback deliberately left the intent in place — the driver
+says so explicitly when it happens:
+
+```bash
+kubectl -n <namespace> logs -l app=cinder-rbd-csi-nodeplugin \
+  -c cinder-rbd-csi-plugin | grep -i "intent is retained"
+```
+
+| Finding | Action |
+|---|---|
+| pool is `kube-rbd` | §1c. Not the driver's mapping. |
+| a `map-pending` record exists for this volume and image | Nothing to do by hand. Restart the node plugin pod; startup reconciliation finalizes the interrupted stage. |
+| `state-dir` is empty or was recently changed | The intent was lost, not absent. Confirm `[RBD] state-dir` is on persistent storage, then treat the mapping as unowned below. |
+| no record, pool is driver-owned, no rollback message | Treat as unowned below. |
+
+**An unowned mapping in a driver-owned pool is an operator decision, not a driver
+one.** Confirm nothing is using it before removing it:
+
+```bash
+POOL=$(cat /sys/bus/rbd/devices/$N/pool)
+IMG=$(cat /sys/bus/rbd/devices/$N/name)
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- rbd status ${POOL}/${IMG}
+lsblk /dev/rbd$N        # any holder or mountpoint means it is in use
+```
+
+Only with no watcher, no lock holder and no holder on the block device is manual
+unmapping defensible:
+
+```bash
+rbd device unmap --conf <generated-conf> /dev/rbd$N
+```
+
+Losing this race corrupts data in whatever *is* using the device, so if any of
+the three checks is inconclusive, stop and escalate rather than proceeding.
 
 ---
 
@@ -548,7 +636,7 @@ consumer. Do not force it; return to the check above.
 
 | Path | Contents | Safe to delete? |
 |---|---|---|
-| `/var/lib/cinder-rbd-csi/staged/<volume-id>.json` | node-scoped staging record | yes — the driver remaps on the next stage |
+| `/var/lib/cinder-rbd-csi/staged/<volume-id>.json` | node-scoped ownership intent and staging record | **no** while the image is mapped — this file is the only proof the driver owns the mapping, and deleting it makes the volume isolate (§1e). Safe once nothing is mapped. |
 | `<kubelet>/plugins/kubernetes.io/csi/.../globalmount/rbd-staging.json` | per-volume staging record | yes, same |
 | `/run/cinder-rbd-csi/ceph.conf` | cluster-scoped generated config, no secrets | yes — rewritten at startup |
 | `/run/cinder-rbd-csi/<volume-id>/ceph.conf` | per-volume config, no secrets | yes, while unmapped |

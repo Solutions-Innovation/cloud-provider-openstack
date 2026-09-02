@@ -22,6 +22,7 @@ package rbd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -147,15 +148,32 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context,
 			volumeID, entry.Detail)
 	}
 
-	// Step 4: idempotency by live-map identity.
-	adopted, err := ns.adoptExistingMapping(ctx, want)
+	// Step 4: reuse a live mapping only if this driver can prove it created it.
+	//
+	// The intent is read before the kernel is consulted so that a mapping found
+	// without one is treated as foreign rather than as something to explain away.
+	intent, intentErr := ns.Staging.ReadIndex(volumeID)
+	if intentErr != nil {
+		if !errors.Is(intentErr, os.ErrNotExist) {
+			// An unreadable intent cannot prove ownership. Do not fall back to
+			// identity alone: that is exactly the adoption this guards against.
+			klog.Warningf("NodeStageVolume: ownership intent for volume %s is unusable (%v); "+
+				"treating it as absent", volumeID, intentErr)
+		}
+		intent = nil
+	}
+
+	reused, err := ns.reuseOwnedMapping(ctx, volumeID, want, intent)
 	if err != nil {
 		return nil, err
 	}
-	if adopted != nil {
-		klog.V(2).Infof("NodeStageVolume: adopting existing mapping %s for %s",
-			adopted.DevicePath, want)
-		if err := ns.recordStaging(ctx, stagingPath, volumeID, attachmentID, ci, *adopted); err != nil {
+	if reused != nil {
+		klog.V(2).Infof("NodeStageVolume: reusing driver-owned mapping %s for %s (intent phase %s)",
+			reused.DevicePath, want, intent.Phase)
+		// Finalize at the intent's generation: the mapping is not new, so
+		// allocating a fresh generation would misreport it as a remap.
+		if err := ns.recordStaging(ctx, stagingPath, volumeID, attachmentID, ci,
+			*reused, intent.MapGeneration); err != nil {
 			return nil, err
 		}
 		return &csi.NodeStageVolumeResponse{}, nil
@@ -167,21 +185,28 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context,
 		return nil, status.Errorf(codes.Internal, "failed to prepare Ceph configuration: %v", err)
 	}
 
-	mapReq := MapRequest{
-		Identity:    want,
-		Monitors:    ci.Monitors,
-		UserID:      cred.UserID,
-		ConfPath:    rf.ConfPath,
-		KeyringPath: rf.KeyringPath,
-		Exclusive:   true,
-		Timeout:     ns.Opts.MapTimeoutDuration(),
+	// Step 6: persist the ownership intent BEFORE mapping.
+	//
+	// This is the only durable evidence that a mapping found later belongs to
+	// this driver. Kernel and sysfs state can prove *what* an image is; nothing
+	// in them records *who* mapped it, and platform Ceph-CSI maps through the
+	// same kernel interface on these nodes. Writing the intent first means a
+	// crash at any point after this leaves a recoverable state instead of an
+	// unattributable mapping.
+	generation := ns.Staging.NextGeneration(volumeID)
+	if err := ns.Staging.WriteIntent(newMapIntentRecord(volumeID, attachmentID, ci, generation)); err != nil {
+		_ = removeRuntimeFiles(ns.Opts, volumeID)
+		return nil, status.Errorf(codes.Internal,
+			"refusing to map %s without a durable ownership intent: %v", want, err)
 	}
 
-	// Step 6: exclusive map. No fallback exists.
-	dev, err := ns.Mapper.Map(ctx, mapReq)
+	// Step 7: exclusive map. No fallback exists.
+	dev, err := ns.Mapper.Map(ctx, mapRequestFor(want, ci, cred, rf, ns.Opts))
 	if err != nil {
+		ns.discardIntentIfUnmapped(ctx, volumeID, want)
 		_ = removeRuntimeFiles(ns.Opts, volumeID)
 		if errors.Is(err, ErrExclusiveLockDenied) {
+			mapReq := mapRequestFor(want, ci, cred, rf, ns.Opts)
 			holders, lockErr := ns.Mapper.LockHolders(ctx, mapReq)
 			if lockErr == nil && len(holders) > 0 {
 				return nil, status.Errorf(codes.FailedPrecondition,
@@ -194,58 +219,206 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context,
 		return nil, status.Errorf(codes.Unavailable, "failed to map %s: %v", want, err)
 	}
 
-	// Step 7: the identity gate. Any failure unmaps what we just created.
-	sizeBytes, err := ns.identityGate(ctx, dev, want, mapReq)
+	// Step 8: the identity gate. Any failure rolls back what we just created.
+	sizeBytes, err := ns.identityGate(ctx, dev, want, mapRequestFor(want, ci, cred, rf, ns.Opts))
 	if err != nil {
-		if unmapErr := ns.Mapper.Unmap(ctx, dev.DevicePath, ns.Opts.UnmapTimeoutDuration()); unmapErr != nil {
-			klog.Errorf("NodeStageVolume: failed to roll back mapping %s: %v", dev.DevicePath, unmapErr)
-		}
-		_ = removeRuntimeFiles(ns.Opts, volumeID)
-		return nil, err
+		return nil, ns.rollbackMap(ctx, volumeID, dev, want, err)
 	}
 
-	// Step 8: record the mapping.
-	if err := ns.recordStagingWithSize(stagingPath, volumeID, attachmentID, ci, dev, sizeBytes); err != nil {
-		// The mapping is good; only the hint failed to persist. Unmapping here
-		// would throw away working state, and reconciliation adopts the mapping
-		// by pool/image on the next stage.
-		klog.Errorf("NodeStageVolume: mapped %s but failed to write the staging record: %v",
-			dev.DevicePath, err)
-		return nil, status.Errorf(codes.Internal,
-			"mapped %s but failed to persist staging state: %v", dev.DevicePath, err)
+	// Step 9: record the mapping and advance the intent to staged.
+	if err := ns.recordStagingWithSize(stagingPath, volumeID, attachmentID, ci,
+		dev, generation, sizeBytes); err != nil {
+		// The mapping cannot be left live. With ownership proven only by an
+		// intent, a mapping whose completed record never landed would be reused
+		// on the strength of that intent — but nothing would have verified the
+		// size or recorded the device for unstage. Roll it back so the retry is
+		// a clean map.
+		return nil, ns.rollbackMap(ctx, volumeID, dev, want,
+			status.Errorf(codes.Internal,
+				"mapped %s but failed to persist staging state: %v", dev.DevicePath, err))
 	}
 
 	klog.V(2).Infof("NodeStageVolume: staged volume %s as %s (%s)", volumeID, dev.DevicePath, want)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-// adoptExistingMapping looks for a live mapping of the same pool/image.
+// mapRequestFor assembles the mapper request. Exclusivity is not negotiable.
+func mapRequestFor(want ImageIdentity, ci *openstack.RBDConnectionInfo, cred *CephCredential,
+	rf runtimeFiles, opts openstack.RBDOpts) MapRequest {
+	return MapRequest{
+		Identity:    want,
+		Monitors:    ci.Monitors,
+		UserID:      cred.UserID,
+		ConfPath:    rf.ConfPath,
+		KeyringPath: rf.KeyringPath,
+		Exclusive:   true,
+		Timeout:     opts.MapTimeoutDuration(),
+	}
+}
+
+// reuseOwnedMapping returns a live mapping of want when, and only when, a valid
+// ownership intent proves this driver created it.
 //
-// A matching mapping is adopted so a retried stage is a no-op. A mapping that
-// occupies the same pool/image but fails identity verification is ISOLATED: the
-// driver refuses to serve the volume and does not unmap, because the device may
-// belong to another client — platform Ceph-CSI uses the same kernel path on
-// these nodes.
-func (ns *nodeServer) adoptExistingMapping(ctx context.Context, want ImageIdentity) (*MappedDevice, error) {
+// Two independent facts are required and neither substitutes for the other:
+//
+//   - the intent proves *authorship* — that this driver mapped this image for
+//     this volume;
+//   - kernel verification proves *identity* — that the device really is that
+//     image on the expected cluster.
+//
+// A live mapping without a valid intent is isolated, never adopted and never
+// unmapped. It may belong to platform Ceph-CSI, which shares the kernel RBD
+// interface on these nodes; unmapping it could fault an unrelated workload, and
+// adopting it would hand a foreign device to a migration pod. There is no
+// deployment mode, all-in-one included, in which identity alone is sufficient.
+func (ns *nodeServer) reuseOwnedMapping(ctx context.Context, volumeID string,
+	want ImageIdentity, intent *StagingRecord) (*MappedDevice, error) {
+	found, err := ns.locateMapping(ctx, want)
+	if err != nil {
+		return nil, err
+	}
+	if found == nil {
+		return nil, nil
+	}
+
+	if !intent.ProvesOwnershipOf(volumeID, want) {
+		return nil, ns.isolateMapping(volumeID, want, *found, fmt.Sprintf(
+			"device %s maps %s but no valid driver ownership intent covers it "+
+				"(intent present: %t); it may belong to another Ceph client, so it is "+
+				"neither adopted nor unmapped",
+			found.DevicePath, want, intent != nil))
+	}
+
+	if err := ns.Mapper.VerifyIdentity(ctx, found.DevicePath, want); err != nil {
+		return nil, ns.isolateMapping(volumeID, want, *found, fmt.Sprintf(
+			"device %s is covered by an ownership intent but failed identity "+
+				"verification (%v); it is neither adopted nor unmapped",
+			found.DevicePath, err))
+	}
+	return found, nil
+}
+
+// locateMapping finds a live mapping by pool and image without judging it.
+//
+// Device numbers are never used to locate anything: they are reused, so
+// /dev/rbd5 today need not be /dev/rbd5 from an hour ago.
+func (ns *nodeServer) locateMapping(ctx context.Context, want ImageIdentity) (*MappedDevice, error) {
 	mapped, err := ns.Mapper.ListMapped(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list kernel RBD mappings: %v", err)
 	}
-
 	for i := range mapped {
-		d := mapped[i]
-		if d.Pool != want.Pool || d.Image != want.Image {
-			continue
+		if mapped[i].Pool == want.Pool && mapped[i].Image == want.Image {
+			return &mapped[i], nil
 		}
-		if err := ns.Mapper.VerifyIdentity(ctx, d.DevicePath, want); err != nil {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"device %s maps %s/%s but failed identity verification (%v); "+
-					"refusing to adopt or unmap it — operator resolution required",
-				d.DevicePath, d.Pool, d.Image, err)
-		}
-		return &d, nil
 	}
 	return nil, nil
+}
+
+// isolateMapping records a volume as unservable on this node and returns the
+// error to fail the RPC with.
+//
+// Isolation is registered so that later stage attempts fail immediately with the
+// same explanation, and so the condition is visible as a metric rather than only
+// as a repeated RPC error.
+func (ns *nodeServer) isolateMapping(volumeID string, want ImageIdentity,
+	dev MappedDevice, detail string) error {
+	ns.Isolation.Add(ReconcileEntry{
+		Action:     ActionIsolated,
+		VolumeID:   volumeID,
+		Identity:   want,
+		DevicePath: dev.DevicePath,
+		Detail:     detail,
+	})
+	klog.Errorf("NodeStageVolume: isolating volume %s: %s", volumeID, detail)
+	return status.Errorf(codes.FailedPrecondition,
+		"%s. Operator resolution is required; see the operator runbook.", detail)
+}
+
+// rollbackMap undoes a mapping this operation created, then reports cause.
+//
+// Order is the whole point. The intent is removed only after absence is
+// confirmed, so every intermediate failure leaves state that reconciliation can
+// still act on:
+//
+//   - identity mismatch ⇒ do not unmap at all; the device is not ours to remove
+//   - unmap failed ⇒ intent retained, mapping still owned, retry or reconcile
+//   - absence unconfirmed ⇒ intent retained, because a mapping may survive
+//
+// Removing the intent first would convert any of these into an unattributable
+// mapping that no later run may touch.
+func (ns *nodeServer) rollbackMap(ctx context.Context, volumeID string, dev MappedDevice,
+	want ImageIdentity, cause error) error {
+	// Key material is re-materialized by the next stage and `rbd device unmap`
+	// does not need it, so it never outlives a failed attempt.
+	defer func() { _ = removeRuntimeFiles(ns.Opts, volumeID) }()
+
+	// Never unmap on a device path alone: numbers are recycled, so the device at
+	// this path may already be another client's image. If it cannot be confirmed
+	// as ours, the intent is kept and reconciliation locates our mapping by
+	// pool/image instead — which is the only lookup that stays valid.
+	if err := ns.Mapper.VerifyIdentity(ctx, dev.DevicePath, want); err != nil {
+		klog.Errorf("NodeStageVolume: not unmapping %s: it does not verify as %s (%v); "+
+			"retaining the ownership intent so reconciliation can locate the mapping by image",
+			dev.DevicePath, want, err)
+		return status.Errorf(codes.FailedPrecondition,
+			"%s; %s could not be confirmed as %s so it was left mapped (%v). The ownership "+
+				"intent is retained. Operator resolution is required; see the operator runbook.",
+			status.Convert(cause).Message(), dev.DevicePath, want, err)
+	}
+
+	if err := ns.Mapper.Unmap(ctx, dev.DevicePath, ns.Opts.UnmapTimeoutDuration()); err != nil {
+		klog.Errorf("NodeStageVolume: failed to roll back mapping %s: %v; "+
+			"retaining the ownership intent for reconciliation", dev.DevicePath, err)
+		return status.Errorf(codes.Internal,
+			"%s; rolling back the mapping failed (%v). The ownership intent is retained so the "+
+				"mapping remains attributable and recoverable.",
+			status.Convert(cause).Message(), err)
+	}
+
+	remaining, err := ns.locateMapping(ctx, want)
+	if err != nil {
+		return status.Errorf(codes.Internal,
+			"%s; the mapping was unmapped but its absence could not be confirmed (%v). "+
+				"The ownership intent is retained.", status.Convert(cause).Message(), err)
+	}
+	if remaining != nil {
+		return status.Errorf(codes.Internal,
+			"%s; %s still appears mapped as %s after unmap. The ownership intent is retained.",
+			status.Convert(cause).Message(), want, remaining.DevicePath)
+	}
+
+	// Absence confirmed: only now is it safe to drop the ownership claim.
+	if err := ns.Staging.RemoveIndexOnly(volumeID); err != nil {
+		klog.Warningf("NodeStageVolume: failed to remove ownership intent for volume %s: %v",
+			volumeID, err)
+	}
+	return cause
+}
+
+// discardIntentIfUnmapped drops the intent when the map demonstrably did not
+// happen.
+//
+// A failed map call is not proof that nothing was mapped, so the kernel is
+// checked. If a mapping exists, or cannot be listed, the intent is kept: an
+// unattributable mapping is far worse than a stale intent, which the next stage
+// or reconciliation resolves.
+func (ns *nodeServer) discardIntentIfUnmapped(ctx context.Context, volumeID string, want ImageIdentity) {
+	found, err := ns.locateMapping(ctx, want)
+	if err != nil {
+		klog.Warningf("NodeStageVolume: could not confirm that %s is unmapped after a failed map "+
+			"(%v); retaining the ownership intent for volume %s", want, err, volumeID)
+		return
+	}
+	if found != nil {
+		klog.Warningf("NodeStageVolume: map of %s reported failure but %s is mapped; "+
+			"retaining the ownership intent for volume %s", want, found.DevicePath, volumeID)
+		return
+	}
+	if err := ns.Staging.RemoveIndexOnly(volumeID); err != nil {
+		klog.Warningf("NodeStageVolume: failed to remove ownership intent for volume %s: %v",
+			volumeID, err)
+	}
 }
 
 // identityGate performs the five checks required before a writable device is
@@ -291,19 +464,24 @@ func (ns *nodeServer) identityGate(ctx context.Context, dev MappedDevice,
 	return sizeBytes, nil
 }
 
-// recordStaging writes the staging record, determining the size from the device.
+// recordStaging writes the completed record, determining the size from the device.
 func (ns *nodeServer) recordStaging(ctx context.Context, stagingPath, volumeID, attachmentID string,
-	ci *openstack.RBDConnectionInfo, dev MappedDevice) error {
+	ci *openstack.RBDConnectionInfo, dev MappedDevice, generation int) error {
 	sizeBytes, err := ns.Mapper.DeviceSize(ctx, dev.DevicePath)
 	if err != nil {
 		klog.V(4).Infof("recordStaging: size of %s unavailable: %v", dev.DevicePath, err)
 	}
-	return ns.recordStagingWithSize(stagingPath, volumeID, attachmentID, ci, dev, sizeBytes)
+	return ns.recordStagingWithSize(stagingPath, volumeID, attachmentID, ci, dev, generation, sizeBytes)
 }
 
+// recordStagingWithSize persists the completed record, advancing the intent from
+// map-pending to staged.
+//
+// The generation is passed in rather than derived here: it was allocated before
+// the map, and re-deriving it would read back the intent this call is about to
+// overwrite, double-counting the mapping as a remap.
 func (ns *nodeServer) recordStagingWithSize(stagingPath, volumeID, attachmentID string,
-	ci *openstack.RBDConnectionInfo, dev MappedDevice, sizeBytes int64) error {
-	generation := ns.Staging.NextGeneration(volumeID)
+	ci *openstack.RBDConnectionInfo, dev MappedDevice, generation int, sizeBytes int64) error {
 	rec := newStagingRecord(volumeID, attachmentID, ci, dev, generation, sizeBytes)
 	if err := ns.Staging.Write(stagingPath, rec); err != nil {
 		return status.Errorf(codes.Internal, "failed to write staging record: %v", err)
@@ -497,6 +675,16 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context,
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"volume %s is not staged at %s: %v", volumeID, stagingPath, err)
+	}
+	// Only a completed stage may be published. A map-pending record describes an
+	// interrupted attempt: it names no device, and bind-mounting on the strength
+	// of one would expose a device nothing has verified. WriteIntent is
+	// index-only so this should be unreachable, which is exactly why it is
+	// checked rather than assumed.
+	if rec.Phase != PhaseStaged {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"volume %s is staged only as %s at %s; the stage did not complete",
+			volumeID, rec.Phase, stagingPath)
 	}
 	want, ok := ns.expectedIdentity(rec)
 	if !ok {

@@ -276,7 +276,15 @@ func (r *reconciler) reconcileRecord(ctx context.Context, rec *StagingRecord,
 
 	if found == nil {
 		base.Action = ActionUnstaged
-		base.Detail = "no live kernel mapping for the recorded image; a later stage will map afresh"
+		if rec.Phase == PhaseMapPending {
+			// The intent outlived its purpose: nothing was mapped, or a rollback
+			// completed without getting to remove it. Discarding is correct and
+			// safe precisely because there is no mapping to leave orphaned.
+			base.Detail = "ownership intent has no live mapping; the map did not happen " +
+				"or was rolled back, so the intent is discarded"
+		} else {
+			base.Detail = "no live kernel mapping for the recorded image; a later stage will map afresh"
+		}
 		r.discardRecord(rec)
 		klog.V(3).Infof("reconcile: volume %s (%s): %s", rec.VolumeID, want, base.Detail)
 		return base
@@ -293,6 +301,20 @@ func (r *reconciler) reconcileRecord(ctx context.Context, rec *StagingRecord,
 		return base
 	}
 
+	// A map-pending record with a verified live mapping is the crash window
+	// between `rbd device map` and the completed record. The intent proves the
+	// mapping is ours, so it is adopted and finalized rather than left in limbo —
+	// this is what makes a mid-stage crash recoverable instead of isolating.
+	if rec.Phase == PhaseMapPending {
+		base.Action = ActionAdopted
+		base.DevicePath = found.DevicePath
+		base.Detail = fmt.Sprintf("ownership intent covers live mapping %s; "+
+			"finalizing the interrupted stage", found.DevicePath)
+		klog.V(2).Infof("reconcile: volume %s: %s", rec.VolumeID, base.Detail)
+		r.finalizeIntent(rec, *found)
+		return base
+	}
+
 	// Adopt. The device number may have changed across a restart, so the record
 	// is refreshed rather than trusted.
 	base.Action = ActionAdopted
@@ -304,6 +326,25 @@ func (r *reconciler) reconcileRecord(ctx context.Context, rec *StagingRecord,
 	}
 	r.refreshRecord(rec, *found)
 	return base
+}
+
+// finalizeIntent advances an interrupted map-pending record to staged.
+//
+// Only the node-scoped index is written, for the same reason refreshRecord gives:
+// the staging-path copy lives under a kubelet directory that may not exist yet,
+// and NodeStageVolume rewrites it on the next call. The device is recorded from
+// the kernel, never from the intent, which never knew it.
+func (r *reconciler) finalizeIntent(rec *StagingRecord, dev MappedDevice) {
+	updated := *rec
+	updated.Phase = PhaseStaged
+	updated.DevicePath = dev.DevicePath
+	updated.DeviceID = dev.ID
+	if err := r.staging.WriteIndexOnly(&updated); err != nil {
+		// The intent survives, so the mapping stays attributable and the next
+		// stage or reconciliation can finish the job.
+		klog.Warningf("reconcile: failed to finalize ownership intent for volume %s: %v; "+
+			"the intent is retained", rec.VolumeID, err)
+	}
 }
 
 // refreshRecord rewrites the node-scoped index with the current device path.

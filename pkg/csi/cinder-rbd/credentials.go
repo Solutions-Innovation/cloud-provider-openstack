@@ -218,6 +218,19 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("rename %s to %s: %w", tmpName, path, err)
 	}
+	// fsync the directory too. Syncing the file only guarantees its contents;
+	// the rename that publishes it under the final name lives in the directory,
+	// and without this a power failure can lose the entry despite a synced file.
+	// Ownership intents depend on exactly this being durable, so a failure here
+	// is reported rather than ignored.
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open %s to sync: %w", dir, err)
+	}
+	defer func() { _ = dirFile.Close() }()
+	if err := dirFile.Sync(); err != nil {
+		return fmt.Errorf("sync directory %s: %w", dir, err)
+	}
 	return nil
 }
 
