@@ -172,8 +172,9 @@ driverConfig:
     mapTimeout: 120s
     unmapTimeout: 120s
     deviceWaitTimeout: 60s
-    # 0 means unlimited, pending measurement of the krbd mapping limit.
-    maxVolumesPerNode: 0
+    # Advertised through NodeGetInfo so Kubernetes schedules at most this many
+    # volumes from this CSI driver on one node. This is not a runtime map limit.
+    maxVolumesPerNode: 32
   volume:
     createTimeout: 300
     detachTimeout: 120

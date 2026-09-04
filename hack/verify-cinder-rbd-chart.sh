@@ -108,22 +108,31 @@ grep -A1 'mountPath: /lib/modules' <<<"${libmod}" | grep -q 'readOnly: true' \
   || fail "/lib/modules must be mounted readOnly"
 pass "mountLibModules opt-in works and is read-only"
 
-echo "==> 4. no iSCSI residue"
+echo "==> 4. per-node scheduling limit"
 full=$(render -f "${valid}")
+
+# Keep the chart's scheduling limit explicit. A zero value means unlimited in
+# CSI and would let Kubernetes schedule an unbounded number of this driver's
+# volumes onto one node.
+grep -q 'max-volumes-per-node = 32' <<<"${full}" \
+  || fail "default max-volumes-per-node must be 32"
+pass "default max-volumes-per-node is 32"
+
+echo "==> 5. no iSCSI residue"
 for path in '/etc/iscsi' '/var/lib/iscsi' '/run/lock/iscsi'; do
   grep -q -- "${path}" <<<"${full}" && fail "iSCSI path ${path} leaked into the RBD chart"
 done
 grep -qi 'iscsiadm\|initiatorname\|chap' <<<"${full}" && fail "iSCSI-specific configuration leaked into the RBD chart"
 pass "no iSCSI paths or options"
 
-echo "==> 5. rendered output carries no credential material"
+echo "==> 6. rendered output carries no credential material"
 # The chart must never emit a key. cephCredential.create defaults to false, so
 # the Secret is only referenced, never populated.
 grep -qE '^\s+(userKey|key):\s*\S' <<<"${full}" && fail "rendered output appears to contain key material"
 grep -q 'AQ' <<<"${full}" && fail "rendered output contains something resembling a Ceph key"
 pass "no key material in rendered output"
 
-echo "==> 6. cacert indirection"
+echo "==> 7. cacert indirection"
 # Only the helper may dereference .Values.cacert, so the legacy no-cacert path
 # cannot regress.
 if command -v rg >/dev/null 2>&1; then
@@ -143,7 +152,7 @@ grep -q 'name: cacert' <<<"${enabled}" || fail "no cacert volume when the option
 grep -q 'mountPath: /etc/ssl/certs' <<<"${enabled}" || fail "cacert not mounted at /etc/ssl/certs"
 pass "cacert volume emitted when enabled"
 
-echo "==> 7. CSI driver object and CDI profile"
+echo "==> 8. CSI driver object and CDI profile"
 grep -q 'name: cinder-rbd.csi.windriver.com' <<<"${full}" || fail "CSIDriver object missing"
 grep -q 'attachRequired: true' <<<"${full}" || fail "attachRequired must be true (external-attacher drives publish)"
 pass "CSIDriver object correct"
@@ -163,11 +172,11 @@ prof_name=$(grep -A3 'kind: StorageProfile' <<<"${full}" | grep 'name:' | head -
   fail "StorageProfile name (${prof_name}) must equal the StorageClass name (${sc_name})"
 pass "StorageProfile name matches the StorageClass"
 
-echo "==> 8. block-only StorageClass"
+echo "==> 9. block-only StorageClass"
 grep -q 'allowVolumeExpansion: false' <<<"${full}" || fail "expansion must not be advertised"
 pass "volume expansion not advertised"
 
-echo "==> 9. every value a template reads is declared"
+echo "==> 10. every value a template reads is declared"
 # A template that reads .Values.some.undeclared.knob does not fail: Helm yields
 # nil, so `if` and `with` blocks silently take the empty branch. The chart then
 # has an invisible switch that no operator can discover from values.yaml and no
