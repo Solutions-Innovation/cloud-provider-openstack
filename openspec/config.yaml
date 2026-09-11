@@ -1,0 +1,49 @@
+schema: spec-driven
+store: cloud-provider-openstack
+
+context: |
+  This repository implements OpenStack cloud-provider components, including
+  Kubernetes CSI drivers for Cinder-backed WRCP/WRC migration workloads.
+  The cinder-iscsi CSI driver attaches Cinder volumes directly to worker hosts
+  through iSCSI. The cinder-rbd CSI driver maps Ceph RBD-backed Cinder volumes
+  through exclusive kernel RBD (krbd); it is implemented but remains
+  pre-production until qualification is complete.
+
+  These are migration-focused, raw-block drivers, not general-purpose
+  replacements for the upstream Cinder CSI driver. They support
+  SINGLE_NODE_WRITER/ReadWriteOnce volumes and reject filesystem capabilities.
+  Both use Cinder v3 self-service attachment APIs (microversion 3.27 or newer)
+  without Nova or shadow VMs. Cinder attachment records, attachment IDs, and
+  Kubernetes VolumeAttachment resources are separate state domains.
+
+  The primary implementation surfaces are pkg/csi/cinder-iscsi/ and
+  pkg/csi/cinder-rbd/. Helm packaging is in
+  charts/cinder-iscsi-csi-plugin/ and charts/cinder-rbd-csi-plugin/. Migration
+  documentation is in docs/cinder-csi-plugin/migration/, with runnable
+  examples in examples/cinder-iscsi-csi-plugin/ and
+  examples/cinder-rbd-csi-plugin/. Specifications and change artifacts are
+  maintained in the cloud-provider-openstack OpenSpec store.
+
+rules:
+  proposal:
+    - Identify the affected driver/backend, OpenStack services and APIs, Kubernetes resources, Helm charts, examples, and migration documentation.
+    - State whether behavior applies to iSCSI, RBD, or both; do not describe the RBD driver as production-qualified.
+    - Describe backward-compatibility implications for CSI capabilities, volume lifecycle, Helm values, manifests, and existing migration workflows.
+    - Preserve the raw-block, SINGLE_NODE_WRITER/ReadWriteOnce scope unless an explicit compatibility and migration plan expands it.
+    - Identify effects on Cinder attachment lifecycle, attachment-ID ownership, and retain-versus-delete volume behavior.
+
+  design:
+    - Identify controller, node, OpenStack API, Kubernetes, and host-tool responsibilities and the authoritative owner of each state item.
+    - Keep Cinder attachment records, Cinder attachment IDs, Kubernetes VolumeAttachment objects, and node-side device state distinct.
+    - Document failure recovery, reconciliation, idempotency, and bounded retry behavior for partial Cinder attachment and node staging failures.
+    - For iSCSI changes, describe initiator/connector identity, CHAP handling, device discovery, and logout plus node-database cleanup.
+    - For RBD changes, require verified Ceph FSID/pool/image identity and durable ownership evidence before reusing or unmapping a kernel map; never infer ownership from a matching device alone.
+    - Preserve retain-only deletion safety for RBD unless a race-safe cross-node no-map proof is designed and qualified.
+    - Document credential handling, log redaction, least-privilege RBAC, and every privileged host path or capability required by the node plugin.
+
+  tasks:
+    - Include focused unit and failure-path tests for every implementation change, without touching real host device paths.
+    - Include Helm lint and render/verification coverage for chart or manifest changes, including safety guards and secret-redaction checks where applicable.
+    - Update examples and migration/operator documentation when CSI behavior, configuration, deployment, recovery, or qualification status changes.
+    - Validate raw-block and CDI StorageProfile behavior whenever provisioning or deployment behavior changes.
+    - Record qualification assumptions and distinguish tested lab facts from production-ready claims.
