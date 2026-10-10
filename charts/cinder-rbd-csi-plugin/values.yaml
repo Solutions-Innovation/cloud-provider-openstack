@@ -69,6 +69,13 @@ csi:
       tolerations:
         - operator: Exists
       kubeletDir: /var/lib/kubelet
+      # Port served by the liveness sidecar and probed by the kubelet.
+      #
+      # The node plugin runs on the host network, so this port is bound on the
+      # node itself. Change it when another host-network driver on the same node
+      # already holds 9808 (for example the Cinder iSCSI node plugin). The
+      # controller pod is not on the host network and is unaffected.
+      healthPort: 9808
       # Mount the host's /lib/modules read-only into the node plugin.
       #
       # Only needed where the `rbd` kernel module is not already loaded and the

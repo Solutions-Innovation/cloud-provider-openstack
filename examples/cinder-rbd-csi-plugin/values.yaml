@@ -1,0 +1,114 @@
+# Example values for the openstack-cinder-rbd-csi Helm chart.
+#
+# Copy this file, set the Ceph FSID below, adjust the settings marked
+# "ENVIRONMENT", and install:
+#
+#   helm install cinder-rbd ./_dist/openstack-cinder-rbd-csi-<version>.tgz \
+#     --namespace kube-system -f my-values.yaml
+#
+# This file contains no credentials and must stay that way. The OpenStack
+# configuration and the Ceph key live in Secrets that you create before
+# installing; this file only names them.
+
+# --- Driver configuration ----------------------------------------------------
+driverConfig:
+  rbd:
+    # REQUIRED. The chart refuses to render while this is empty.
+    # The FSID is an identifier for your Ceph cluster, not a credential. The
+    # driver uses it to confirm that every device it maps belongs to this
+    # cluster. Obtain it from a Ceph toolbox or admin host:
+    #   ceph fsid
+    # Pass it on the command line instead if you prefer:
+    #   --set driverConfig.rbd.expectedFsid=<fsid>
+    expectedFsid: ""
+
+    # ENVIRONMENT: the cluster name reported by your Ceph deployment.
+    expectedClusterName: ceph
+
+    # These three values are fixed by the driver. The chart rejects any other
+    # value; they are listed here so the effective configuration is visible.
+    mounter: krbd
+    exclusive: true
+
+    # Upper bound on volumes from this driver that Kubernetes schedules onto
+    # one node.
+    maxVolumesPerNode: 32
+
+  volume:
+    # ENVIRONMENT: the Cinder volume type backed by your Ceph RBD pool. The
+    # StorageClass "type" parameter below takes precedence.
+    defaultVolumeType: ceph-rook-store
+
+    # The only supported mode. Deleting a PVC keeps the Cinder volume.
+    deleteVolumeMode: retain
+
+# --- Secrets (created by you, referenced by name) ---------------------------
+# The Secret that holds cloud.conf for the controller. Create it first:
+#   kubectl -n kube-system create secret generic cinder-rbd-csi-cloud-config \
+#     --from-file=cloud.conf=<path-to-cloud.conf>
+secret:
+  enabled: true
+  create: false
+  name: cinder-rbd-csi-cloud-config
+
+# The Secret that holds the Ceph client credential for the node plugin, with
+# the keys "userID" and "userKey". Create it first; see the installation guide.
+cephCredential:
+  create: false
+  secretName: cinder-rbd-ceph-client
+
+# --- StorageClass and CDI ----------------------------------------------------
+storageClass:
+  enabled: true
+  name: cinder-rbd-migration
+  isDefault: false
+  # Kubernetes requires a value here. The driver retains the Cinder volume when
+  # a PVC is deleted regardless of this setting.
+  reclaimPolicy: Delete
+  volumeBindingMode: Immediate
+  parameters:
+    # ENVIRONMENT: Cinder volume type and availability zone.
+    type: ceph-rook-store
+    availability: nova
+
+# Creates a CDI StorageProfile named after the StorageClass so that DataVolumes
+# use raw block volumes. Set to false if CDI is not installed.
+storageProfile:
+  enabled: true
+
+# Identifier added to the metadata of volumes this cluster creates.
+clusterID: "kubernetes"
+
+# --- Optional settings -------------------------------------------------------
+
+# HTTPS OpenStack endpoints signed by a private CA: mount the CA bundle into the
+# controller and reference it from cloud.conf with
+#   ca-file=/etc/ssl/certs/ca-certificates.crt
+# cacert:
+#   enabled: true
+#   source: hostPath          # or: secret
+#   hostPath:
+#     path: /etc/ssl/certs
+#     type: Directory
+
+# Private registry or an image tag other than the chart's appVersion.
+# csi:
+#   plugin:
+#     image:
+#       repository: registry.example.com/cinder-rbd-csi-plugin
+#       tag: <tag>
+#       pullPolicy: IfNotPresent
+# imagePullSecrets:
+#   - name: <registry-secret>
+
+# Node plugin placement, health port, and kernel module access.
+# csi:
+#   plugin:
+#     nodePlugin:
+#       # The node plugin uses the host network. Move its health port if another
+#       # host-network driver on the same nodes already uses 9808.
+#       healthPort: 9809
+#       nodeSelector:
+#         <label>: "<value>"
+#       # Only if the node plugin reports that the rbd kernel module is missing.
+#       mountLibModules: true

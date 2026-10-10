@@ -105,6 +105,10 @@ test-cinder-iscsi-csi-sanity: work
 test-cinder-rbd-csi-sanity: work
 	go test $(GIT_HOST)/$(BASE_DIR)/tests/sanity/cinder-rbd
 
+.PHONY: package-cinder-rbd-chart
+package-cinder-rbd-chart:
+	hack/package-cinder-rbd-chart.sh
+
 # kept for compatibility reasons.
 fmt: check
 lint: check

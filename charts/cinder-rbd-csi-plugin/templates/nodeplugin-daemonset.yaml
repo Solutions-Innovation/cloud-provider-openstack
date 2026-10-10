@@ -67,6 +67,7 @@ spec:
           args:
             - "-v={{ .Values.logVerbosityLevel }}"
             - --csi-address=/csi/csi.sock
+            - --health-port={{ .Values.csi.plugin.nodePlugin.healthPort | int }}
             {{- if .Values.csi.livenessprobe.extraArgs }}
             {{- with .Values.csi.livenessprobe.extraArgs }}
             {{- tpl . $ | trim | nindent 12 }}
@@ -113,7 +114,7 @@ spec:
               {{- toYaml .Values.csi.plugin.extraEnv | nindent 12 }}
             {{- end }}
           ports:
-            - containerPort: 9808
+            - containerPort: {{ .Values.csi.plugin.nodePlugin.healthPort | int }}
               name: healthz
               protocol: TCP
           livenessProbe:

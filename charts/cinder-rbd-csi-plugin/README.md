@@ -30,6 +30,10 @@ topology.
 
 ## Install
 
+For a step-by-step walkthrough that packages this chart locally and installs it
+with an example values file, see the
+[installation guide](../../docs/cinder-csi-plugin/migration/rbd-cinder-csi-installation-guide.md).
+
 Two things must exist before installing.
 
 **1. Cinder credentials** for the controller:

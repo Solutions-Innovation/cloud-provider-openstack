@@ -229,5 +229,57 @@ if [[ -n "${undeclared}" ]]; then
 fi
 pass "all $(grep -roh '\.Values\(\.[A-Za-z_][A-Za-z0-9_]*\)\+' "${chart_dir}/templates" | sort -u | wc -l | tr -d ' ') referenced value paths are declared"
 
+echo "==> 11. example values stay valid"
+example="examples/cinder-rbd-csi-plugin/values.yaml"
+[[ -f "${example}" ]] || fail "${example} is missing"
+
+# The example leaves the FSID for the operator, so it must not render as-is.
+expect_render_failure "expectedFsid is required" -f "${example}"
+
+ex_out=$(render -f "${example}" --set driverConfig.rbd.expectedFsid=c5f7876d-258c-4152-b26a-a3ab532fda28) \
+  || fail "the example values do not render once the FSID is set"
+pass "example renders once the FSID is set"
+
+grep -q 'delete-volume-mode = retain' <<<"${ex_out}" || fail "example must render retain-only deletion"
+grep -q 'exclusive = true' <<<"${ex_out}" || fail "example must render exclusive mapping"
+grep -q 'mounter = krbd' <<<"${ex_out}" || fail "example must render the krbd mounter"
+pass "example keeps retain, exclusive, and krbd"
+
+# The example is committed and copied around; it must carry no credential.
+grep -qE '^\s*(userKey|key|password|application-credential-secret):\s*\S' "${example}" \
+  && fail "example values appear to contain a credential"
+grep -q 'AQ[A-Za-z0-9+/]\{20,\}' "${example}" && fail "example values contain something resembling a Ceph key"
+grep -q 'secretName: cinder-rbd-ceph-client' <<<"${ex_out}" || fail "example must reference the Ceph credential Secret by name"
+pass "example carries no credential"
+
+echo "==> 12. node health port"
+# The node plugin is host-networked, so its health port is bound on the node. It
+# must be movable when another host-network driver already holds 9808, and the
+# sidecar argument, the declared port, and the probe target must move together.
+node_ds() { awk '/^kind: DaemonSet/,/^---/' <<<"$1"; }
+controller() { awk '/^kind: Deployment/,/^---/' <<<"$1"; }
+
+default_ds=$(node_ds "${full}")
+grep -q -- '--health-port=9808' <<<"${default_ds}" || fail "default sidecar must use --health-port=9808"
+grep -q 'containerPort: 9808' <<<"${default_ds}" || fail "default node healthz port must be 9808"
+pass "default node health port is 9808"
+
+moved=$(render -f "${valid}" --set csi.plugin.nodePlugin.healthPort=9809)
+moved_ds=$(node_ds "${moved}")
+grep -q -- '--health-port=9809' <<<"${moved_ds}" || fail "override did not reach the liveness sidecar"
+grep -q 'containerPort: 9809' <<<"${moved_ds}" || fail "override did not reach the healthz containerPort"
+grep -q '9808' <<<"${moved_ds}" && fail "9808 remains in the node DaemonSet after overriding the health port"
+grep -q 'port: healthz' <<<"${moved_ds}" || fail "the node liveness probe must target the named healthz port"
+pass "override moves sidecar, containerPort, and probe together"
+
+[[ "$(controller "${full}")" == "$(controller "${moved}")" ]] \
+  || fail "the controller Deployment changed when only the node health port was overridden"
+pass "controller unaffected by the node health port"
+
+for bad in 0 70000 abc 98.5; do
+  expect_render_failure "healthPort must be an integer between 1 and 65535" -f "${valid}" \
+    --set-json "csi.plugin.nodePlugin.healthPort=$([[ ${bad} == abc ]] && echo '"abc"' || echo "${bad}")"
+done
+
 echo
 echo "All Cinder RBD chart checks passed."
