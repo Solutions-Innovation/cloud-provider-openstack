@@ -1,0 +1,147 @@
+# Target Cinder volume, exposed as a raw block device (not a filesystem) so
+# that dd can write the converted RAW image directly onto it.
+#
+# storageClassName defaults to "csi-sc-cinderplugin", the StorageClass
+# name used throughout this project's own examples/docs for the Cinder
+# CSI driver (see e.g. ../block/block.yaml and
+# ../../../docs/cinder-csi-plugin/using-cinder-csi-plugin.md). A
+# StorageClass is cluster-level infrastructure tied to an actual CSI
+# driver deployment -- this manifest doesn't create one, it only
+# references it, so update the name below (or point it at a different
+# StorageClass you already have) to match what's actually deployed in
+# your cluster. If you'd rather use the cluster's default StorageClass
+# instead of naming one explicitly, delete this field entirely (that is
+# what was used during this example's own testing, since the test
+# cluster had no Cinder CSI driver installed and relied on a
+# Ceph-RBD-backed default StorageClass instead).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vm-import-target-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Block
+  storageClassName: csi-sc-cinderplugin
+  resources:
+    requests:
+      # Must be >= the size of the converted RAW disk image. Verified in
+      # testing with 20Gi against a 16GiB source disk, and 15Gi against a
+      # 10GiB source disk.
+      storage: 20Gi
+
+---
+# One-shot Job that converts the source OVA/OVF/VMDK image to RAW and
+# writes it onto the Cinder-backed block device, using qemu-img for both
+# steps. The conversion script (convert-and-import.sh) is baked into the
+# image as its ENTRYPOINT; see Dockerfile in this directory.
+#
+# Default (CONVERT_MODE=qemu-img-direct) writes straight to TARGET_DEVICE
+# via `qemu-img convert -n --target-is-zero -O raw`, skipping any
+# intermediate RAW file entirely. This doesn't need scratch space
+# proportional to the source disk's virtual size -- only enough to
+# download/extract the compressed source image itself, which for a
+# streamOptimized VMDK (the common VMware/OVA export format) is typically
+# far smaller. Verified end-to-end against a 10GiB-virtual/~1GiB-actual
+# CoreOS .ova: completed in ~20 seconds with a sha256 checksum identical to
+# the qemu-img (file + dd) path. This relies on the target device
+# genuinely reading back as all-zero; the script verifies this
+# automatically before writing and refuses to proceed otherwise (see
+# OPERATIONS-GUIDE.md Section 3 for the full explanation).
+#
+# If TARGET_DEVICE might not read back as zero (e.g. a reused volume) or
+# you'd rather not depend on that assumption, set CONVERT_MODE=qemu-img
+# instead: it converts to a scratch RAW file first, then `dd`s it onto
+# the device. Verified end-to-end against the same CoreOS .ova above (and
+# a second, Fedora Server BIOS/MBR+LVM guest) -- also successful, just
+# slower (~90s convert + ~130s dd, vs. ~20s total for qemu-img-direct) and
+# needing roughly 2x the virtual disk size in scratch space.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vm-import-job
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: vm-import
+          # Built from the Dockerfile in this directory.
+          image: jonzhang/vm-import:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SOURCE_IMAGE_PATH
+              # Path as seen INSIDE THE CONTAINER (under the source-input
+              # mount below), not a path on your workstation. Point this
+              # at a specific file for a single .ova/.vmdk, e.g.:
+              #   value: "/input/my-vm.ova"
+              # For a bare OVF directory (loose .ovf + .vmdk + .nvram +
+              # etc., not packaged into a single .ova), point this at the
+              # DIRECTORY itself instead -- the script finds the .ovf
+              # descriptor and its referenced .vmdk inside it
+              # automatically. Verified in testing: a 16GiB-virtual/
+              # ~1.7GiB-actual Fedora Server OVF directory (BIOS/MBR+LVM
+              # guest) with this exact pattern:
+              #   value: "/input"
+              value: "/input/CHANGE-ME-source.ova"
+            # SOURCE_IMAGE_URL is the alternative when the source image is
+            # reachable over HTTP(S) instead of mounted locally, e.g.:
+            #   - name: SOURCE_IMAGE_URL
+            #     value: "https://example.com/path/to/source.ova"
+            - name: TARGET_DEVICE
+              value: "/dev/xvda"
+            - name: CONVERT_MODE
+              value: "qemu-img-direct" # or "qemu-img" -- see notes above
+            - name: DD_BLOCK_SIZE
+              value: "4M"
+            - name: VERIFY_CHECKSUM
+              value: "false"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          volumeDevices:
+            - name: vm-import-target
+              devicePath: /dev/xvda
+          volumeMounts:
+            - name: workdir
+              mountPath: /work
+            - name: source-input
+              mountPath: /input
+              readOnly: true
+      volumes:
+        - name: vm-import-target
+          persistentVolumeClaim:
+            claimName: vm-import-target-pvc
+            readOnly: false
+        - name: workdir
+          emptyDir:
+            # Under CONVERT_MODE=qemu-img-direct (default): no RAW file is
+            # ever written here, so this only needs to hold the
+            # downloaded/extracted source image itself -- for a
+            # streamOptimized VMDK (the common case from VMware/OVA
+            # exports), that's roughly its *actual* (compressed) size, not
+            # its virtual size. Verified in testing: a 10GiB-virtual-size,
+            # ~1GiB-actual-size CoreOS .ova needed only a few GiB here.
+            #
+            # Under CONVERT_MODE=qemu-img: must additionally hold the
+            # intermediate RAW file (roughly 2x the virtual disk size in
+            # total). The sizeLimit below is sized for that case; reduce
+            # it if you only ever use the qemu-img-direct default.
+            sizeLimit: 40Gi
+        # Points at the source file/directory on the NODE (not inside the
+        # container) for SOURCE_IMAGE_PATH to mount in as /input. Replace
+        # the path below with wherever your source .ova/.vmdk/OVF
+        # directory actually lives on the scheduling node. Testing used a
+        # path like /home/<user>/vm-import/<source-name> on a single-node
+        # test cluster; a hostPath volume ties the Pod to that specific
+        # node (see OPERATIONS-GUIDE.md Section 4.1 for the SOURCE_IMAGE_URL
+        # alternative, which has no such constraint).
+        - name: source-input
+          hostPath:
+            path: /CHANGE-ME/path/to/your/source-image-or-ovf-directory
+            type: Directory
