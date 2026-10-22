@@ -2,7 +2,7 @@
 
 This example demonstrates how to migrate a source VM disk (OVA/OVF/VMDK) into
 an OpenStack Cinder volume using a Kubernetes Job, the Cinder CSI driver's
-**Block Volume** mode, and `qemu-img`.
+**Block Volume** mode, and `qemu-img`/`virt-v2v`.
 
 > For a detailed, step-by-step operations manual covering the image
 > build/pull/tag/push workflow and a full reference of every YAML field and
@@ -17,7 +17,7 @@ an OpenStack Cinder volume using a Kubernetes Job, the Cinder CSI driver's
    filesystem-formatted PVC would corrupt it — we need the raw device.
 2. A one-shot `Job` runs a container that:
    - downloads (or reads a locally mounted) source OVA/OVF/VMDK image
-   - converts and writes it using one of two strategies (`CONVERT_MODE`):
+   - converts and writes it using one of three strategies (`CONVERT_MODE`):
      - `qemu-img-direct` (default) — `qemu-img convert -n --target-is-zero
        -O raw` straight onto the target device, skipping any intermediate
        RAW file. Needs scratch space only for the downloaded/extracted
@@ -28,7 +28,11 @@ an OpenStack Cinder volume using a Kubernetes Job, the Cinder CSI driver's
        `qemu-img` mode's output. The script automatically verifies the
        target device reads as all-zero before using this mode and refuses
        to proceed otherwise, since the underlying `--target-is-zero`
-       assumption is unsafe on a previously-written volume. See
+       assumption is unsafe on a previously-written volume. **This mode
+       (and `qemu-img` below) only converts the disk's byte-for-byte
+       format — it does not touch anything inside the guest filesystem,
+       which is fine for most Linux guests but is NOT sufficient for
+       Windows guests (see `virt-v2v` below).** See
        [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#3-choosing-a-conversion-mode)
        for the full performance analysis (including why writing to a block
        device without `--target-is-zero` can stall for minutes on a sparse
@@ -39,6 +43,33 @@ an OpenStack Cinder volume using a Kubernetes Job, the Cinder CSI driver's
        scratch space roughly 2x the source disk's virtual size. Use this
        when `TARGET_DEVICE` might not read back as zero (e.g. a reused
        volume) or when you'd rather not depend on that assumption at all.
+     - `virt-v2v` — **required for Windows guests.** `qemu-img`/
+       `qemu-img-direct` are pure format converters: they never touch the
+       guest filesystem. A Windows VM exported from VMware has
+       VMware-specific drivers and a boot configuration tied to VMware's
+       virtual hardware, and will typically fail to boot under KVM/QEMU
+       (the hypervisor Nova uses) without driver injection and
+       boot-configuration fixups — only `virt-v2v` performs these.
+       Converts to a scratch RAW file first (like `qemu-img` above;
+       `virt-v2v` has no way to write directly to a block device), then
+       `dd`s it onto the target. Needs real KVM acceleration for
+       reasonable speed (works without it, via software emulation, just
+       much slower) and requires the guest OS to be recognized by
+       libguestfs's inspection — Windows guests are well supported;
+       OSTree/Ignition-based Linux distros (e.g. Fedora CoreOS) are
+       **not** and will fail here, so use `qemu-img-direct`/`qemu-img` for
+       those instead. Verified end-to-end against a real Windows Server
+       2019 guest (90GiB-virtual/~5.2GiB-actual `streamOptimized` VMDK):
+       libguestfs correctly identified it as "Windows Server 2019
+       Standard Evaluation (win2k19)" and converted it to boot under KVM;
+       the resulting Cinder/Ceph RBD volume showed a correct GPT partition
+       layout (Windows RE + EFI System + Microsoft Reserved + an
+       NTFS-signed main partition) after import. Also verified (on a
+       Linux source, before Windows support was confirmed) against a
+       Fedora Server BIOS/MBR+LVM guest, with output identical (via
+       sha256) to the `qemu-img` path. See
+       [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#3-choosing-a-conversion-mode)
+       for the full comparison and real numbers for all three modes.
    - optionally verifies a sha256 checksum of what was written
 3. Once the Job completes successfully, the Cinder volume behind the PVC
    contains the imported disk and can be used to boot a Nova instance, or
@@ -74,10 +105,13 @@ the Job's container, independent of the CSI driver.
 
 - `convert-and-import.sh` — the conversion/import script, baked into the
   tool image as its `ENTRYPOINT`.
-- `Dockerfile` — tool image (`qemu-img`, `curl`, `tar`, `python3`) used to
-  run the script. Build and push it to a registry reachable by your
-  cluster.
-- `job.yaml` — Block-mode PVC + Job manifest (no `StorageClass` object; see
+- `Dockerfile` — tool image (`qemu-img`, `virt-v2v`/`libguestfs`, `curl`,
+  `tar`, `python3`) used to run the script. `virt-v2v`/`libguestfs` add
+  roughly 1.5GB to the image but are required for Windows guest support
+  (see `CONVERT_MODE=virt-v2v` above). Build and push it to a registry
+  reachable by your cluster.
+- `job.yaml` — Block-mode target PVC + PVC-backed scratch space + Job
+  manifest (no `StorageClass` object; see
   [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#21-choosing-a-storageclass)
   for why).
 
@@ -133,19 +167,29 @@ Edit `job.yaml`:
   [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#41-using-sourceimageurl-instead-of-a-local-file).
 - `env.CONVERT_MODE` — `qemu-img-direct` (default; writes straight to the
   block device, needs the target to read back as all-zero — verified
-  automatically) or `qemu-img` (converts to a scratch file first, then
+  automatically), `qemu-img` (converts to a scratch file first, then
   `dd`s it onto the device; safe on any target but needs ~2x the virtual
-  disk size in scratch space). See
+  disk size in scratch space), or `virt-v2v` (**required for Windows
+  guests** — injects drivers and fixes up the boot configuration so the
+  guest can actually boot under KVM; also converts to a scratch file
+  first). See
   [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#3-choosing-a-conversion-mode)
   for the full comparison.
 - `env.TARGET_DEVICE` and `volumeDevices[0].devicePath` — must match (the
   device path as seen inside the container, e.g. `/dev/xvda`).
-- `volumes[1].emptyDir.sizeLimit` (the `workdir` volume) — scratch space.
-  Under the default `qemu-img-direct` mode, this only needs to hold the
-  downloaded/extracted source image (its *actual*, not virtual, size for a
-  `streamOptimized` VMDK). Under `qemu-img`, it additionally needs the
-  intermediate RAW file, so budget roughly 2x the virtual disk size, or
-  mount a dedicated scratch PVC instead of `emptyDir` for large disks.
+- `volumes[1]` (the `workdir` volume, PVC-backed by default) — scratch
+  space. Under the default `qemu-img-direct` mode, this only needs to hold
+  the downloaded/extracted source image (its *actual*, not virtual, size
+  for a `streamOptimized` VMDK) — if you know you'll only ever use that
+  mode and your source images are small, you can swap this for a plain
+  `emptyDir` instead to avoid provisioning the extra PVC (see the comments
+  in `job.yaml`). Under `qemu-img`/`virt-v2v`, it additionally needs the
+  intermediate RAW file, so budget roughly 2x the virtual disk size —
+  this matters most for `virt-v2v` with large Windows system disks, where
+  a node-local `emptyDir` is likely to run out of space (verified in
+  testing: a 90GiB-virtual Windows source did not fit this test cluster's
+  node-local scratch partition, but converted successfully once `workdir`
+  was backed by a 110Gi PVC instead).
 - `volumes[2].hostPath.path` (the `source-input` volume) — the directory on
   the node containing your source image; must match what
   `SOURCE_IMAGE_PATH` points at under `/input`.
@@ -223,6 +267,41 @@ the resulting PV, or detach/orphan it from Kubernetes before deleting the PVC.
   provisioned CSI volume should always pass this check, but a volume
   reused from a previous write will not. If the check fails, use
   `CONVERT_MODE=qemu-img` instead.
+- **`CONVERT_MODE=virt-v2v` is required for Windows guests**, not optional
+  — `qemu-img-direct`/`qemu-img` never touch anything inside the guest
+  filesystem, so a Windows VM exported from VMware will typically fail to
+  boot under KVM/QEMU without the driver injection and boot-configuration
+  fixups that only `virt-v2v` performs. A few things to know before using
+  it:
+  - `DISK_SELECTOR` has **no effect** under this mode — `virt-v2v`
+    converts the whole VM definition (all disks referenced by the
+    `.ovf`/`.vmx`) as a single unit, unlike `qemu-img`/`qemu-img-direct`,
+    which select one `.vmdk` at a time. The script logs a warning if
+    `DISK_SELECTOR` is set in this mode.
+  - It performs noticeably better with real KVM acceleration available
+    (the node needs `/dev/kvm`, typically exposed via the KubeVirt device
+    plugin as the `devices.kubevirt.io/kvm` resource — see the commented-out
+    block in `job.yaml`). It still works without it, falling back to
+    software emulation, just much slower — verified in testing: a
+    90GiB-virtual/~5.2GiB-actual Windows Server 2019 guest took about 29
+    minutes end-to-end (virt-v2v conversion ~6.5 min + `dd` write ~22 min
+    @ 70+ MB/s) with no KVM acceleration available on the test node.
+  - The container image used for testing doesn't bundle VirtIO drivers
+    (`/usr/share/virtio-win`), so `virt-v2v` falls back to configuring the
+    guest with slower emulated devices rather than installing VirtIO
+    drivers — it still produces a bootable disk, just without the
+    VirtIO performance benefit. If you want VirtIO drivers installed,
+    extend the `Dockerfile` to bundle the `virtio-win` ISO (available from
+    Fedora's virtio-win project) and either place it where `virt-v2v`
+    looks by default or point it there via its `-i` input options; this
+    was not exercised in testing.
+  - Relies on libguestfs's OS inspection to recognize the guest. Windows
+    guests are well supported (verified: correctly identified a Windows
+    Server 2019 guest and converted it to a bootable disk with a valid
+    GPT/NTFS layout). OSTree/Ignition-based Linux distributions (e.g.
+    Fedora CoreOS) are **not** recognized and will fail with `No root
+    device found in this operating system image` — use
+    `qemu-img-direct`/`qemu-img` for those instead.
 - `VERIFY_CHECKSUM=true` reads the full image back from the Cinder volume
   over the network/storage backend to compute a checksum — this roughly
   doubles the I/O cost and time. Under `CONVERT_MODE=qemu-img-direct`, it

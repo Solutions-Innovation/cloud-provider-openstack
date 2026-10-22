@@ -2,14 +2,25 @@
 # them onto an OpenStack Cinder volume (exposed as a raw block device via
 # the Cinder CSI driver's Block Volume mode). Used by job.yaml.
 #
-# Uses qemu-img for all conversion (default mode writes directly to the
-# target block device via `qemu-img convert -n --target-is-zero`, skipping
-# any intermediate RAW file; see convert-and-import.sh for details and the
-# "qemu-img" fallback mode for targets that don't read back as zero).
-# virt-v2v was evaluated but dropped: its output modes (local file,
-# oVirt/RHV, OpenStack-via-REST-API) have no way to write directly to an
-# arbitrary pre-existing block device, so it could not support the
-# space-saving direct-write mode that is now the default here.
+# qemu-img handles the default/fast paths (CONVERT_MODE=qemu-img-direct
+# writes directly to the target block device via `qemu-img convert -n
+# --target-is-zero`, skipping any intermediate RAW file; CONVERT_MODE=
+# qemu-img is the fallback for targets that don't read back as zero).
+#
+# virt-v2v + libguestfs are included for CONVERT_MODE=virt-v2v, which is
+# REQUIRED for Windows guests: qemu-img is a pure format converter and
+# never touches anything inside the guest filesystem, so a Windows VM
+# exported from VMware (VMware-specific drivers, boot configuration tied
+# to VMware's virtual hardware) will typically fail to boot under
+# KVM/QEMU without driver injection and boot-config fixups, which only
+# virt-v2v performs. virt-v2v has no way to write directly to an
+# arbitrary pre-existing block device (its output modes target local
+# files, oVirt/RHV, or OpenStack-via-REST-API), so this mode converts to
+# a scratch RAW file and dd's it onto the target, like CONVERT_MODE=
+# qemu-img -- it does not support the space-saving direct-write
+# optimization that qemu-img-direct uses for Linux sources. See
+# convert-and-import.sh and OPERATIONS-GUIDE.md Section 3 for the full
+# comparison and when each mode is required vs. optional.
 FROM registry.fedoraproject.org/fedora-minimal:44
 
 # Build-time proxy support (e.g. --build-arg http_proxy=http://proxy:3128/).
@@ -24,8 +35,9 @@ WORKDIR /root
 RUN microdnf install -y --nodocs --setopt install_weak_deps=False \
         bash \
         curl ca-certificates tar unzip \
-        qemu-img \
-        util-linux \
+        qemu-img qemu-kvm qemu-tools nbd \
+        libguestfs libguestfs-tools-c virt-v2v \
+        util-linux util-linux-script \
         coreutils \
         python3 \
         perl-Digest-SHA && \
@@ -33,5 +45,7 @@ RUN microdnf install -y --nodocs --setopt install_weak_deps=False \
 
 COPY convert-and-import.sh /scripts/convert-and-import.sh
 RUN chmod +x /scripts/convert-and-import.sh
+
+ENV LIBGUESTFS_BACKEND=direct
 
 ENTRYPOINT ["/bin/bash", "/scripts/convert-and-import.sh"]

@@ -42,6 +42,35 @@
 #     (in addition to the downloaded source image itself). Use this when
 #     TARGET_DEVICE might not read back as zero (e.g. a reused volume) or
 #     when you'd rather not rely on the --target-is-zero assumption at all.
+#   - CONVERT_MODE=virt-v2v: run `virt-v2v -i ova|disk -o local -of raw` to
+#     a scratch file, then `dd` that file onto the target block device.
+#     **REQUIRED for Windows guests.** qemu-img convert/qemu-img-direct
+#     are pure format converters -- they copy the disk's bytes from one
+#     container format to another (vmdk -> raw) without touching anything
+#     inside the guest filesystem. A Windows guest exported from VMware
+#     has VMware-specific drivers (and often no virtio drivers at all),
+#     a boot configuration pointing at VMware's virtual hardware, and (for
+#     older Windows versions) a HAL tied to that hardware -- booting this
+#     unmodified under KVM/QEMU (what Nova uses) typically fails with a
+#     boot-time bluescreen (commonly INACCESSIBLE_BOOT_DEVICE or a similar
+#     STOP code) because the guest can't find/drive its boot disk under
+#     the new virtual hardware. virt-v2v fixes this: it mounts the guest
+#     filesystem, injects VirtIO drivers, and rewrites the boot
+#     configuration to work under KVM, in addition to converting the disk
+#     format. Linux guests are generally more portable across hypervisors
+#     without this step (most modern distros already include virtio
+#     drivers and don't hardcode hypervisor-specific boot paths), which is
+#     why qemu-img-direct/qemu-img are suitable there and are the default,
+#     but for Windows sources this mode is not optional.
+#     Also requires real KVM acceleration to run in reasonable time
+#     (requires /dev/kvm on the node, e.g. via the KubeVirt device plugin)
+#     and requires the guest OS to be recognized by libguestfs's
+#     inspection; OSTree/Ignition-based Linux distributions (e.g. Fedora
+#     CoreOS) are NOT recognized and will fail -- use qemu-img-direct for
+#     those instead. Like CONVERT_MODE=qemu-img, this mode converts to a
+#     scratch RAW file first (virt-v2v has no supported way to write
+#     directly to an arbitrary pre-existing block device), so it needs
+#     scratch space roughly equal to the virtual size of the source disk.
 #
 # This script is intended to run inside the Pod/Job defined in job.yaml.
 #
@@ -55,7 +84,9 @@
 # Optional environment variables:
 #   SOURCE_IMAGE_PATH   - Local path to the source image if already present.
 #                         Takes precedence over SOURCE_IMAGE_URL.
-#   CONVERT_MODE        - "qemu-img-direct" (default) or "qemu-img".
+#   CONVERT_MODE        - "qemu-img-direct" (default), "qemu-img", or
+#                         "virt-v2v" (required for Windows guests -- see
+#                         the comment above for why).
 #   ZERO_CHECK_SAMPLE_BYTES - Bytes sampled from the start, middle, and end
 #                         of TARGET_DEVICE to verify it reads as zero
 #                         before using CONVERT_MODE=qemu-img-direct.
@@ -92,6 +123,9 @@
 #                         output instead (e.g. if you're running the
 #                         script directly in an interactive terminal where
 #                         the \r-based live-updating bar renders fine).
+#   ENABLE_DEBUG        - If "true", passes --debug to virt-v2v for
+#                         verbose troubleshooting output. Only relevant
+#                         when CONVERT_MODE=virt-v2v. Defaults to "false".
 #
 set -euo pipefail
 
@@ -131,8 +165,11 @@ require_var TARGET_DEVICE
 
 # Resolves SRC_PATH (a .ova archive, a bare .vmdk/.qcow2/etc. file, or a
 # directory containing a loose .ovf + its referenced disk) to a single
-# qemu-img-readable disk image path. Used by both CONVERT_MODE=qemu-img and
-# CONVERT_MODE=qemu-img-direct. Sets DISK_IMAGE as a side effect.
+# qemu-img-readable disk image path. Used by CONVERT_MODE=qemu-img and
+# CONVERT_MODE=qemu-img-direct ONLY. CONVERT_MODE=virt-v2v handles input
+# resolution itself (it operates on the whole VM definition, not a single
+# selected .vmdk -- see the virt-v2v case below and its note on
+# DISK_SELECTOR having no effect there). Sets DISK_IMAGE as a side effect.
 resolve_disk_image() {
   DISK_IMAGE="${SRC_PATH}"
 
@@ -395,8 +432,61 @@ case "${CONVERT_MODE}" in
     run_with_progress qemu-img convert -p -O raw "${DISK_IMAGE}" "${RAW_PATH}"
     ;;
 
+  virt-v2v)
+    log_info "Converting with virt-v2v (mode=virt-v2v)"
+    if [ -d "${SRC_PATH}" ]; then
+      # A directory containing a loose OVF descriptor + its referenced
+      # files (.vmdk, .nvram, etc). virt-v2v's "ova" input mode accepts
+      # both a .ova tar archive and a directory of this kind.
+      OVF_FILE="$(find "${SRC_PATH}" -maxdepth 1 -iname '*.ovf' | sort | head -n1)"
+      [ -n "${OVF_FILE}" ] || fail "no .ovf descriptor found in directory ${SRC_PATH}"
+      log_debug "Using OVF directory: ${SRC_PATH} (descriptor: ${OVF_FILE})"
+      VIRT_V2V_INPUT_ARGS=(-i ova "${SRC_PATH}")
+    else
+      case "${SRC_PATH}" in
+        *.ova)
+          VIRT_V2V_INPUT_ARGS=(-i ova "${SRC_PATH}")
+          ;;
+        *.ovf)
+          fail "a bare .ovf file was provided but it has no embedded disk; point at the containing directory (so virt-v2v can find the referenced .vmdk/.nvram files), or at the .ova archive instead"
+          ;;
+        *)
+          VIRT_V2V_INPUT_ARGS=(-i disk "${SRC_PATH}")
+          ;;
+      esac
+    fi
+
+    if [ -n "${DISK_SELECTOR:-}" ]; then
+      log_warn "DISK_SELECTOR is set but has no effect under CONVERT_MODE=virt-v2v -- virt-v2v converts every disk referenced by the source VM's .ovf/.vmx definition as a single unit (this matters for Windows guests, where the boot disk and any additional data disks are typically interdependent parts of one guest conversion, not independently selectable). If you need to import only one disk of a multi-disk Windows source, this is not currently supported by this script; consider CONVERT_MODE=qemu-img against that disk's .vmdk directly instead, understanding that the driver-injection/boot-fixup benefits of virt-v2v will not apply to it."
+    fi
+
+    VIRT_V2V_DEBUG_FLAG=""
+    if [ "${ENABLE_DEBUG:-false}" = "true" ]; then
+      VIRT_V2V_DEBUG_FLAG="--debug"
+    fi
+
+    # virt-v2v -o local writes files named "NAME-sda", "NAME-sdb", etc.
+    # (NOT "NAME-sda.raw" -- the -of raw flag controls the on-disk format,
+    # not the filename suffix). Use a dedicated output dir and locate the
+    # first disk image deterministically, excluding the accompanying
+    # libvirt XML descriptor.
+    VIRT_V2V_OUT_DIR="${WORK_DIR}/raw"
+    rm -f "${VIRT_V2V_OUT_DIR}"/* 2>/dev/null || true
+
+    # shellcheck disable=SC2086
+    run_with_progress virt-v2v ${VIRT_V2V_DEBUG_FLAG} "${VIRT_V2V_INPUT_ARGS[@]}" -o local -os "${VIRT_V2V_OUT_DIR}" -of raw
+
+    VIRT_V2V_CONVERTED_RAW="$(find "${VIRT_V2V_OUT_DIR}" -maxdepth 1 -type f \( -iname '*-sda' -o -iname '*-sda.raw' \) | sort | head -n1)"
+    if [ -z "${VIRT_V2V_CONVERTED_RAW}" ]; then
+      # Fallback: any regular file that isn't the libvirt XML descriptor.
+      VIRT_V2V_CONVERTED_RAW="$(find "${VIRT_V2V_OUT_DIR}" -maxdepth 1 -type f ! -iname '*.xml' | sort | head -n1)"
+    fi
+    [ -n "${VIRT_V2V_CONVERTED_RAW}" ] && [ -f "${VIRT_V2V_CONVERTED_RAW}" ] || fail "virt-v2v did not produce a disk output file in ${VIRT_V2V_OUT_DIR}"
+    [ "${VIRT_V2V_CONVERTED_RAW}" = "${RAW_PATH}" ] || mv "${VIRT_V2V_CONVERTED_RAW}" "${RAW_PATH}"
+    ;;
+
   *)
-    fail "unknown CONVERT_MODE '${CONVERT_MODE}' (expected 'qemu-img-direct' or 'qemu-img')"
+    fail "unknown CONVERT_MODE '${CONVERT_MODE}' (expected 'qemu-img-direct', 'qemu-img', or 'virt-v2v')"
     ;;
 esac
 
