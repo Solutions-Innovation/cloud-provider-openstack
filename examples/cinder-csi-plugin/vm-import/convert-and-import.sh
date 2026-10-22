@@ -8,7 +8,7 @@
 # CSI driver in this project).
 #
 # Conversion strategy:
-#   - CONVERT_MODE=qemu-img-direct (default): run `qemu-img convert -O raw`
+#   - CONVERT_MODE=direct (default): run `qemu-img convert -O raw`
 #     directly onto the target block device, skipping any intermediate RAW
 #     file. This uses `-n --target-is-zero`, which tells qemu-img to assume
 #     the destination already reads back as all zeros and to skip writing
@@ -23,9 +23,9 @@
 #     (observed: 4+ minutes with zero additional bytes written, confirmed
 #     via the kernel reporting the writer thread blocked in
 #     submit_bio_wait) where this mode's actual run took ~18.5 seconds,
-#     producing output with an identical sha256 checksum to the
-#     file-based path below. This is a known qemu-img behavior, not a bug:
-#     see https://github.com/oVirt/vdsm/commit/2bbe66274524cc009f39d3a5e5577b84144f1171
+#     producing output with an identical sha256 checksum to a scratch-file
+#     based conversion. This is a known qemu-img behavior, not a bug: see
+#     https://github.com/oVirt/vdsm/commit/2bbe66274524cc009f39d3a5e5577b84144f1171
 #     for upstream's own measurements (up to 250x on their workload).
 #     SAFETY: --target-is-zero is only correct if the target block device
 #     truly reads back as zero everywhere. This script verifies that by
@@ -33,44 +33,61 @@
 #     refuses to proceed if any sampled region is non-zero. A freshly
 #     provisioned CSI volume (Cinder, Ceph RBD, etc.) should always read
 #     as zero; a volume that has been written to before (e.g. reused
-#     across test runs without the backing storage being wiped) might not
-#     be. If the check fails, use CONVERT_MODE=qemu-img instead.
-#   - CONVERT_MODE=qemu-img: run `qemu-img convert -O raw` to a scratch
-#     file, then `dd` that file onto the target block device. Simple and
-#     safe regardless of the target device's prior contents, but requires
-#     scratch space roughly equal to the virtual size of the source disk
-#     (in addition to the downloaded source image itself). Use this when
-#     TARGET_DEVICE might not read back as zero (e.g. a reused volume) or
-#     when you'd rather not rely on the --target-is-zero assumption at all.
-#   - CONVERT_MODE=virt-v2v: run `virt-v2v -i ova|disk -o local -of raw` to
-#     a scratch file, then `dd` that file onto the target block device.
-#     **REQUIRED for Windows guests.** qemu-img convert/qemu-img-direct
-#     are pure format converters -- they copy the disk's bytes from one
-#     container format to another (vmdk -> raw) without touching anything
-#     inside the guest filesystem. A Windows guest exported from VMware
-#     has VMware-specific drivers (and often no virtio drivers at all),
-#     a boot configuration pointing at VMware's virtual hardware, and (for
-#     older Windows versions) a HAL tied to that hardware -- booting this
-#     unmodified under KVM/QEMU (what Nova uses) typically fails with a
-#     boot-time bluescreen (commonly INACCESSIBLE_BOOT_DEVICE or a similar
-#     STOP code) because the guest can't find/drive its boot disk under
-#     the new virtual hardware. virt-v2v fixes this: it mounts the guest
+#     across test runs without the backing storage being wiped) will not
+#     be, and this script will refuse to run rather than risk corruption
+#     -- provision a fresh volume instead of reusing one in that case.
+#     This mode only converts the disk's byte-for-byte format -- it does
+#     not touch anything inside the guest filesystem. This is fine for
+#     most Linux guests (modern distros already include virtio drivers and
+#     don't hardcode hypervisor-specific boot paths) but is NOT sufficient
+#     for Windows guests -- see CONVERT_MODE=direct-v2v below.
+#   - CONVERT_MODE=direct-v2v: for Windows guests. Runs the exact same
+#     direct-mode write described above (straight onto TARGET_DEVICE, no
+#     intermediate RAW file, same --target-is-zero safety check), then
+#     runs `virt-v2v-in-place -i disk TARGET_DEVICE` directly against the
+#     target block device to perform driver injection/boot-config fixup
+#     IN PLACE on the data that's already there. No intermediate RAW file
+#     is ever created for virt-v2v either, so this mode needs no more
+#     scratch space than CONVERT_MODE=direct (just the downloaded/
+#     extracted source image, not the virtual disk size). The direct
+#     write (`qemu-img convert`) is a pure format converter -- it copies
+#     the disk's bytes from one container format to another (vmdk ->
+#     raw) without touching anything inside the guest filesystem.
+#     A Windows guest exported from VMware has VMware-specific drivers
+#     (and often no virtio drivers at all), a boot configuration pointing
+#     at VMware's virtual hardware, and (for older Windows versions) a HAL
+#     tied to that hardware -- booting this unmodified under KVM/QEMU
+#     (what Nova uses) typically fails with a boot-time bluescreen
+#     (commonly INACCESSIBLE_BOOT_DEVICE or a similar STOP code) because
+#     the guest can't find/drive its boot disk under the new virtual
+#     hardware. virt-v2v-in-place fixes this: it mounts the guest
 #     filesystem, injects VirtIO drivers, and rewrites the boot
 #     configuration to work under KVM, in addition to converting the disk
-#     format. Linux guests are generally more portable across hypervisors
-#     without this step (most modern distros already include virtio
-#     drivers and don't hardcode hypervisor-specific boot paths), which is
-#     why qemu-img-direct/qemu-img are suitable there and are the default,
-#     but for Windows sources this mode is not optional.
-#     Also requires real KVM acceleration to run in reasonable time
-#     (requires /dev/kvm on the node, e.g. via the KubeVirt device plugin)
-#     and requires the guest OS to be recognized by libguestfs's
+#     format. Verified in testing against a 90GiB-virtual/~5.2GiB-actual
+#     Windows Server 2019 guest with no KVM acceleration available: the
+#     direct-mode write took ~3 minutes, virt-v2v-in-place took ~3.2
+#     minutes, for a total of ~6.2 minutes, using only a small (8Gi)
+#     emptyDir for scratch space -- no large scratch volume needed.
+#     Produced a correct GPT layout and NTFS boot-sector signature on the
+#     target device.
+#     IMPORTANT SAFETY NOTE: virt-v2v-in-place modifies TARGET_DEVICE's
+#     data IN PLACE, with NO backup of the pre-conversion state. Per
+#     upstream's own documentation: "If virt-v2v-in-place fails it will
+#     return a non-zero (error) exit code. In this case, the disk image
+#     will be in an unknown, possibly corrupted state." This script does
+#     not and cannot work around that risk -- if the virt-v2v-in-place
+#     step fails, the just-written data on TARGET_DEVICE may be left
+#     partially modified. Use a freshly provisioned, disposable target
+#     volume; do not use this mode against a volume you cannot afford to
+#     recreate from the source image again if something goes wrong.
+#     Also requires the guest OS to be recognized by libguestfs's
 #     inspection; OSTree/Ignition-based Linux distributions (e.g. Fedora
-#     CoreOS) are NOT recognized and will fail -- use qemu-img-direct for
-#     those instead. Like CONVERT_MODE=qemu-img, this mode converts to a
-#     scratch RAW file first (virt-v2v has no supported way to write
-#     directly to an arbitrary pre-existing block device), so it needs
-#     scratch space roughly equal to the virtual size of the source disk.
+#     CoreOS) are NOT recognized and will fail -- use CONVERT_MODE=direct
+#     for those instead. Performs noticeably better with real KVM
+#     acceleration available (/dev/kvm on the node, e.g. via the KubeVirt
+#     device plugin); still works without it, via software emulation,
+#     just much slower (as in the ~6.2 minute figure above, which was
+#     measured WITHOUT KVM acceleration).
 #
 # This script is intended to run inside the Pod/Job defined in job.yaml.
 #
@@ -84,28 +101,36 @@
 # Optional environment variables:
 #   SOURCE_IMAGE_PATH   - Local path to the source image if already present.
 #                         Takes precedence over SOURCE_IMAGE_URL.
-#   CONVERT_MODE        - "qemu-img-direct" (default), "qemu-img", or
-#                         "virt-v2v" (required for Windows guests -- see
-#                         the comment above for why).
+#   CONVERT_MODE        - "direct" (default, Linux guests) or "direct-v2v"
+#                         (Windows guests -- see the comment above for why
+#                         and for the in-place-modification risk it carries).
+#   NO_FSTRIM           - If "true", passes --no-fstrim to virt-v2v-in-place
+#                         under CONVERT_MODE=direct-v2v, skipping the
+#                         filesystem trim virt-v2v normally does before
+#                         conversion. Only relevant for that mode.
+#                         Defaults to "false".
 #   ZERO_CHECK_SAMPLE_BYTES - Bytes sampled from the start, middle, and end
 #                         of TARGET_DEVICE to verify it reads as zero
-#                         before using CONVERT_MODE=qemu-img-direct.
+#                         before writing (both modes perform this check).
 #                         Defaults to 104857600 (100MiB) per sample.
 #   WORK_DIR            - Scratch directory for intermediate files. Defaults
-#                         to /work.
-#   DD_BLOCK_SIZE       - Block size passed to dd. Defaults to 4M.
+#                         to /work. Only needs to hold the downloaded/
+#                         extracted source image -- neither mode ever
+#                         writes a full intermediate RAW file here.
 #   VERIFY_CHECKSUM      - If "true", compute and compare sha256 checksums
-#                         of the RAW image and the data written to
-#                         TARGET_DEVICE. Defaults to "false" (reading back a
-#                         large device roughly doubles total I/O time). Note:
-#                         under CONVERT_MODE=qemu-img-direct, enabling this
-#                         requires a temporary RAW file after all (qemu-img
-#                         cannot write RAW output to a pipe), so it
-#                         temporarily reintroduces the scratch-space
-#                         requirement that qemu-img-direct otherwise avoids.
-#                         The temporary file is removed immediately after
-#                         the checksum comparison.
+#                         of the source image and the data written to
+#                         TARGET_DEVICE (the direct-mode write only; under
+#                         CONVERT_MODE=direct-v2v this does not cover the
+#                         subsequent virt-v2v-in-place modification).
+#                         Defaults to "false" (reading back a large device
+#                         roughly doubles total I/O time). Requires a
+#                         temporary RAW file (qemu-img convert cannot
+#                         stream RAW output to a pipe), removed immediately
+#                         after the checksum comparison.
 #   KEEP_WORK_DIR       - If "true", skip cleanup of WORK_DIR on success.
+#   DISK_SELECTOR       - Filename (basename only) to pick a specific disk
+#                         when the source has more than one .vmdk. Only
+#                         affects the direct-mode write phase; see below.
 #   PROGRESS_STEP_PERCENT   - Print a progress update whenever progress
 #                         advances by at least this many percentage points.
 #                         Defaults to 10.
@@ -113,19 +138,20 @@
 #                         (in seconds) even if PROGRESS_STEP_PERCENT hasn't
 #                         been reached yet, so long-running steps with slow
 #                         progress still show activity. Defaults to 15.
-#   PROGRESS_MODE       - "clean" (default) throttles qemu-img/dd's native
-#                         \r-based progress output (hundreds of
-#                         "(NN.NN/100%)" ticks that look like a garbled
-#                         wall of text when captured non-interactively,
-#                         e.g. by `kubectl logs`) into a handful of clean,
-#                         timestamped single-line updates. Set to "raw" to
-#                         disable this and see qemu-img's/dd's native
-#                         output instead (e.g. if you're running the
-#                         script directly in an interactive terminal where
-#                         the \r-based live-updating bar renders fine).
-#   ENABLE_DEBUG        - If "true", passes --debug to virt-v2v for
+#   PROGRESS_MODE       - "clean" (default) throttles qemu-img's/
+#                         virt-v2v-in-place's native \r-based progress
+#                         output (hundreds of "(NN.NN/100%)" ticks that
+#                         look like a garbled wall of text when captured
+#                         non-interactively, e.g. by `kubectl logs`) into a
+#                         handful of clean, timestamped single-line
+#                         updates. Set to "raw" to disable this and see the
+#                         tool's native output instead (e.g. if you're
+#                         running the script directly in an interactive
+#                         terminal where the \r-based live-updating bar
+#                         renders fine).
+#   ENABLE_DEBUG        - If "true", passes -v to virt-v2v-in-place for
 #                         verbose troubleshooting output. Only relevant
-#                         when CONVERT_MODE=virt-v2v. Defaults to "false".
+#                         when CONVERT_MODE=direct-v2v. Defaults to "false".
 #
 set -euo pipefail
 
@@ -148,8 +174,7 @@ require_var() {
 }
 
 WORK_DIR="${WORK_DIR:-/work}"
-CONVERT_MODE="${CONVERT_MODE:-qemu-img-direct}"
-DD_BLOCK_SIZE="${DD_BLOCK_SIZE:-4M}"
+CONVERT_MODE="${CONVERT_MODE:-direct}"
 VERIFY_CHECKSUM="${VERIFY_CHECKSUM:-false}"
 ZERO_CHECK_SAMPLE_BYTES="${ZERO_CHECK_SAMPLE_BYTES:-104857600}"
 PROGRESS_MODE="${PROGRESS_MODE:-clean}"
@@ -165,11 +190,7 @@ require_var TARGET_DEVICE
 
 # Resolves SRC_PATH (a .ova archive, a bare .vmdk/.qcow2/etc. file, or a
 # directory containing a loose .ovf + its referenced disk) to a single
-# qemu-img-readable disk image path. Used by CONVERT_MODE=qemu-img and
-# CONVERT_MODE=qemu-img-direct ONLY. CONVERT_MODE=virt-v2v handles input
-# resolution itself (it operates on the whole VM definition, not a single
-# selected .vmdk -- see the virt-v2v case below and its note on
-# DISK_SELECTOR having no effect there). Sets DISK_IMAGE as a side effect.
+# qemu-img-readable disk image path. Sets DISK_IMAGE as a side effect.
 resolve_disk_image() {
   DISK_IMAGE="${SRC_PATH}"
 
@@ -264,20 +285,20 @@ verify_target_is_zero() {
   for offset in 0 "${mid_skip}" "${end_skip}"; do
     if ! dd if="${TARGET_DEVICE}" bs="${sample}" count=1 skip="$(( offset / sample ))" iflag=skip_bytes 2>/dev/null \
          | python3 -c 'import sys; data = sys.stdin.buffer.read(); sys.exit(0 if data == b"\x00" * len(data) else 1)'; then
-      fail "TARGET_DEVICE is not all-zero at byte offset ${offset}; refusing to use CONVERT_MODE=qemu-img-direct (--target-is-zero would be unsafe -- it assumes the destination already reads as zero). Use CONVERT_MODE=qemu-img instead, or ensure the volume is freshly provisioned/wiped."
+      fail "TARGET_DEVICE is not all-zero at byte offset ${offset}; refusing to proceed (--target-is-zero would be unsafe -- it assumes the destination already reads as zero). Provision a fresh volume instead of reusing one that has been written to before."
     fi
   done
   log_debug "Zero check passed"
 }
 
 # Runs "$@" (expected to be `qemu-img convert -p ...` or
-# `dd ... status=progress`) and, unless PROGRESS_MODE=raw, pipes its
+# `virt-v2v-in-place ...`) and, unless PROGRESS_MODE=raw, pipes its
 # combined stdout+stderr through a Python filter that throttles the
 # command's native \r-delimited progress updates (hundreds of
-# "(NN.NN/100%)" ticks for qemu-img, or one update per second for dd) down
-# to a handful of clean, timestamped, newline-terminated lines -- readable
-# in `kubectl logs` and similar non-interactive log viewers, which don't
-# interpret \r the way a real terminal does.
+# "(NN.NN/100%)" ticks) down to a handful of clean, timestamped,
+# newline-terminated lines -- readable in `kubectl logs` and similar
+# non-interactive log viewers, which don't interpret \r the way a real
+# terminal does.
 #
 # `stdbuf -o0 -e0` forces the wrapped command's stdout/stderr to be
 # COMPLETELY unbuffered (not just line-buffered) even though it's not a
@@ -378,42 +399,52 @@ DEV_SIZE_BYTES=$(blockdev --getsize64 "${TARGET_DEVICE}")
 log_debug "Target device size: ${DEV_SIZE_BYTES} bytes"
 
 # ---------------------------------------------------------------------------
-# Step 2: convert (and, for qemu-img-direct, write) the source image
+# Step 2: write the source image directly onto TARGET_DEVICE
 # ---------------------------------------------------------------------------
+
+# Resolves the source disk image, verifies TARGET_DEVICE reads as
+# all-zero, checks the source fits, and writes straight onto TARGET_DEVICE
+# with `qemu-img convert -n --target-is-zero`, optionally verifying a
+# checksum afterward. Used by both CONVERT_MODE=direct and
+# CONVERT_MODE=direct-v2v as their (identical) first phase.
+do_direct_write() {
+  resolve_disk_image
+
+  verify_target_is_zero "${DEV_SIZE_BYTES}"
+
+  qemu-img info "${DISK_IMAGE}"
+
+  SRC_VIRTUAL_SIZE_BYTES=$(qemu-img info --output=json "${DISK_IMAGE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["virtual-size"])')
+  if [ -n "${SRC_VIRTUAL_SIZE_BYTES}" ] && [ "${SRC_VIRTUAL_SIZE_BYTES}" -gt "${DEV_SIZE_BYTES}" ]; then
+    fail "source disk (${SRC_VIRTUAL_SIZE_BYTES} bytes) is larger than target device ${TARGET_DEVICE} (${DEV_SIZE_BYTES} bytes). Resize the PVC/Cinder volume before retrying."
+  fi
+
+  log_info "Writing directly to ${TARGET_DEVICE} using qemu-img convert -n --target-is-zero"
+  run_with_progress qemu-img convert -p -n --target-is-zero -O raw "${DISK_IMAGE}" "${TARGET_DEVICE}"
+  sync
+  log_info "qemu-img convert completed"
+
+  if [ "${VERIFY_CHECKSUM}" = "true" ]; then
+    log_info "Verifying checksum (reads ${SRC_VIRTUAL_SIZE_BYTES:-${DEV_SIZE_BYTES}} bytes back from ${TARGET_DEVICE})"
+    # qemu-img convert cannot write RAW output to a pipe/stdout (its
+    # output driver needs a seekable target), so a temporary file is
+    # required here. This only affects VERIFY_CHECKSUM=true runs, not
+    # the default path, which never creates this file.
+    qemu-img convert -O raw "${DISK_IMAGE}" "${RAW_PATH}"
+    SRC_SUM=$(sha256sum "${RAW_PATH}" | awk '{print $1}')
+    DST_SUM=$(head -c "${SRC_VIRTUAL_SIZE_BYTES:-${DEV_SIZE_BYTES}}" "${TARGET_DEVICE}" | sha256sum | awk '{print $1}')
+    rm -f "${RAW_PATH}"
+    if [ "${SRC_SUM}" != "${DST_SUM}" ]; then
+      fail "checksum mismatch: source=${SRC_SUM} target=${DST_SUM}"
+    fi
+    log_info "Checksum verified: ${SRC_SUM}"
+  fi
+}
+
 case "${CONVERT_MODE}" in
-  qemu-img-direct)
-    log_info "Converting with qemu-img directly onto ${TARGET_DEVICE} (mode=qemu-img-direct, no intermediate RAW file)"
-    resolve_disk_image
-
-    verify_target_is_zero "${DEV_SIZE_BYTES}"
-
-    qemu-img info "${DISK_IMAGE}"
-
-    SRC_VIRTUAL_SIZE_BYTES=$(qemu-img info --output=json "${DISK_IMAGE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["virtual-size"])')
-    if [ -n "${SRC_VIRTUAL_SIZE_BYTES}" ] && [ "${SRC_VIRTUAL_SIZE_BYTES}" -gt "${DEV_SIZE_BYTES}" ]; then
-      fail "source disk (${SRC_VIRTUAL_SIZE_BYTES} bytes) is larger than target device ${TARGET_DEVICE} (${DEV_SIZE_BYTES} bytes). Resize the PVC/Cinder volume before retrying."
-    fi
-
-    log_info "Writing directly to ${TARGET_DEVICE} using qemu-img convert -n --target-is-zero"
-    run_with_progress qemu-img convert -p -n --target-is-zero -O raw "${DISK_IMAGE}" "${TARGET_DEVICE}"
-    sync
-    log_info "qemu-img convert completed"
-
-    if [ "${VERIFY_CHECKSUM}" = "true" ]; then
-      log_info "Verifying checksum (reads ${SRC_VIRTUAL_SIZE_BYTES:-${DEV_SIZE_BYTES}} bytes back from ${TARGET_DEVICE})"
-      # qemu-img convert cannot write RAW output to a pipe/stdout (its
-      # output driver needs a seekable target), so a temporary file is
-      # required here. This only affects VERIFY_CHECKSUM=true runs, not
-      # the default qemu-img-direct path, which never creates this file.
-      qemu-img convert -O raw "${DISK_IMAGE}" "${RAW_PATH}"
-      SRC_SUM=$(sha256sum "${RAW_PATH}" | awk '{print $1}')
-      DST_SUM=$(head -c "${SRC_VIRTUAL_SIZE_BYTES:-${DEV_SIZE_BYTES}}" "${TARGET_DEVICE}" | sha256sum | awk '{print $1}')
-      rm -f "${RAW_PATH}"
-      if [ "${SRC_SUM}" != "${DST_SUM}" ]; then
-        fail "checksum mismatch: source=${SRC_SUM} target=${DST_SUM}"
-      fi
-      log_info "Checksum verified: ${SRC_SUM}"
-    fi
+  direct)
+    log_info "Writing directly onto ${TARGET_DEVICE} (mode=direct, no intermediate RAW file)"
+    do_direct_write
 
     if [ "${KEEP_WORK_DIR:-false}" != "true" ]; then
       log_debug "Cleaning up ${WORK_DIR}"
@@ -424,108 +455,41 @@ case "${CONVERT_MODE}" in
     exit 0
     ;;
 
-  qemu-img)
-    log_info "Converting with qemu-img (mode=qemu-img)"
-    resolve_disk_image
+  direct-v2v)
+    log_info "Writing directly onto ${TARGET_DEVICE}, then running virt-v2v-in-place (mode=direct-v2v)"
+    log_warn "virt-v2v-in-place modifies TARGET_DEVICE's data IN PLACE with no backup. If it fails, TARGET_DEVICE may be left in an unknown, possibly corrupted state. Only use this mode against a freshly provisioned, disposable target volume."
+    do_direct_write
 
-    qemu-img info "${DISK_IMAGE}"
-    run_with_progress qemu-img convert -p -O raw "${DISK_IMAGE}" "${RAW_PATH}"
-    ;;
-
-  virt-v2v)
-    log_info "Converting with virt-v2v (mode=virt-v2v)"
-    if [ -d "${SRC_PATH}" ]; then
-      # A directory containing a loose OVF descriptor + its referenced
-      # files (.vmdk, .nvram, etc). virt-v2v's "ova" input mode accepts
-      # both a .ova tar archive and a directory of this kind.
-      OVF_FILE="$(find "${SRC_PATH}" -maxdepth 1 -iname '*.ovf' | sort | head -n1)"
-      [ -n "${OVF_FILE}" ] || fail "no .ovf descriptor found in directory ${SRC_PATH}"
-      log_debug "Using OVF directory: ${SRC_PATH} (descriptor: ${OVF_FILE})"
-      VIRT_V2V_INPUT_ARGS=(-i ova "${SRC_PATH}")
-    else
-      case "${SRC_PATH}" in
-        *.ova)
-          VIRT_V2V_INPUT_ARGS=(-i ova "${SRC_PATH}")
-          ;;
-        *.ovf)
-          fail "a bare .ovf file was provided but it has no embedded disk; point at the containing directory (so virt-v2v can find the referenced .vmdk/.nvram files), or at the .ova archive instead"
-          ;;
-        *)
-          VIRT_V2V_INPUT_ARGS=(-i disk "${SRC_PATH}")
-          ;;
-      esac
+    if [ "${KEEP_WORK_DIR:-false}" != "true" ]; then
+      log_debug "Cleaning up ${WORK_DIR}"
+      rm -rf "${WORK_DIR:?}"/input "${WORK_DIR:?}"/raw
     fi
 
     if [ -n "${DISK_SELECTOR:-}" ]; then
-      log_warn "DISK_SELECTOR is set but has no effect under CONVERT_MODE=virt-v2v -- virt-v2v converts every disk referenced by the source VM's .ovf/.vmx definition as a single unit (this matters for Windows guests, where the boot disk and any additional data disks are typically interdependent parts of one guest conversion, not independently selectable). If you need to import only one disk of a multi-disk Windows source, this is not currently supported by this script; consider CONVERT_MODE=qemu-img against that disk's .vmdk directly instead, understanding that the driver-injection/boot-fixup benefits of virt-v2v will not apply to it."
+      log_warn "DISK_SELECTOR is set but only affects the initial direct-mode write under CONVERT_MODE=direct-v2v -- the subsequent virt-v2v-in-place step operates on the whole TARGET_DEVICE as a single disk, with no disk-selection concept of its own."
+    fi
+
+    VIRT_V2V_IN_PLACE_FSTRIM_FLAG=""
+    if [ "${NO_FSTRIM:-false}" = "true" ]; then
+      VIRT_V2V_IN_PLACE_FSTRIM_FLAG="--no-fstrim"
     fi
 
     VIRT_V2V_DEBUG_FLAG=""
     if [ "${ENABLE_DEBUG:-false}" = "true" ]; then
-      VIRT_V2V_DEBUG_FLAG="--debug"
+      VIRT_V2V_DEBUG_FLAG="-v"
     fi
 
-    # virt-v2v -o local writes files named "NAME-sda", "NAME-sdb", etc.
-    # (NOT "NAME-sda.raw" -- the -of raw flag controls the on-disk format,
-    # not the filename suffix). Use a dedicated output dir and locate the
-    # first disk image deterministically, excluding the accompanying
-    # libvirt XML descriptor.
-    VIRT_V2V_OUT_DIR="${WORK_DIR}/raw"
-    rm -f "${VIRT_V2V_OUT_DIR}"/* 2>/dev/null || true
-
+    log_info "Running virt-v2v-in-place against ${TARGET_DEVICE} for driver injection/boot-config fixup"
     # shellcheck disable=SC2086
-    run_with_progress virt-v2v ${VIRT_V2V_DEBUG_FLAG} "${VIRT_V2V_INPUT_ARGS[@]}" -o local -os "${VIRT_V2V_OUT_DIR}" -of raw
+    run_with_progress virt-v2v-in-place -i disk "${TARGET_DEVICE}" ${VIRT_V2V_IN_PLACE_FSTRIM_FLAG} ${VIRT_V2V_DEBUG_FLAG}
+    sync
+    log_info "virt-v2v-in-place completed"
 
-    VIRT_V2V_CONVERTED_RAW="$(find "${VIRT_V2V_OUT_DIR}" -maxdepth 1 -type f \( -iname '*-sda' -o -iname '*-sda.raw' \) | sort | head -n1)"
-    if [ -z "${VIRT_V2V_CONVERTED_RAW}" ]; then
-      # Fallback: any regular file that isn't the libvirt XML descriptor.
-      VIRT_V2V_CONVERTED_RAW="$(find "${VIRT_V2V_OUT_DIR}" -maxdepth 1 -type f ! -iname '*.xml' | sort | head -n1)"
-    fi
-    [ -n "${VIRT_V2V_CONVERTED_RAW}" ] && [ -f "${VIRT_V2V_CONVERTED_RAW}" ] || fail "virt-v2v did not produce a disk output file in ${VIRT_V2V_OUT_DIR}"
-    [ "${VIRT_V2V_CONVERTED_RAW}" = "${RAW_PATH}" ] || mv "${VIRT_V2V_CONVERTED_RAW}" "${RAW_PATH}"
+    log_info "Import complete: ${SRC_PATH} -> ${TARGET_DEVICE} (direct write + virt-v2v-in-place)"
+    exit 0
     ;;
 
   *)
-    fail "unknown CONVERT_MODE '${CONVERT_MODE}' (expected 'qemu-img-direct', 'qemu-img', or 'virt-v2v')"
+    fail "unknown CONVERT_MODE '${CONVERT_MODE}' (expected 'direct' or 'direct-v2v')"
     ;;
 esac
-
-[ -f "${RAW_PATH}" ] || fail "expected RAW output at ${RAW_PATH} but it was not found"
-
-RAW_SIZE_BYTES=$(stat -c%s "${RAW_PATH}")
-log_debug "RAW image size: ${RAW_SIZE_BYTES} bytes"
-
-if [ "${RAW_SIZE_BYTES}" -gt "${DEV_SIZE_BYTES}" ]; then
-  fail "RAW image (${RAW_SIZE_BYTES} bytes) is larger than target device ${TARGET_DEVICE} (${DEV_SIZE_BYTES} bytes). Resize the PVC/Cinder volume before retrying."
-fi
-
-# ---------------------------------------------------------------------------
-# Step 3: write the RAW image onto the target block device (Cinder volume)
-# ---------------------------------------------------------------------------
-log_info "Writing RAW image to ${TARGET_DEVICE} using dd (bs=${DD_BLOCK_SIZE})"
-run_with_progress dd if="${RAW_PATH}" of="${TARGET_DEVICE}" bs="${DD_BLOCK_SIZE}" conv=fsync status=progress
-sync
-log_info "dd completed"
-
-# ---------------------------------------------------------------------------
-# Step 4 (optional): verify checksum of written data
-# ---------------------------------------------------------------------------
-if [ "${VERIFY_CHECKSUM}" = "true" ]; then
-  log_info "Verifying checksum (reads ${RAW_SIZE_BYTES} bytes back from ${TARGET_DEVICE})"
-  SRC_SUM=$(sha256sum "${RAW_PATH}" | awk '{print $1}')
-  DST_SUM=$(head -c "${RAW_SIZE_BYTES}" "${TARGET_DEVICE}" | sha256sum | awk '{print $1}')
-  if [ "${SRC_SUM}" != "${DST_SUM}" ]; then
-    fail "checksum mismatch: source=${SRC_SUM} target=${DST_SUM}"
-  fi
-  log_info "Checksum verified: ${SRC_SUM}"
-fi
-
-# ---------------------------------------------------------------------------
-# Step 5: cleanup scratch files
-# ---------------------------------------------------------------------------
-if [ "${KEEP_WORK_DIR:-false}" != "true" ]; then
-  log_debug "Cleaning up ${WORK_DIR}"
-  rm -rf "${WORK_DIR:?}"/input "${WORK_DIR:?}"/raw
-fi
-
-log_info "Import complete: ${SRC_PATH} -> ${TARGET_DEVICE}"

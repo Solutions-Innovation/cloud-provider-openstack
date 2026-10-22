@@ -17,68 +17,73 @@ an OpenStack Cinder volume using a Kubernetes Job, the Cinder CSI driver's
    filesystem-formatted PVC would corrupt it — we need the raw device.
 2. A one-shot `Job` runs a container that:
    - downloads (or reads a locally mounted) source OVA/OVF/VMDK image
-   - converts and writes it using one of three strategies (`CONVERT_MODE`):
-     - `qemu-img-direct` (default) — `qemu-img convert -n --target-is-zero
-       -O raw` straight onto the target device, skipping any intermediate
-       RAW file. Needs scratch space only for the downloaded/extracted
-       source image, not the (potentially much larger) virtual disk size —
-       the key benefit when working with limited node ephemeral storage.
-       Verified end-to-end: ~20 seconds for a 10GiB-virtual/~1GiB-actual
-       `streamOptimized` VMDK, with a sha256 checksum identical to the
-       `qemu-img` mode's output. The script automatically verifies the
-       target device reads as all-zero before using this mode and refuses
-       to proceed otherwise, since the underlying `--target-is-zero`
-       assumption is unsafe on a previously-written volume. **This mode
-       (and `qemu-img` below) only converts the disk's byte-for-byte
-       format — it does not touch anything inside the guest filesystem,
-       which is fine for most Linux guests but is NOT sufficient for
-       Windows guests (see `virt-v2v` below).** See
-       [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#3-choosing-a-conversion-mode)
-       for the full performance analysis (including why writing to a block
-       device without `--target-is-zero` can stall for minutes on a sparse
-       VMDK).
-     - `qemu-img` — `qemu-img convert -O raw` to a scratch file, then `dd`
-       that file onto the target device. Safe regardless of the target
-       device's prior contents (no zero-read assumption), but needs
-       scratch space roughly 2x the source disk's virtual size. Use this
-       when `TARGET_DEVICE` might not read back as zero (e.g. a reused
-       volume) or when you'd rather not depend on that assumption at all.
-     - `virt-v2v` — **required for Windows guests.** `qemu-img`/
-       `qemu-img-direct` are pure format converters: they never touch the
-       guest filesystem. A Windows VM exported from VMware has
-       VMware-specific drivers and a boot configuration tied to VMware's
-       virtual hardware, and will typically fail to boot under KVM/QEMU
-       (the hypervisor Nova uses) without driver injection and
-       boot-configuration fixups — only `virt-v2v` performs these.
-       Converts to a scratch RAW file first (like `qemu-img` above;
-       `virt-v2v` has no way to write directly to a block device), then
-       `dd`s it onto the target. Needs real KVM acceleration for
-       reasonable speed (works without it, via software emulation, just
-       much slower) and requires the guest OS to be recognized by
-       libguestfs's inspection — Windows guests are well supported;
-       OSTree/Ignition-based Linux distros (e.g. Fedora CoreOS) are
-       **not** and will fail here, so use `qemu-img-direct`/`qemu-img` for
-       those instead. Verified end-to-end against a real Windows Server
-       2019 guest (90GiB-virtual/~5.2GiB-actual `streamOptimized` VMDK):
-       libguestfs correctly identified it as "Windows Server 2019
-       Standard Evaluation (win2k19)" and converted it to boot under KVM;
-       the resulting Cinder/Ceph RBD volume showed a correct GPT partition
-       layout (Windows RE + EFI System + Microsoft Reserved + an
-       NTFS-signed main partition) after import. Also verified (on a
-       Linux source, before Windows support was confirmed) against a
-       Fedora Server BIOS/MBR+LVM guest, with output identical (via
-       sha256) to the `qemu-img` path. See
-       [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#3-choosing-a-conversion-mode)
-       for the full comparison and real numbers for all three modes.
+   - writes it straight onto the target device with `qemu-img convert -n
+     --target-is-zero -O raw` — no intermediate RAW file at any point, so
+     scratch space only ever needs to hold the downloaded/extracted source
+     image itself, not the (potentially much larger) virtual disk size.
+     This relies on the target device genuinely reading back as all-zero;
+     the script verifies this automatically and refuses to proceed
+     otherwise. Verified end-to-end: ~20 seconds for a
+     10GiB-virtual/~1GiB-actual `streamOptimized` VMDK. See
+     [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#3-choosing-a-conversion-mode)
+     for the full performance analysis (including why writing to a block
+     device without `--target-is-zero` can stall for minutes on a sparse
+     VMDK).
+   - optionally (`CONVERT_MODE=direct-v2v`), runs `virt-v2v-in-place`
+     directly against the target device afterward, to inject drivers and
+     fix up the boot configuration **in place** — required for Windows
+     guests (see below)
    - optionally verifies a sha256 checksum of what was written
 3. Once the Job completes successfully, the Cinder volume behind the PVC
    contains the imported disk and can be used to boot a Nova instance, or
    referenced directly in OpenStack (`openstack volume show <volume-id>`),
    or bound into a different Pod as a data/boot volume.
 
+### Choosing `CONVERT_MODE`
+
+Two modes are supported, both writing straight onto the target device with
+no intermediate RAW file:
+
+- **`direct` (default)** — just the direct write described above. Fine
+  for most Linux guests (modern distros already include virtio drivers
+  and don't hardcode hypervisor-specific boot paths), but **not**
+  sufficient for Windows guests, which need driver injection/boot fixup —
+  see `direct-v2v` below.
+- **`direct-v2v`** — **required for Windows guests.** Runs the same
+  direct write, then runs `virt-v2v-in-place` directly against the
+  target device to inject VirtIO drivers and fix up the boot
+  configuration **in place** on the data just written. A Windows VM
+  exported from VMware has VMware-specific drivers and a boot
+  configuration tied to VMware's virtual hardware, and will typically
+  fail to boot under KVM/QEMU (the hypervisor Nova uses) without this
+  step. Verified end-to-end against a real Windows Server 2019 guest
+  (90GiB-virtual/~5.2GiB-actual `streamOptimized` VMDK, no KVM
+  acceleration on the test node): **~6.2 minutes total** (direct write
+  ~3 min + `virt-v2v-in-place` ~3.2 min), using only an 8Gi `emptyDir`
+  for scratch space. libguestfs correctly identified the guest as
+  "Windows Server 2019 Standard Evaluation (win2k19)"; the resulting
+  Cinder/Ceph RBD volume showed a correct GPT partition layout (Windows
+  RE + EFI System + Microsoft Reserved + an NTFS-signed main partition)
+  after import.
+
+  **IMPORTANT SAFETY NOTE**: `virt-v2v-in-place` modifies the target
+  device's data **in place, with no backup**. Per upstream's own
+  documentation, if it fails, "the disk image will be in an unknown,
+  possibly corrupted state." Only use this mode against a freshly
+  provisioned, disposable target volume — one you can recreate from the
+  source image again if something goes wrong. Also requires the guest OS
+  to be recognized by libguestfs's inspection; OSTree/Ignition-based
+  Linux distributions (e.g. Fedora CoreOS) are **not** recognized and
+  will fail here — use `CONVERT_MODE=direct` for those instead.
+
+See
+[OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#3-choosing-a-conversion-mode)
+for the full comparison, real numbers, and additional caveats (KVM
+acceleration, VirtIO driver availability, `DISK_SELECTOR` interaction).
+
 ### Progress output
 
-`qemu-img convert -p` and `dd status=progress` both report progress by
+`qemu-img convert -p` and `virt-v2v-in-place` both report progress by
 repeatedly overwriting the same terminal line with `\r` (carriage return).
 That renders fine in a real, interactive terminal, but `kubectl logs` and
 similar non-interactive log viewers don't interpret `\r` — the result is
@@ -98,8 +103,8 @@ before/after log excerpts.
 This relies entirely on functionality already provided by this project (the
 Cinder CSI driver's dynamic provisioning + Block volume support, see
 [Using Block Volume](../../../docs/cinder-csi-plugin/examples.md#using-block-volume)).
-No changes to the driver itself are needed. `qemu-img` runs entirely inside
-the Job's container, independent of the CSI driver.
+No changes to the driver itself are needed. `qemu-img`/`virt-v2v` run
+entirely inside the Job's container, independent of the CSI driver.
 
 ## Files
 
@@ -108,10 +113,10 @@ the Job's container, independent of the CSI driver.
 - `Dockerfile` — tool image (`qemu-img`, `virt-v2v`/`libguestfs`, `curl`,
   `tar`, `python3`) used to run the script. `virt-v2v`/`libguestfs` add
   roughly 1.5GB to the image but are required for Windows guest support
-  (see `CONVERT_MODE=virt-v2v` above). Build and push it to a registry
-  reachable by your cluster.
-- `job.yaml` — Block-mode target PVC + PVC-backed scratch space + Job
-  manifest (no `StorageClass` object; see
+  (`CONVERT_MODE=direct-v2v`). Build and push it to a registry reachable
+  by your cluster.
+- `job.yaml` — Block-mode target PVC + Job manifest (no `StorageClass`
+  object; see
   [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#21-choosing-a-storageclass)
   for why).
 
@@ -156,7 +161,7 @@ Edit `job.yaml`:
   [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#21-choosing-a-storageclass)
   for details.
 - `resources.requests.storage` on the PVC — must be **greater than or equal
-  to** the virtual size of the source disk once converted to RAW.
+  to** the virtual size of the source disk.
 - `env.SOURCE_IMAGE_PATH` (default) — path to the source `.ova`/`.ovf`
   directory/`.vmdk` as seen inside the container (e.g.
   `/input/my-disk.ova`), backed by the `source-input` `hostPath` volume.
@@ -165,31 +170,17 @@ Edit `job.yaml`:
   if your source image is reachable over HTTP(S), replace this with
   `env.SOURCE_IMAGE_URL` and remove the `source-input` volume/mount — see
   [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#41-using-sourceimageurl-instead-of-a-local-file).
-- `env.CONVERT_MODE` — `qemu-img-direct` (default; writes straight to the
-  block device, needs the target to read back as all-zero — verified
-  automatically), `qemu-img` (converts to a scratch file first, then
-  `dd`s it onto the device; safe on any target but needs ~2x the virtual
-  disk size in scratch space), or `virt-v2v` (**required for Windows
-  guests** — injects drivers and fixes up the boot configuration so the
-  guest can actually boot under KVM; also converts to a scratch file
-  first). See
-  [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#3-choosing-a-conversion-mode)
-  for the full comparison.
+- `env.CONVERT_MODE` — `direct` (default; for Linux guests) or
+  `direct-v2v` (required for Windows guests — see
+  [How it works](#choosing-convert_mode) above for the full tradeoff).
 - `env.TARGET_DEVICE` and `volumeDevices[0].devicePath` — must match (the
   device path as seen inside the container, e.g. `/dev/xvda`).
-- `volumes[1]` (the `workdir` volume, PVC-backed by default) — scratch
-  space. Under the default `qemu-img-direct` mode, this only needs to hold
-  the downloaded/extracted source image (its *actual*, not virtual, size
-  for a `streamOptimized` VMDK) — if you know you'll only ever use that
-  mode and your source images are small, you can swap this for a plain
-  `emptyDir` instead to avoid provisioning the extra PVC (see the comments
-  in `job.yaml`). Under `qemu-img`/`virt-v2v`, it additionally needs the
-  intermediate RAW file, so budget roughly 2x the virtual disk size —
-  this matters most for `virt-v2v` with large Windows system disks, where
-  a node-local `emptyDir` is likely to run out of space (verified in
-  testing: a 90GiB-virtual Windows source did not fit this test cluster's
-  node-local scratch partition, but converted successfully once `workdir`
-  was backed by a 110Gi PVC instead).
+- `volumes[1]` (the `workdir` volume, `emptyDir`) — scratch space. Neither
+  `CONVERT_MODE` value ever writes a full intermediate RAW file here, so
+  it only needs to hold the downloaded/extracted source image itself
+  (its *actual*, not virtual, size for a `streamOptimized` VMDK) —
+  verified in testing, an 8Gi `emptyDir` was sufficient even for a
+  90GiB-virtual Windows guest under `CONVERT_MODE=direct-v2v`.
 - `volumes[2].hostPath.path` (the `source-input` volume) — the directory on
   the node containing your source image; must match what
   `SOURCE_IMAGE_PATH` points at under `/input`.
@@ -245,12 +236,17 @@ the resulting PV, or detach/orphan it from Kubernetes before deleting the PVC.
   VM's actual disk numbering or boot order, so guessing would risk
   importing the wrong disk without any indication something was off.
   (With exactly one `.vmdk`, no selector is needed — that one disk is
-  used automatically.) Verified in testing against a two-disk OVF
-  directory (a 16GiB-virtual/~1.7GiB-actual boot disk and a
-  10GiB-virtual/~220KiB-actual secondary disk): omitting `DISK_SELECTOR`
-  correctly failed with both filenames listed; setting it explicitly to
-  each disk in turn, with two separate Job runs and their own PVCs, both
-  completed successfully with `VERIFY_CHECKSUM=true` passing. See
+  used automatically.) **Under `CONVERT_MODE=direct-v2v`, `DISK_SELECTOR`
+  only affects the direct-write phase** — the subsequent
+  `virt-v2v-in-place` step always operates on the whole target device as
+  a single disk, with no disk-selection concept of its own; the script
+  logs a warning if `DISK_SELECTOR` is set in that mode. Verified in
+  testing against a two-disk OVF directory (a 16GiB-virtual/~1.7GiB-actual
+  boot disk and a 10GiB-virtual/~220KiB-actual secondary disk, both under
+  `CONVERT_MODE=direct`): omitting `DISK_SELECTOR` correctly failed with
+  both filenames listed; setting it explicitly to each disk in turn, with
+  two separate Job runs and their own PVCs, both completed successfully
+  with `VERIFY_CHECKSUM=true` passing. See
   [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#4-running-an-import) for the
   pre-flight check as step 0 of the overall procedure, and
   [OPERATIONS-GUIDE.md](./OPERATIONS-GUIDE.md#42-importing-a-multi-disk-source-more-than-one-vmdk)
@@ -260,55 +256,49 @@ the resulting PV, or detach/orphan it from Kubernetes before deleting the PVC.
   has no embedded disk data; point `SOURCE_IMAGE_PATH`/`SOURCE_IMAGE_URL` at
   the containing directory or the `.ova` archive instead, or supply the
   matching `.vmdk` directly.
-- `qemu-img-direct` mode requires the target device to read back as
-  all-zero (it uses `qemu-img convert --target-is-zero`, which is unsafe
-  otherwise). The script checks this automatically by sampling the device
-  and refuses to proceed if any sampled region is non-zero — a freshly
-  provisioned CSI volume should always pass this check, but a volume
-  reused from a previous write will not. If the check fails, use
-  `CONVERT_MODE=qemu-img` instead.
-- **`CONVERT_MODE=virt-v2v` is required for Windows guests**, not optional
-  — `qemu-img-direct`/`qemu-img` never touch anything inside the guest
-  filesystem, so a Windows VM exported from VMware will typically fail to
-  boot under KVM/QEMU without the driver injection and boot-configuration
-  fixups that only `virt-v2v` performs. A few things to know before using
-  it:
-  - `DISK_SELECTOR` has **no effect** under this mode — `virt-v2v`
-    converts the whole VM definition (all disks referenced by the
-    `.ovf`/`.vmx`) as a single unit, unlike `qemu-img`/`qemu-img-direct`,
-    which select one `.vmdk` at a time. The script logs a warning if
-    `DISK_SELECTOR` is set in this mode.
-  - It performs noticeably better with real KVM acceleration available
-    (the node needs `/dev/kvm`, typically exposed via the KubeVirt device
-    plugin as the `devices.kubevirt.io/kvm` resource — see the commented-out
-    block in `job.yaml`). It still works without it, falling back to
-    software emulation, just much slower — verified in testing: a
-    90GiB-virtual/~5.2GiB-actual Windows Server 2019 guest took about 29
-    minutes end-to-end (virt-v2v conversion ~6.5 min + `dd` write ~22 min
-    @ 70+ MB/s) with no KVM acceleration available on the test node.
+- **Both modes require the target device to read back as all-zero**
+  (they use `qemu-img convert --target-is-zero` for the direct write,
+  which is unsafe otherwise). The script checks this automatically by
+  sampling the device and refuses to proceed if any sampled region is
+  non-zero — a freshly provisioned CSI volume should always pass this
+  check, but a volume reused from a previous write will not. If the
+  check fails, provision a fresh volume instead of reusing one that has
+  been written to before; there is no fallback mode that skips this
+  requirement.
+- **`CONVERT_MODE=direct-v2v` carries real risk** — see
+  [Choosing CONVERT_MODE](#choosing-convert_mode) above for the full
+  explanation of why `virt-v2v-in-place`'s in-place modification means a
+  failure can leave the target device in an unknown state, with no
+  automatic recovery. A few additional things to know before using it:
+  - Benefits from real KVM acceleration available (the node needs
+    `/dev/kvm`, typically exposed via the KubeVirt device plugin as the
+    `devices.kubevirt.io/kvm` resource — see the commented-out block in
+    `job.yaml`). It still works without it, falling back to software
+    emulation, just much slower — the ~6.2 minute figure above was
+    measured **without** KVM acceleration available on the test node.
   - The container image used for testing doesn't bundle VirtIO drivers
-    (`/usr/share/virtio-win`), so `virt-v2v` falls back to configuring the
-    guest with slower emulated devices rather than installing VirtIO
-    drivers — it still produces a bootable disk, just without the
-    VirtIO performance benefit. If you want VirtIO drivers installed,
-    extend the `Dockerfile` to bundle the `virtio-win` ISO (available from
-    Fedora's virtio-win project) and either place it where `virt-v2v`
-    looks by default or point it there via its `-i` input options; this
-    was not exercised in testing.
+    (`/usr/share/virtio-win`), so `virt-v2v-in-place` falls back to
+    configuring the guest with slower emulated devices rather than
+    installing VirtIO drivers — it still produces a bootable disk, just
+    without the VirtIO performance benefit. If you want VirtIO drivers
+    installed, extend the `Dockerfile` to bundle the `virtio-win` ISO
+    (available from Fedora's virtio-win project) and either place it
+    where `virt-v2v` looks by default or point it there via its input
+    options; this was not exercised in testing.
   - Relies on libguestfs's OS inspection to recognize the guest. Windows
     guests are well supported (verified: correctly identified a Windows
-    Server 2019 guest and converted it to a bootable disk with a valid
-    GPT/NTFS layout). OSTree/Ignition-based Linux distributions (e.g.
-    Fedora CoreOS) are **not** recognized and will fail with `No root
-    device found in this operating system image` — use
-    `qemu-img-direct`/`qemu-img` for those instead.
+    Server 2019 guest and converted it to a disk with a valid GPT/NTFS
+    layout). OSTree/Ignition-based Linux distributions (e.g. Fedora
+    CoreOS) are **not** recognized and will fail with `No root device
+    found in this operating system image` — use `CONVERT_MODE=direct`
+    for those instead.
 - `VERIFY_CHECKSUM=true` reads the full image back from the Cinder volume
   over the network/storage backend to compute a checksum — this roughly
-  doubles the I/O cost and time. Under `CONVERT_MODE=qemu-img-direct`, it
-  also creates a temporary RAW file (removed immediately after comparison)
-  since `qemu-img convert` cannot stream RAW output to a pipe, temporarily
-  reintroducing the scratch-space cost that mode otherwise avoids. Use it
-  for one-off validation, not routine runs.
+  doubles the I/O cost and time, and creates a temporary RAW file
+  (removed immediately after comparison) since `qemu-img convert` cannot
+  stream RAW output to a pipe. Under `CONVERT_MODE=direct-v2v`, it only
+  covers the direct-write phase, not the subsequent `virt-v2v-in-place`
+  modification. Use it for one-off validation, not routine runs.
 - The Job's pod must be schedulable on a node where Cinder/Nova can attach a
   volume (i.e., a node that is itself an OpenStack instance), consistent
   with the general requirement described in

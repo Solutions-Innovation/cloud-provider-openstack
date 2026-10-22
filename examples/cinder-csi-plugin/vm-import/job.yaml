@@ -1,5 +1,5 @@
 # Target Cinder volume, exposed as a raw block device (not a filesystem) so
-# that dd can write the converted RAW image directly onto it.
+# that qemu-img/virt-v2v-in-place can write/modify the disk image directly.
 #
 # storageClassName defaults to "csi-sc-cinderplugin", the StorageClass
 # name used throughout this project's own examples/docs for the Cinder
@@ -25,95 +25,61 @@ spec:
   storageClassName: csi-sc-cinderplugin
   resources:
     requests:
-      # Must be >= the size of the converted RAW disk image. Verified in
-      # testing with 20Gi against a 16GiB source disk, and 15Gi against a
-      # 10GiB source disk.
+      # Must be >= the virtual size of the source disk. Verified in
+      # testing with 20Gi against a 16GiB source disk, 15Gi against a
+      # 10GiB source disk, and 95Gi against a 90GiB-virtual-size Windows
+      # source disk.
       storage: 20Gi
 
 ---
-# PVC-backed scratch space for CONVERT_MODE=qemu-img and
-# CONVERT_MODE=virt-v2v, both of which need to materialize a full
-# intermediate RAW file (roughly the source disk's *virtual* size, not
-# its compressed/actual size) before `dd`-ing it onto the target device.
+# One-shot Job that writes the source OVA/OVF/VMDK image onto the
+# Cinder-backed block device. The conversion script
+# (convert-and-import.sh) is baked into the image as its ENTRYPOINT; see
+# Dockerfile in this directory.
 #
-# This exists as a separate, deletable PVC (rather than relying on the
-# scheduling node's local disk via `emptyDir`, see the `workdir` volume
-# below for that alternative) because the local-disk approach breaks down
-# once the source disk is large: a Job's `emptyDir` is backed by whatever
-# local filesystem the node happens to have free space on (commonly a
-# constrained partition like /var/lib/kubelet, not the node's full disk),
-# and Windows system disks in particular are routinely 60-100+ GiB of
-# *virtual* size even when their actual used/compressed data is much
-# smaller. A PVC backed by a real storage backend (Cinder, Ceph RBD, etc,
-# whatever `storageClassName` below resolves to) is not limited by a
-# single node's local free space and is the only reliable option once
-# the source disk size exceeds what the node can spare locally. Verified
-# in testing: a 90GiB-virtual/~5.2GiB-actual Windows Server 2019
-# streamOptimized VMDK could not fit in this test cluster's node-local
-# emptyDir (only ~47GiB free on the relevant partition) but converted
-# successfully once `workdir` below was switched to this PVC, backed by a
-# Ceph RBD pool with ~1TiB free.
+# Two CONVERT_MODE values are supported, both writing straight onto
+# TARGET_DEVICE via `qemu-img convert -n --target-is-zero -O raw` with no
+# intermediate RAW file at any point -- so scratch space (the `workdir`
+# volume below) only ever needs to hold the downloaded/extracted source
+# image itself, never the (potentially much larger) virtual disk size.
+# This relies on TARGET_DEVICE genuinely reading back as all-zero; the
+# script verifies this automatically before writing and refuses to
+# proceed otherwise (see OPERATIONS-GUIDE.md Section 3).
 #
-# Not needed under the default CONVERT_MODE=qemu-img-direct, which never
-# writes an intermediate RAW file at all -- see the `workdir` volume
-# below for how to use a plain `emptyDir` instead in that case, which
-# avoids provisioning (and paying for) this extra volume.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: vm-import-workdir-pvc
-spec:
-  accessModes:
-    - ReadWriteOnce
-  volumeMode: Filesystem
-  storageClassName: csi-sc-cinderplugin
-  resources:
-    requests:
-      # Must be >= ~2x the source disk's virtual size (one copy for the
-      # intermediate RAW file, plus headroom for the downloaded/extracted
-      # source image itself). Verified in testing with 110Gi against a
-      # 90GiB-virtual-size Windows source disk.
-      storage: 110Gi
-
----
-# One-shot Job that converts the source OVA/OVF/VMDK image to RAW and
-# writes it onto the Cinder-backed block device, using qemu-img for both
-# steps. The conversion script (convert-and-import.sh) is baked into the
-# image as its ENTRYPOINT; see Dockerfile in this directory.
+#   - CONVERT_MODE=direct (default) -- just the write described above.
+#     Verified end-to-end against a 10GiB-virtual/~1GiB-actual CoreOS
+#     .ova: completed in ~20 seconds. Sufficient for most Linux guests
+#     (modern distros already include virtio drivers and don't hardcode
+#     hypervisor-specific boot paths), but NOT sufficient for Windows
+#     guests, which need the driver injection/boot-configuration fixup
+#     that only virt-v2v provides -- see CONVERT_MODE=direct-v2v below.
+#   - CONVERT_MODE=direct-v2v -- for WINDOWS guests. Runs the same write
+#     as CONVERT_MODE=direct, then runs `virt-v2v-in-place` directly
+#     against TARGET_DEVICE to inject drivers and fix up the boot
+#     configuration IN PLACE on the data just written. Verified
+#     end-to-end against a 90GiB-virtual/~5.2GiB-actual Windows Server
+#     2019 guest: ~6.2 minutes total (direct write ~3 min + virt-v2v-in-
+#     place ~3.2 min), with no KVM acceleration available on the test
+#     node, using only the default 8Gi `workdir` emptyDir below -- no
+#     large scratch volume needed. Produced a correct GPT layout and
+#     NTFS boot-sector signature on the target device.
+#     IMPORTANT: virt-v2v-in-place modifies TARGET_DEVICE's data IN
+#     PLACE, with NO backup. Per upstream's own documentation, if it
+#     fails, "the disk image will be in an unknown, possibly corrupted
+#     state." Only use this mode against a freshly provisioned,
+#     disposable target volume -- one you can recreate from the source
+#     image again if something goes wrong. Also requires the guest OS to
+#     be recognized by libguestfs's inspection; OSTree/Ignition-based
+#     Linux distributions (e.g. Fedora CoreOS) are NOT recognized and
+#     will fail here -- use CONVERT_MODE=direct for those instead.
 #
-# Default (CONVERT_MODE=qemu-img-direct) writes straight to TARGET_DEVICE
-# via `qemu-img convert -n --target-is-zero -O raw`, skipping any
-# intermediate RAW file entirely. This doesn't need scratch space
-# proportional to the source disk's virtual size -- only enough to
-# download/extract the compressed source image itself, which for a
-# streamOptimized VMDK (the common VMware/OVA export format) is typically
-# far smaller. Verified end-to-end against a 10GiB-virtual/~1GiB-actual
-# CoreOS .ova: completed in ~20 seconds with a sha256 checksum identical to
-# the qemu-img (file + dd) path. This relies on the target device
-# genuinely reading back as all-zero; the script verifies this
-# automatically before writing and refuses to proceed otherwise (see
-# OPERATIONS-GUIDE.md Section 3 for the full explanation).
-#
-# If TARGET_DEVICE might not read back as zero (e.g. a reused volume) or
-# you'd rather not depend on that assumption, set CONVERT_MODE=qemu-img
-# instead: it converts to a scratch RAW file first, then `dd`s it onto
-# the device. Verified end-to-end against the same CoreOS .ova above (and
-# a second, Fedora Server BIOS/MBR+LVM guest) -- also successful, just
-# slower (~90s convert + ~130s dd, vs. ~20s total for qemu-img-direct) and
-# needing roughly 2x the virtual disk size in scratch space.
-#
-# For WINDOWS guests, set CONVERT_MODE=virt-v2v instead -- this is
-# REQUIRED, not optional. qemu-img-direct/qemu-img are pure format
-# converters that never touch the guest filesystem; a Windows VM exported
-# from VMware typically fails to boot under KVM/QEMU without driver
-# injection and boot-configuration fixups, which only virt-v2v performs.
-# virt-v2v also needs real KVM acceleration (the
-# devices.kubevirt.io/kvm resource requests/limits, commented out below)
-# to run in reasonable time, and converts to a scratch RAW file first
-# like CONVERT_MODE=qemu-img (it cannot write directly to a block device),
-# so size `workdir` accordingly -- see the vm-import-workdir-pvc PVC above
-# for why a PVC-backed workdir (rather than emptyDir) is recommended for
-# this mode. See OPERATIONS-GUIDE.md Section 3 for the full comparison.
+# Both modes benefit from real KVM acceleration for the virt-v2v-in-place
+# step specifically (CONVERT_MODE=direct never uses KVM at all); the
+# devices.kubevirt.io/kvm resource requests/limits below are commented
+# out by default and only relevant to CONVERT_MODE=direct-v2v. Both
+# modes still work without it (verified in testing), just much slower
+# for direct-v2v, via software emulation. See OPERATIONS-GUIDE.md
+# Section 3 for the full comparison and real numbers.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -150,9 +116,7 @@ spec:
             - name: TARGET_DEVICE
               value: "/dev/xvda"
             - name: CONVERT_MODE
-              value: "qemu-img-direct" # "qemu-img", or "virt-v2v" (REQUIRED for Windows guests) -- see notes above
-            - name: DD_BLOCK_SIZE
-              value: "4M"
+              value: "direct" # or "direct-v2v" (for Windows guests) -- see notes above
             - name: VERIFY_CHECKSUM
               value: "false"
           resources:
@@ -160,10 +124,12 @@ spec:
               cpu: "500m"
               memory: "1Gi"
               # Uncomment both the request and limit below if you switch
-              # CONVERT_MODE to "virt-v2v" -- it needs access to /dev/kvm
-              # via the KubeVirt device plugin for KVM-accelerated
-              # conversion. Leave commented out for qemu-img-direct/
-              # qemu-img, which don't use KVM.
+              # CONVERT_MODE to "direct-v2v" -- the virt-v2v-in-place step
+              # benefits from access to /dev/kvm via the KubeVirt device
+              # plugin for KVM-accelerated conversion (still works
+              # without it, just slower, via software emulation). Leave
+              # commented out for the default CONVERT_MODE=direct, which
+              # never uses KVM at all.
               # devices.kubevirt.io/kvm: "1"
             limits:
               cpu: "2"
@@ -183,33 +149,17 @@ spec:
           persistentVolumeClaim:
             claimName: vm-import-target-pvc
             readOnly: false
-        # PVC-backed workdir (see vm-import-workdir-pvc above for sizing
-        # rationale). Recommended default here because it works
-        # correctly regardless of source disk size or the scheduling
-        # node's local free space -- which matters most for
-        # CONVERT_MODE=qemu-img and CONVERT_MODE=virt-v2v (both need a
-        # full intermediate RAW file), and especially for virt-v2v with
-        # large Windows source disks, where node-local space is the most
-        # likely thing to run out. Costs an extra PVC (storage billed/
-        # reserved) compared to emptyDir below, even when you end up
-        # using the qemu-img-direct default that doesn't actually need
-        # the space.
-        #
-        # If you know you'll only ever use CONVERT_MODE=qemu-img-direct
-        # (no intermediate RAW file, so workdir only needs to hold the
-        # downloaded/extracted source image -- typically far smaller
-        # than its virtual size for a streamOptimized VMDK) AND your
-        # source images are small enough to comfortably fit the
-        # scheduling node's local free disk space, you can swap this
-        # for a plain emptyDir instead and skip provisioning
-        # vm-import-workdir-pvc entirely:
-        #   - name: workdir
-        #     emptyDir:
-        #       sizeLimit: 40Gi
+        # emptyDir scratch space. Neither CONVERT_MODE value ever writes
+        # a full intermediate RAW file here -- both only need room for
+        # the downloaded/extracted source image itself, which for a
+        # streamOptimized VMDK (the common VMware/OVA export format) is
+        # typically far smaller than its virtual size. Verified in
+        # testing: this exact 8Gi sizeLimit was sufficient even for a
+        # 90GiB-virtual/~5.2GiB-actual Windows Server 2019 guest under
+        # CONVERT_MODE=direct-v2v.
         - name: workdir
-          persistentVolumeClaim:
-            claimName: vm-import-workdir-pvc
-            readOnly: false
+          emptyDir:
+            sizeLimit: 8Gi
         # Points at the source file/directory on the NODE (not inside the
         # container) for SOURCE_IMAGE_PATH to mount in as /input. Replace
         # the path below with wherever your source .ova/.vmdk/OVF
