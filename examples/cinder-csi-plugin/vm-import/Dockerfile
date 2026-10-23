@@ -61,6 +61,13 @@ RUN mkdir -p /usr/share/virtio-win/ && \
     curl -fL --retry 3 --retry-delay 5 -o /usr/share/virtio-win/virtio-win.iso \
          https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
 
+# Placed into the converted guest's filesystem (not executed) by
+# convert-and-import.sh after virt-v2v-in-place completes, for the
+# guest's administrator to run manually post-boot -- see the script's own
+# header comment and OPERATIONS-GUIDE.md for why VMware Tools' own
+# uninstaller cannot be relied on after a cross-hypervisor migration.
+COPY remove-vmware-tools.ps1 /scripts/remove-vmware-tools.ps1
+
 ENV LIBGUESTFS_BACKEND=direct
 
 ENTRYPOINT ["/bin/bash", "/scripts/convert-and-import.sh"]

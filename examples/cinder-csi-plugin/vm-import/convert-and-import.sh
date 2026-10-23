@@ -152,6 +152,33 @@
 #   ENABLE_DEBUG        - If "true", passes -v to virt-v2v-in-place for
 #                         verbose troubleshooting output. Only relevant
 #                         when CONVERT_MODE=direct-v2v. Defaults to "false".
+#   UPLOAD_VMWARE_CLEANUP_SCRIPT - If "true" (default; only relevant under
+#                         CONVERT_MODE=direct-v2v), uploads
+#                         remove-vmware-tools.ps1 into the converted
+#                         guest's filesystem (at 'C:\Program Files\
+#                         Guestfs\remove-vmware-tools.ps1') after
+#                         virt-v2v-in-place completes. This script is
+#                         NOT executed automatically -- it is left for the
+#                         guest's administrator to run manually, after the
+#                         guest has actually booted on KVM, to force-remove
+#                         VMware Tools. This exists because VMware Tools'
+#                         own MSI uninstaller cannot complete once the
+#                         guest is no longer running on a VMware
+#                         hypervisor (see the uploaded script's own header
+#                         comment, and OPERATIONS-GUIDE.md's VMware Tools
+#                         uninstall-failure troubleshooting entry, for the
+#                         full explanation and upstream references). Set
+#                         to "false" to skip this (e.g. if the guest's
+#                         filesystem can't be mounted read-write -- see
+#                         below -- or you don't want the script present).
+#                         If the upload itself fails (most commonly
+#                         because the guest's NTFS partition has a
+#                         "hibernated"/not-cleanly-unmounted flag set,
+#                         which libguestfs refuses to mount read-write as
+#                         a safety measure), this logs a warning and
+#                         continues rather than failing the whole run,
+#                         since virt-v2v-in-place has already completed
+#                         successfully by this point.
 #
 set -euo pipefail
 
@@ -441,6 +468,39 @@ do_direct_write() {
   fi
 }
 
+# Uploads remove-vmware-tools.ps1 into the just-converted Windows guest's
+# filesystem (does NOT execute it). Standard VMware Tools uninstall
+# (whether via its own firstboot-scheduled uninstaller, Apps & Features,
+# or msiexec directly) cannot complete on a guest that's no longer running
+# on a VMware hypervisor -- see the script's own header comment and
+# OPERATIONS-GUIDE.md's troubleshooting entry for VMware Tools uninstall
+# failures for the full explanation (MSI error 1603 from a VM_LogStart/
+# VM_CheckRequirements custom action that validates the hypervisor).
+# Placing this script in the guest lets its administrator run it manually
+# once the guest has actually booted on KVM and can be verified -- this is
+# deliberately NOT run automatically as a firstboot script, since removing
+# registry/service/file state is an irreversible guest-side change that
+# should happen under administrator control with the guest reachable to
+# confirm the result, not unattended during conversion.
+upload_vmware_cleanup_script() {
+  local script_src="/scripts/remove-vmware-tools.ps1"
+  local script_dest='/Program Files/Guestfs/remove-vmware-tools.ps1'
+
+  if [ ! -f "${script_src}" ]; then
+    log_warn "remove-vmware-tools.ps1 not found in the image at ${script_src} -- skipping upload. This should not happen with the stock Dockerfile; check for a locally patched image."
+    return 0
+  fi
+
+  log_info "Uploading VMware Tools cleanup script into the guest for manual use after boot (see OPERATIONS-GUIDE.md)"
+  if ! guestfish --rw -a "${TARGET_DEVICE}" -i -- \
+       mkdir-p '/Program Files/Guestfs' : \
+       upload "${script_src}" "${script_dest}" 2>&1; then
+    log_warn "Failed to upload remove-vmware-tools.ps1 into the guest -- this does not affect the conversion result, but you will need to copy the script in manually. See OPERATIONS-GUIDE.md for its content and usage. Common cause: the guest's NTFS filesystem has a 'hibernated' or 'not cleanly unmounted' flag set, which libguestfs refuses to mount read-write as a safety measure (confirmed in this project's own testing via ntfs-3g.probe exit code 14 after the guest had been booted and stopped without a clean Windows shutdown) -- running `ntfsfix` against the OS partition clears this, but is not done automatically here since it modifies guest filesystem metadata outside the scope of a normal conversion run."
+    return 0
+  fi
+  log_info "Uploaded cleanup script to '${script_dest}' inside the guest (run it from an elevated PowerShell prompt after boot)"
+}
+
 case "${CONVERT_MODE}" in
   direct)
     log_info "Writing directly onto ${TARGET_DEVICE} (mode=direct, no intermediate RAW file)"
@@ -484,6 +544,10 @@ case "${CONVERT_MODE}" in
     run_with_progress virt-v2v-in-place -i disk "${TARGET_DEVICE}" ${VIRT_V2V_IN_PLACE_FSTRIM_FLAG} ${VIRT_V2V_DEBUG_FLAG}
     sync
     log_info "virt-v2v-in-place completed"
+
+    if [ "${UPLOAD_VMWARE_CLEANUP_SCRIPT:-true}" = "true" ]; then
+      upload_vmware_cleanup_script
+    fi
 
     log_info "Import complete: ${SRC_PATH} -> ${TARGET_DEVICE} (direct write + virt-v2v-in-place)"
     exit 0
