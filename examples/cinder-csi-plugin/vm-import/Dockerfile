@@ -46,6 +46,21 @@ RUN microdnf install -y --nodocs --setopt install_weak_deps=False \
 COPY convert-and-import.sh /scripts/convert-and-import.sh
 RUN chmod +x /scripts/convert-and-import.sh
 
+# VirtIO drivers for Windows guests, bundled so virt-v2v-in-place
+# (CONVERT_MODE=direct-v2v) can actually inject them during conversion.
+# Without this, libguestfs finds no drivers in /usr/share/virtio-win and
+# falls back to configuring the guest with slower emulated devices --
+# this is NOT a virt-v2v/libguestfs version issue (both are the current
+# Fedora 44 packages; verified: virt-v2v-2.12.0, libguestfs-1.60.1), it
+# is purely a missing-ISO issue, confirmed by the warning
+# "there are no virtio drivers available for this version of Windows ...
+# virt-v2v looks for drivers in /usr/share/virtio-win" seen in testing
+# before this ISO was added. Using the same stable-virtio ISO source as
+# this project's reference Windows-conversion tooling.
+RUN mkdir -p /usr/share/virtio-win/ && \
+    curl -fL --retry 3 --retry-delay 5 -o /usr/share/virtio-win/virtio-win.iso \
+         https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
+
 ENV LIBGUESTFS_BACKEND=direct
 
 ENTRYPOINT ["/bin/bash", "/scripts/convert-and-import.sh"]

@@ -74,11 +74,25 @@ spec:
 #     will fail here -- use CONVERT_MODE=direct for those instead.
 #
 # Both modes benefit from real KVM acceleration for the virt-v2v-in-place
-# step specifically (CONVERT_MODE=direct never uses KVM at all); the
-# devices.kubevirt.io/kvm resource requests/limits below are commented
-# out by default and only relevant to CONVERT_MODE=direct-v2v. Both
-# modes still work without it (verified in testing), just much slower
-# for direct-v2v, via software emulation. See OPERATIONS-GUIDE.md
+# step specifically (CONVERT_MODE=direct never uses KVM at all). KVM
+# acceleration is enabled by default below via a privileged
+# securityContext + LIBGUESTFS_BACKEND_SETTINGS (see the container-level
+# comments further down) -- NOT via a devices.kubevirt.io/kvm resource
+# request. Verified end-to-end on a real StarlingX (WRCP) cluster: that
+# cluster's devices.kubevirt.io/kvm is registered on the node but
+# allocatable=0 (no KubeVirt device plugin actively running), yet the
+# privileged container could still open the host's /dev/kvm directly
+# (confirmed via libguestfs's own appliance logs: "qemu KVM: enabled",
+# and the guest kernel detecting "Hypervisor detected: KVM" and using
+# kvm-clock) -- privileged bypasses Kubernetes' device-plugin gating
+# entirely, so no devices.kubevirt.io/kvm request is needed (or useful)
+# once privileged is set. Requesting that resource anyway, as an earlier
+# version of this manifest did, actively breaks scheduling on any cluster
+# where it's advertised with 0 allocatable (the common case when no
+# KubeVirt device plugin is actually deployed) -- the Pod stays Pending
+# forever. Both modes still work without KVM acceleration (e.g. if you
+# remove the privileged block below), just much slower for direct-v2v,
+# via software emulation. See OPERATIONS-GUIDE.md Section 2.3.1 and
 # Section 3 for the full comparison and real numbers.
 apiVersion: batch/v1
 kind: Job
@@ -119,22 +133,51 @@ spec:
               value: "direct" # or "direct-v2v" (for Windows guests) -- see notes above
             - name: VERIFY_CHECKSUM
               value: "false"
+            # Forces libguestfs's internal QEMU appliance (used by
+            # virt-v2v-in-place under CONVERT_MODE=direct-v2v) to launch
+            # with -enable-kvm explicitly, rather than relying solely on
+            # libguestfs's own automatic /dev/kvm detection. Only takes
+            # effect together with the privileged securityContext below
+            # (which is what actually grants permission to open
+            # /dev/kvm -- see that field's comment for why no
+            # devices.kubevirt.io/kvm resource request is needed here).
+            # Unused (harmless) under CONVERT_MODE=direct, which never
+            # launches the appliance.
+            - name: LIBGUESTFS_BACKEND_SETTINGS
+              value: "qemu_options=-enable-kvm"
+          # Required (together with LIBGUESTFS_BACKEND_SETTINGS above)
+          # for virt-v2v-in-place's internal appliance VM to actually
+          # acquire and use /dev/kvm for hardware-accelerated conversion
+          # under CONVERT_MODE=direct-v2v. privileged: true bypasses
+          # Kubernetes' device-plugin gating entirely and lets the
+          # container open the host's /dev/kvm directly -- no
+          # devices.kubevirt.io/kvm resource request is needed (or
+          # useful) once this is set. Verified end-to-end on a real
+          # StarlingX (WRCP) cluster where devices.kubevirt.io/kvm was
+          # registered but had allocatable=0 (no KubeVirt device plugin
+          # actually running): the privileged container still
+          # successfully obtained KVM acceleration (confirmed via
+          # libguestfs's "qemu KVM: enabled" log line and the guest
+          # kernel's "Hypervisor detected: KVM" / kvm-clock usage).
+          # SECURITY: privileged grants the container near-host-root
+          # capabilities (access to all host devices, ability to alter
+          # kernel/network settings, a larger container-escape attack
+          # surface) -- a materially higher-risk posture than an
+          # unprivileged container. Only acceptable here because this is
+          # a short-lived, one-shot Job (not a long-running service) whose
+          # sole purpose is this low-level block-device/appliance-VM
+          # operation. If your threat model does not accept this, remove
+          # this block (and LIBGUESTFS_BACKEND_SETTINGS above) and accept
+          # the slower software-emulation fallback instead.
+          securityContext:
+            privileged: true
           resources:
             requests:
               cpu: "500m"
               memory: "1Gi"
-              # Uncomment both the request and limit below if you switch
-              # CONVERT_MODE to "direct-v2v" -- the virt-v2v-in-place step
-              # benefits from access to /dev/kvm via the KubeVirt device
-              # plugin for KVM-accelerated conversion (still works
-              # without it, just slower, via software emulation). Leave
-              # commented out for the default CONVERT_MODE=direct, which
-              # never uses KVM at all.
-              # devices.kubevirt.io/kvm: "1"
             limits:
               cpu: "2"
               memory: "2Gi"
-              # devices.kubevirt.io/kvm: "1"
           volumeDevices:
             - name: vm-import-target
               devicePath: /dev/xvda

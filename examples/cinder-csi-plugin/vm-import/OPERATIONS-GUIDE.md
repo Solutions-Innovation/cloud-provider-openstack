@@ -36,12 +36,18 @@ docker build \
 ```
 
 Build time is dominated by `microdnf install` pulling `qemu-img`,
-`virt-v2v`, `libguestfs`, and their dependencies; verified at ~50 seconds
-on a reasonably fast connection. Final image size is around 2GB — most of
-that is `libguestfs`'s dependency chain (it bundles a full QEMU/KVM stack
-to run its internal "appliance" VM, used for guest filesystem inspection
-and driver injection). This is required for Windows guest support (see
-[Section 3](#3-choosing-a-conversion-mode)).
+`virt-v2v`, `libguestfs`, and their dependencies (~50 seconds on a
+reasonably fast connection), plus downloading the ~840MiB
+`virtio-win.iso` (bundled so `virt-v2v-in-place` can actually inject
+VirtIO drivers into Windows guests under `CONVERT_MODE=direct-v2v` —
+without it, conversion still succeeds but falls back to slower emulated
+devices; see [Section 3](#3-choosing-a-conversion-mode) and the
+Troubleshooting table in [Section 7](#7-troubleshooting)). Final image
+size is around 3.2GB — most of that is `libguestfs`'s dependency chain
+(it bundles a full QEMU/KVM stack to run its internal "appliance" VM,
+used for guest filesystem inspection and driver injection) plus the
+VirtIO ISO itself. Windows guest support (see
+[Section 3](#3-choosing-a-conversion-mode)) requires both.
 
 ### 1.2 Pull (reuse an already-published image)
 
@@ -211,15 +217,17 @@ spec:
               value: "direct"
             - name: VERIFY_CHECKSUM
               value: "false"
+            - name: LIBGUESTFS_BACKEND_SETTINGS
+              value: "qemu_options=-enable-kvm"
+          securityContext:
+            privileged: true
           resources:
             requests:
               cpu: "500m"
               memory: "1Gi"
-              # devices.kubevirt.io/kvm: "1"   # uncomment for CONVERT_MODE=direct-v2v
             limits:
               cpu: "2"
               memory: "2Gi"
-              # devices.kubevirt.io/kvm: "1"   # uncomment for CONVERT_MODE=direct-v2v
           volumeDevices:
             - name: vm-import-target
               devicePath: /dev/xvda
@@ -254,23 +262,69 @@ node, replace `SOURCE_IMAGE_PATH` with `SOURCE_IMAGE_URL` and drop the
 `source-input` volume/mount — see [Section 4](#4-running-an-import) for
 that variant.
 
-The `devices.kubevirt.io/kvm` resource (commented out above) only matters
-for `CONVERT_MODE=direct-v2v` (required for Windows guests — see
-[Section 3](#3-choosing-a-conversion-mode)), which uses it for KVM
-acceleration of its `virt-v2v-in-place` step's internal appliance VM.
-It's commented out by default because requesting it unconditionally would
-prevent the Pod from scheduling on clusters/nodes that don't advertise
-this resource at all — most users on the default `CONVERT_MODE=direct`
-don't need it and shouldn't be blocked by an unused request. Uncomment
-both the `requests` and `limits` lines when you switch to
-`CONVERT_MODE=direct-v2v` and your node has a KubeVirt (or equivalent)
-device plugin advertising `devices.kubevirt.io/kvm` with a non-zero
-allocatable count. If it's advertised but allocatable is `0` (no free
-device, or the plugin reports zero capacity), `direct-v2v` still works
-without this resource request — just via software emulation instead of
-hardware acceleration, which is significantly slower (verified in
-testing: see [Section 3](#3-choosing-a-conversion-mode) for real
-numbers).
+### 2.3.1 Enabling KVM acceleration for `virt-v2v-in-place` (`CONVERT_MODE=direct-v2v`)
+
+Two settings must **both** be present together for `virt-v2v-in-place`'s
+internal libguestfs appliance VM to actually get hardware-accelerated KVM
+instead of silently falling back to software emulation (TCG) — this is an
+AND relationship, not independent options:
+
+| Setting | Why it's needed |
+|---|---|
+| `securityContext.privileged: true` | Grants the container permission to open and use the host's `/dev/kvm` directly (and other low-level operations libguestfs's appliance may need, e.g. loop devices). `privileged` bypasses Kubernetes' device-plugin gating entirely, so it alone is sufficient for `/dev/kvm` access — no `devices.kubevirt.io/kvm` resource request is needed (see the note below on why this project deliberately does **not** request that resource). |
+| `env.LIBGUESTFS_BACKEND_SETTINGS=qemu_options=-enable-kvm` | Forces libguestfs's internal QEMU appliance to pass `-enable-kvm` explicitly, rather than relying solely on libguestfs's own automatic `/dev/kvm` probing. |
+
+If either setting is missing, libguestfs's automatic detection simply
+falls back to software emulation (TCG) **without erroring out** —
+conversion still completes, just much slower. There is no error message
+indicating this fallback happened; the only symptom is conversion taking
+noticeably longer than expected. Both settings are unused (harmless)
+under `CONVERT_MODE=direct`, which never launches the libguestfs
+appliance at all.
+
+**Why this manifest does not request `devices.kubevirt.io/kvm`:**
+earlier versions of this manifest requested
+`devices.kubevirt.io/kvm: "1"` alongside `privileged: true`, on the
+assumption that a StarlingX (WRCP) cluster would always have a KubeVirt
+(or equivalent) device plugin advertising non-zero allocatable capacity
+for it. **Verified end-to-end on a real StarlingX (WRCP) cluster that
+this assumption does not always hold**: `devices.kubevirt.io/kvm` was
+registered on the node (present in `kubectl describe node`'s
+`Allocatable` section) but with allocatable `0` (no KubeVirt device
+plugin actually running) — requesting it unconditionally made the Pod
+stay `Pending` forever (`Insufficient devices.kubevirt.io/kvm`), since
+Kubernetes enforces resource requests strictly regardless of
+`privileged`. Removing the resource request and relying solely on
+`privileged: true` fixed scheduling immediately, and KVM acceleration
+was still confirmed working afterward — `privileged` grants direct access
+to the host's `/dev/kvm` node without going through Kubernetes' device-
+plugin accounting at all, so the resource request was never actually
+necessary once `privileged` is set. Confirmed via `virt-v2v-in-place -v`
+(`ENABLE_DEBUG=true`) output showing `libguestfs: qemu KVM: enabled` and
+the appliance VM's own kernel log reporting `Hypervisor detected: KVM`
+and switching to the `kvm-clock` clocksource — i.e. real hardware
+acceleration, not a TCG fallback that merely didn't error. The resulting
+GPT partition layout (`Windows recovery environment` + `EFI System` +
+`Microsoft reserved` + `Microsoft basic data`) matched the reference
+test run described in [Section 3](#3-choosing-a-conversion-mode). If you
+know your own cluster *does* advertise `devices.kubevirt.io/kvm` with
+non-zero allocatable and would rather request it explicitly for
+clearer scheduling intent/accounting, you can add it back — just be
+aware it is not required for KVM acceleration to work once `privileged`
+is set, and it introduces a scheduling risk (permanent `Pending`) on any
+cluster where the resource is advertised with zero allocatable.
+
+**Security note on `privileged: true`:** this grants the container
+near-host-root capabilities — access to all host devices, the ability to
+alter kernel/network settings, and a materially larger container-escape
+attack surface compared to an unprivileged container. `job.yaml` enables
+it by default on the assumption that this is a short-lived, one-shot Job
+(not a long-running service) dedicated to this single low-level
+block-device/appliance-VM operation, on a StarlingX (WRCP) cluster. If
+your threat model does not accept a privileged container, remove
+`securityContext` and the `LIBGUESTFS_BACKEND_SETTINGS` env var —
+`CONVERT_MODE=direct-v2v` will still work, just via the slower
+software-emulation path.
 
 #### Job-level fields
 
@@ -306,6 +360,15 @@ numbers).
 | `PROGRESS_MODE` | No | `clean` | `clean` throttles `qemu-img convert -p`'s and `virt-v2v-in-place`'s native `\r`-delimited output (which renders as an unreadable wall of text in `kubectl logs` and similar non-interactive viewers) into periodic, clean, timestamped single-line updates. Set to `raw` to disable this and see the tool's native output instead — useful when running the script directly in an interactive terminal, where `\r` correctly overwrites a single line. See [Section 3.1](#31-progress-output) for examples of the difference. |
 | `PROGRESS_STEP_PERCENT` | No | `10` | Only relevant under `PROGRESS_MODE=clean`, for percentage-based progress output. Print an update whenever progress advances by at least this many percentage points since the last one. |
 | `PROGRESS_INTERVAL_SECONDS` | No | `15` | Only relevant under `PROGRESS_MODE=clean`. Print an update at least this often regardless of percentage progress. |
+
+Note: `LIBGUESTFS_BACKEND_SETTINGS` is not one of this script's own
+variables (it is not read by `convert-and-import.sh`) — it is a
+standard libguestfs environment variable, recognized directly by the
+`virt-v2v-in-place` subprocess itself under `CONVERT_MODE=direct-v2v`.
+See [Section 2.3.1](#231-enabling-kvm-acceleration-for-virt-v2v-in-place-convert_modedirect-v2v)
+for what it does and why it must be combined with the
+`devices.kubevirt.io/kvm` resource and a privileged `securityContext` to
+actually take effect.
 
 #### Resource requests/limits
 
@@ -787,8 +850,8 @@ Kubernetes management first.
 | `line NNN: cmp: command not found` during the zero-read check, immediately before a (spurious) `TARGET_DEVICE is not all-zero` failure | The image is missing `cmp` (normally provided by `diffutils`) — this happened once during development when the Dockerfile's package list was trimmed down from an earlier, larger version without checking every script dependency against it | Already fixed in this script: the zero-check now uses `python3` (bundled in the image for other reasons) instead of shelling out to `cmp`, removing the dependency entirely. If you see this on an image you built yourself, make sure it's using the current `convert-and-import.sh` and `Dockerfile` from this directory, not a locally patched/cached copy |
 | Progress lines (`progress: NN.N% complete ...`) all show the **same** `elapsed` value and only appear in `kubectl logs` right as (or after) the Job finishes, instead of appearing gradually while it runs | `qemu-img`'s progress output ends in `\r`, not `\n`; `stdbuf -oL` ("line buffered") only flushes on `\n`, so `\r`-terminated output stayed trapped in a buffer until the process exited and flushed everything at once — this happened once during development (confirmed via a real run where a 37-second conversion produced 11 progress lines all stamped "elapsed 37s", i.e. all flushed simultaneously at exit) | Already fixed in this script: `run_with_progress` now uses `stdbuf -o0 -e0` (fully unbuffered, not just line-buffered) so every write is flushed immediately regardless of whether it ends in `\r` or `\n`; the Python filter also reads via `os.read()` on the raw file descriptor rather than Python's buffered `sys.stdin.read()`, for the same reason on the consuming side. If you see this on an image you built yourself, make sure it's using the current `convert-and-import.sh` from this directory |
 | `unknown CONVERT_MODE '...' (expected 'direct' or 'direct-v2v')` | Typo in `CONVERT_MODE`, or using an older image built before `direct-v2v` support was added | Check spelling; if using a self-built image, rebuild from the current `Dockerfile`/`convert-and-import.sh` in this directory |
-| `CONVERT_MODE=direct-v2v` is extremely slow (many minutes for a large disk) | No real KVM acceleration available to the Pod — `virt-v2v-in-place`'s internal appliance VM fell back to software/tcg emulation | Check whether the node advertises `devices.kubevirt.io/kvm` with a non-zero allocatable count (`kubectl get node <name> -o jsonpath='{.status.allocatable}'`). If it's `0` or absent, either deploy/fix the KubeVirt device plugin so the node can advertise real KVM capacity, or accept the slower software-emulation fallback — it still produces a correct result, just much slower (verified in testing: ~6.2-6.3 minutes total for a 90GiB Windows disk without KVM acceleration) |
-| `virt-v2v-in-place: warning: there are no virtio drivers available for this version of Windows ... The guest will be configured to use slower emulated devices` | Expected with the stock `Dockerfile` in this directory — it doesn't bundle the `virtio-win` driver ISO | Not an error; the conversion still succeeds and produces a bootable guest, just configured with emulated (slower) devices instead of VirtIO ones. If you want VirtIO drivers installed during conversion, extend `Dockerfile` to bundle Fedora's `virtio-win` ISO (not exercised in this project's own testing) |
+| `CONVERT_MODE=direct-v2v` is extremely slow (many minutes for a large disk) | No real KVM acceleration available to the Pod — `virt-v2v-in-place`'s internal appliance VM fell back to software/tcg emulation | Confirm the container has `securityContext.privileged: true` and `env.LIBGUESTFS_BACKEND_SETTINGS=qemu_options=-enable-kvm` set (see [Section 2.3.1](#231-enabling-kvm-acceleration-for-virt-v2v-in-place-convert_modedirect-v2v)) — both are required together for KVM acceleration, and a missing one silently falls back to TCG with no error. Re-run with `ENABLE_DEBUG=true` and check the Pod logs for `libguestfs: qemu KVM: enabled` and the appliance kernel log reporting `Hypervisor detected: KVM` to confirm acceleration is actually active (verified in testing: ~4 minutes total for a 90GiB Windows disk *with* KVM acceleration vs. ~6.2-6.3 minutes *without* it). A `devices.kubevirt.io/kvm` resource request is not needed and not checked here — it has no effect on whether KVM acceleration works once `privileged` is set (see Section 2.3.1) |
+| `virt-v2v-in-place: warning: there are no virtio drivers available for this version of Windows ... The guest will be configured to use slower emulated devices` | The `Dockerfile` in this directory now bundles `/usr/share/virtio-win/virtio-win.iso`, so this warning should no longer appear in normal operation. If you still see it, the image was built before this ISO was added, or a custom `Dockerfile` variant dropped it — rebuild from the current `Dockerfile` in this directory | Not an error either way; the conversion still succeeds and produces a bootable guest, just configured with slower emulated devices instead of VirtIO ones if the ISO is genuinely missing. Confirm the ISO is present with `docker run --rm --entrypoint /bin/bash <image> -c 'ls -la /usr/share/virtio-win/'` |
 | `No root device found in this operating system image` from `virt-v2v-in-place` | The guest OS is not recognized by libguestfs's inspection — known to affect OSTree/Ignition-based Linux distributions (e.g. Fedora CoreOS) | Use `CONVERT_MODE=direct` instead for these guests — it doesn't need libguestfs inspection to succeed |
 | Job fails partway through `CONVERT_MODE=direct-v2v`'s `virt-v2v-in-place` phase, leaving `TARGET_DEVICE` in an uncertain state | This is the documented risk of in-place conversion — see [Section 3](#3-choosing-a-conversion-mode). `virt-v2v-in-place` has no backup/rollback mechanism | Delete the PVC and target volume, provision a fresh one, and re-run the import from the original source image. Do not attempt to boot or otherwise rely on a target device left in this state; there is no reliable way to determine how far the in-place conversion got before failing |
 | `DISK_SELECTOR` set but appears to have no effect under `CONVERT_MODE=direct-v2v` | Expected — the `virt-v2v-in-place` phase operates on the whole `TARGET_DEVICE` as a single disk; it has no per-`.vmdk` selection mechanism like the direct-write phase does. The script logs a warning (not an error) when this is detected | `DISK_SELECTOR` still affects the direct-write phase under this mode. If you need to import only one disk of a multi-disk Windows source and apply driver injection to it specifically, this isn't currently supported by this script in a single Job run |

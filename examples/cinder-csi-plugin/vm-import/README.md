@@ -270,21 +270,28 @@ the resulting PV, or detach/orphan it from Kubernetes before deleting the PVC.
   explanation of why `virt-v2v-in-place`'s in-place modification means a
   failure can leave the target device in an unknown state, with no
   automatic recovery. A few additional things to know before using it:
-  - Benefits from real KVM acceleration available (the node needs
-    `/dev/kvm`, typically exposed via the KubeVirt device plugin as the
-    `devices.kubevirt.io/kvm` resource — see the commented-out block in
-    `job.yaml`). It still works without it, falling back to software
-    emulation, just much slower — the ~6.2 minute figure above was
-    measured **without** KVM acceleration available on the test node.
-  - The container image used for testing doesn't bundle VirtIO drivers
-    (`/usr/share/virtio-win`), so `virt-v2v-in-place` falls back to
-    configuring the guest with slower emulated devices rather than
-    installing VirtIO drivers — it still produces a bootable disk, just
-    without the VirtIO performance benefit. If you want VirtIO drivers
-    installed, extend the `Dockerfile` to bundle the `virtio-win` ISO
-    (available from Fedora's virtio-win project) and either place it
-    where `virt-v2v` looks by default or point it there via its input
-    options; this was not exercised in testing.
+  - Benefits from real KVM acceleration, enabled by default in
+    `job.yaml` via a privileged `securityContext` +
+    `LIBGUESTFS_BACKEND_SETTINGS=qemu_options=-enable-kvm` (see
+    `OPERATIONS-GUIDE.md` Section 2.3.1 for the full explanation,
+    including why this does **not** use a `devices.kubevirt.io/kvm`
+    resource request — verified on a real StarlingX/WRCP cluster where
+    that resource was advertised with zero allocatable, which would
+    have left the Pod permanently `Pending` had it been requested).
+    Conversion still works without KVM acceleration (e.g. if you remove
+    `privileged` for a stricter security posture), falling back to
+    software emulation, just much slower — the ~6.2 minute figure above
+    was measured **without** KVM acceleration, versus ~4 minutes **with**
+    it in a later verified run against the same guest.
+  - The `Dockerfile` bundles VirtIO drivers
+    (`/usr/share/virtio-win/virtio-win.iso`, Fedora's stable-virtio
+    build), so `virt-v2v-in-place` installs them into the guest during
+    conversion rather than falling back to slower emulated devices.
+    Earlier versions of this image did not bundle this ISO, which
+    produced the `there are no virtio drivers available ...` warning
+    and emulated-device fallback seen in early testing — this is fixed
+    as of the current `Dockerfile`; rebuild if you still see that
+    warning.
   - Relies on libguestfs's OS inspection to recognize the guest. Windows
     guests are well supported (verified: correctly identified a Windows
     Server 2019 guest and converted it to a disk with a valid GPT/NTFS
